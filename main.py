@@ -38,8 +38,13 @@ from threading import Thread
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], allow_credentials=True,
-    allow_methods=["*"], allow_headers=["*"],
+    allow_origins=[
+        "http://localhost:5173", 
+        "https://ocppfortechlux-frontend.onrender.com"
+    ],  # 加入你的線上前端網址！
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # 初始化狀態儲存
@@ -62,7 +67,7 @@ async def authorize(cp_id: str, badge_id: str = Body(..., embed=True)):
 # 以下開始 WebSocket 與 OCPP 部分
 
 
-app = FastAPI()
+
 logging.basicConfig(level=logging.INFO)
 # 啟用 logging
 logging.basicConfig(level=logging.INFO)
@@ -180,15 +185,7 @@ CREATE TABLE IF NOT EXISTS status_logs (
 
 conn.commit()
 
-# FastAPI 建立與 CORS
-app = FastAPI()
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:5173"],  # 明確允許前端開發網址
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+
 
 
 from ocpp.v16 import ChargePoint as OcppChargePoint
