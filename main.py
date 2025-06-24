@@ -36,9 +36,12 @@ from threading import Thread
 
 # 建立 FastAPI app
 app = FastAPI()
+
+from fastapi.middleware.cors import CORSMiddleware
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origin_regex="https://.*\\.onrender\\.com",
+    allow_origin_regex=r"https://.*\.onrender\.com",  # ✅ 僅保留 regex，前面加 r 原始字串
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"]
