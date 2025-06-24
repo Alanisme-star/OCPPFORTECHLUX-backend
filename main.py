@@ -38,15 +38,13 @@ from threading import Thread
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://ocppfortechlux-frontend.onrender.com",
-        "http://localhost:5173"
-    ],
-    allow_origin_regex="https://.*\\.onrender\\.com",  # ✅ 加這行支援 *.onrender.com（避免域名略有差異）
+    allow_origin_regex="https://.*\\.onrender\\.com",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"]
 )
+
+
 # 初始化狀態儲存
 charging_point_status = {}
 
