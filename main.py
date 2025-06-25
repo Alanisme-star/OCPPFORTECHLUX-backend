@@ -556,6 +556,11 @@ async def get_transactions(
 
 
 @app.get("/api/transactions/cost-summary")
+
+axios.get("/api/transactions/cost-summary", {
+  timeout: 30000  // 30 秒
+});
+
 async def transaction_cost_summary(
     start: str = Query(None),
     end: str = Query(None)
@@ -583,8 +588,9 @@ async def transaction_cost_summary(
     # 對每個交易 ID 進行費用計算
     for txn_id in txn_ids:
         try:
-            cost_data = await calculate_transaction_cost(txn_id)
+            cost_data = await calculate_transaction_cost(txn_id)  # 暫保留 await，但建議考慮改成非 async 的版本
             result.append(cost_data)
+
         except Exception as e:
             print(f"⚠️ 計算交易 {txn_id} 失敗：{e}")
             continue
