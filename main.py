@@ -404,10 +404,7 @@ class ChargePoint(OcppChargePoint):
 
             # 若餘額過低，自動通知
             if new_balance < 100:
-                try:
-                    send_line_message(f"⚠️ 卡片 {id_tag} 餘額僅剩 {new_balance} 元，請儘速儲值")
-                except Exception as e:
-                    logging.warning(f"LINE 通知失敗：{e}")
+                logging.info(f"⚠️ 卡片 {id_tag} 餘額僅剩 {new_balance} 元")
 
         logging.info(f"🛑 StopTransaction 成功 | CP={self.id} | idTag={id_tag} | transactionId={transaction_id}")
         return StopTransactionPayload(id_tag_info={"status": "Accepted"})
@@ -1034,48 +1031,17 @@ def weekly_notify_task():
                     message = "📊 一週用電排行（依 idTag）:\n"
                     for idx, (id_tag, energy) in enumerate(rows, start=1):
                         message += f"{idx}. {id_tag}：{round(energy/1000, 2)} kWh\n"
-                    send_line_message(message)
+                    logging.info(f"📊 用電排行通知（模擬）：\n{message}")
             except Exception as e:
                 logging.error(f"📉 用電排行通知錯誤：{e}")
         time.sleep(60)  # 每分鐘檢查一次是否符合發送條件
 
 
 
-# === LINE Messaging API 設定 ===
-import os
-LINE_TOKEN = "dZ8gNgV/69iQX8q+I4NpV5zoSzGM3Z2NSZUSPDA4FjmQVCMyB1Z6Ac8eQ3qGk+VUaDyvIiWMgTj+MhYELVkbeVx1IXgux7nea9jxG8fAf8Nef4Ch6+565NYsfwxOAtruVnEBXpibJbcZxncfL/AcXwdB04t89/1O/w1cDnyilFU="
-
-LINE_USER_IDS = [
-    "Uc9a54d56f954e778497066bcdf780665",
-    "U52a762cb79e6847b955c572e0c1f69bc"
-]
-
-print("📋 預計推播對象：")
-for uid in LINE_USER_IDS:
-    print("👉", uid)
-
-def send_line_message(message: str):
-    url = "https://api.line.me/v2/bot/message/push"
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {LINE_TOKEN}"
-    }
-    for user_id in LINE_USER_IDS:
-        payload = {
-            "to": user_id,
-            "messages": [{"type": "text", "text": message}]
-        }
-        resp = requests.post(url, headers=headers, data=json.dumps(payload))
-        logging.info(f"🔔 發送至 {user_id}：{resp.status_code} | 回應：{resp.text}")
-
-
-# 原本的 /api/messaging/test 改為支援自訂對象與訊息
-from fastapi import Request, Body
-
 @app.post("/api/messaging/test")
 async def test_line_messaging(payload: dict = Body(...)):
-    message = payload.get("message", "✅ 測試推播：預設訊息")
-    targets = payload.get("targets")  # 可選: list of id_tags
+    logging.info("🔕 已停用 LINE 推播功能，略過發送")
+    return {"message": "LINE 通知功能已暫時停用"}
 
     # 查詢對應的 user_id
     recipient_ids = []
@@ -1777,6 +1743,3 @@ async def delete_weekly_pricing(id: int = Path(...)):
     cursor.execute('DELETE FROM weekly_pricing WHERE id = ?', (id,))
     conn.commit()
     return {"message": "刪除成功"}
-
-
-
