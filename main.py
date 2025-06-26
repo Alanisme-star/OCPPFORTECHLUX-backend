@@ -41,7 +41,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origin_regex=r"https://.*\.onrender\.com",  # ✅ 僅保留 regex，前面加 r 原始字串
+    allow_origins=["https://ocppfortechlux-frontend.onrender.com"],  # ✅ 明確列出前端網址
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"]
@@ -559,11 +559,6 @@ async def calculate_transaction_cost(transaction_id: int):
         return compute_transaction_cost(transaction_id)
     except Exception as e:
         raise HTTPException(status_code=404, detail=str(e))
-
-   
-
-
-
 
 
 
@@ -1656,3 +1651,9 @@ async def delete_weekly_pricing(id: int = Path(...)):
     cursor.execute('DELETE FROM weekly_pricing WHERE id = ?', (id,))
     conn.commit()
     return {"message": "刪除成功"}
+
+
+@app.get("/healthz")
+async def health_check():
+    return {"status": "ok"}
+
