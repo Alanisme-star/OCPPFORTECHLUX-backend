@@ -552,11 +552,22 @@ async def get_transactions(
 
 
 
-@app.get("/api/transactions/cost-summary")
 
-axios.get("/api/transactions/cost-summary", {
-  timeout: 30000  // 30 秒
-});
+@app.get("/api/transactions/{transaction_id}/cost")
+async def calculate_transaction_cost(transaction_id: int):
+    try:
+        return compute_transaction_cost(transaction_id)
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+   
+
+
+
+
+
+
+@app.get("/api/transactions/cost-summary")
 
 async def transaction_cost_summary(
     start: str = Query(None),
@@ -576,7 +587,7 @@ async def transaction_cost_summary(
         params.append(end)
 
     # 執行查詢
-    cursor = conn.cursor()
+    
     cursor.execute(query, params)
     txn_ids = [row[0] for row in cursor.fetchall()]
 
@@ -585,7 +596,7 @@ async def transaction_cost_summary(
     # 對每個交易 ID 進行費用計算
     for txn_id in txn_ids:
         try:
-            cost_data = await calculate_transaction_cost(txn_id)  # 暫保留 await，但建議考慮改成非 async 的版本
+            cost_data = compute_transaction_cost(txn_id)
             result.append(cost_data)
 
         except Exception as e:
@@ -642,104 +653,6 @@ async def get_transaction_detail(transaction_id: int):
 
     return JSONResponse(content=result)
 
-@app.get("/api/transactions/{transaction_id}/cost")
-async def calculate_transaction_cost(transaction_id: int):
-    from datetime import datetime, time
-    import calendar
-
-    # 查詢交易資料
-    cursor.execute("SELECT start_timestamp, stop_timestamp, meter_start, meter_stop FROM transactions WHERE transaction_id = ?", (transaction_id,))
-    txn = cursor.fetchone()
-    if not txn or txn[3] is None:
-        raise HTTPException(status_code=404, detail="Transaction not found or not completed.")
-
-    start_time = datetime.fromisoformat(txn[0])
-    stop_time = datetime.fromisoformat(txn[1])
-    total_kwh = (txn[3] - txn[2]) / 1000  # 以 Wh 計算轉換為 kWh
-
-    # 查詢所有 meter_values，依照 timestamp 排序
-    cursor.execute("""
-        SELECT timestamp, value
-        FROM meter_values
-        WHERE transaction_id = ?
-        ORDER BY timestamp ASC
-    """, (transaction_id,))
-    mv_rows = cursor.fetchall()
-
-    # 計費規則
-    def is_summer(dt):
-        return datetime(dt.year, 6, 1) <= dt <= datetime(dt.year, 9, 30)
-
-    def is_holiday(dt):
-        return dt.weekday() >= 5  # 週六週日視為假日
-
-    def get_price(dt):
-        season = "summer" if is_summer(dt) else "non_summer"
-        day_type = "holiday" if is_holiday(dt) else "weekday"
-        t = dt.time().strftime("%H:%M")
-        cursor.execute("""
-            SELECT price FROM pricing_rules
-            WHERE season = ? AND day_type = ? AND (
-                (start_time <= end_time AND start_time <= ? AND end_time > ?) OR
-                (start_time > end_time AND ( ? >= start_time OR ? < end_time ))
-            )
-            ORDER BY start_time DESC LIMIT 1
-        """, (season, day_type, t, t, t, t))
-        result = cursor.fetchone()
-        return result[0] if result else 0
-
-
-    # 若資料筆數不足，直接以平均價計算
-    if len(mv_rows) < 2:
-        price = get_price(start_time)
-        energy_cost = total_kwh * price
-        detail = [{
-            "from": start_time.isoformat(),
-            "to": stop_time.isoformat(),
-            "kWh": round(total_kwh, 3),
-            "price": price,
-            "cost": round(energy_cost, 2)
-        }]
-    else:
-        detail = []
-        energy_cost = 0
-        for i in range(1, len(mv_rows)):
-            t1 = datetime.fromisoformat(mv_rows[i - 1][0])
-            t2 = datetime.fromisoformat(mv_rows[i][0])
-            v1 = float(mv_rows[i - 1][1])
-            v2 = float(mv_rows[i][1])
-            kwh = max((v2 - v1) / 1000, 0)
-            price = get_price(t1)
-            cost = kwh * price
-            energy_cost += cost
-            detail.append({
-                "from": t1.isoformat(),
-                "to": t2.isoformat(),
-                "kWh": round(kwh, 3),
-                "price": price,
-                "cost": round(cost, 2)
-            })
-
-    # 查詢基本費與加價設定
-    cursor.execute("SELECT monthly_basic_fee, threshold_kwh, overuse_price_delta FROM base_rates WHERE id = 1")
-    base_row = cursor.fetchone()
-    basic_fee = base_row[0]
-    threshold = base_row[1]
-    delta = base_row[2]
-
-    over_kwh = max(total_kwh - threshold, 0)
-    overuse_fee = over_kwh * delta if over_kwh > 0 else 0
-
-    return {
-        "transactionId": transaction_id,
-        "totalCost": round(basic_fee + energy_cost + overuse_fee, 2),
-        "basicFee": round(basic_fee, 2),
-        "energyCost": round(energy_cost, 2),
-        "overuseFee": round(overuse_fee, 2),
-        "totalKWh": round(total_kwh, 3),
-        "unit": "kWh",
-        "details": detail
-    }
 
 
 
