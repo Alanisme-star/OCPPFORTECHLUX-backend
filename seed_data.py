@@ -1,18 +1,14 @@
 import requests
-import sys
 import time
 from datetime import datetime, timedelta
 import random
 import string
 
-# ✅ 環境切換與延遲
-ENV = sys.argv[1] if len(sys.argv) > 1 else "local"
-BASE_URL = "http://localhost:8000/api" if ENV == "local" else "https://ocppfortechlux-backend.onrender.com/api"
-
-print(f"🌐 使用後端：{BASE_URL}")
-if ENV != "local":
-    print("⏳ 等待 Render 伺服器啟動中 (sleep 10 秒)...")
-    time.sleep(10)
+# ✅ 固定使用雲端 API，不再依照參數切換
+BASE_URL = "https://ocppfortechlux-backend.onrender.com/api"
+print(f"🌐 使用雲端後端：{BASE_URL}")
+print("⏳ 等待 Render 伺服器啟動中 (sleep 10 秒)...")
+time.sleep(10)
 
 CARD_ID = "TEST123"
 CP_ID = "CP001"
@@ -172,3 +168,47 @@ def run_seed():
 
 if __name__ == "__main__":
     run_seed()
+
+import asyncio
+import websockets
+import uuid
+import json
+from datetime import datetime
+
+WS_URL = "ws://localhost:9000/CP001"  # ⚠️ 若是 Render 上部署，請改成你的雲端 WebSocket URL
+CHARGE_POINT_ID = "CP001"
+
+# OCPP 子協議
+HEADERS = {
+    "Sec-WebSocket-Protocol": "ocpp1.6"
+}
+
+def make_ocpp_message(message_id, action, payload):
+    return json.dumps([2, message_id, action, payload])
+
+async def send_status_notification():
+    async with websockets.connect(WS_URL, subprotocols=["ocpp1.6"]) as ws:
+        print("🔌 已連線 WebSocket")
+
+        # Step 1: BootNotification
+        boot_payload = {
+            "chargePointModel": "TEST_MODEL",
+            "chargePointVendor": "TEST_VENDOR"
+        }
+        await ws.send(make_ocpp_message(str(uuid.uuid4()), "BootNotification", boot_payload))
+        print("🚀 發送 BootNotification")
+        await ws.recv()
+
+        # Step 2: StatusNotification
+        status_payload = {
+            "connectorId": 1,
+            "status": "Available",
+            "timestamp": datetime.utcnow().isoformat() + "Z"
+        }
+        await ws.send(make_ocpp_message(str(uuid.uuid4()), "StatusNotification", status_payload))
+        print("📡 已發送 StatusNotification：Available")
+
+        await ws.recv()  # 接收回應
+
+asyncio.run(send_status_notification())
+
