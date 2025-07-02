@@ -1733,3 +1733,29 @@ async def add_payment(data: dict = Body(...)):
         return {"message": "Payment added successfully"}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/internal/mock-daily-pricing")
+async def mock_daily_pricing():
+    base = datetime(2025, 6, 1)
+    for i in range(30):
+        day = base + timedelta(days=i)
+        date_str = day.strftime("%Y-%m-%d")
+
+        # 檢查是否已存在
+        cursor.execute('SELECT * FROM daily_pricing WHERE date = ?', (date_str,))
+        if cursor.fetchone():
+            continue
+
+        cursor.execute('''
+            INSERT INTO daily_pricing (date, price_per_kwh)
+            VALUES (?, ?)
+        ''', (date_str, 10.0))
+
+    conn.commit()
+    return {"message": "✅ 已建立 6 月每日 10 元/kWh 電價資料"}
+
+
+
+
+
