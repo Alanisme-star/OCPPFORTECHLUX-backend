@@ -1813,6 +1813,12 @@ async def recalculate_all_payments():
 
 
 
+@app.get("/api/diagnostic/daily-pricing")
+async def diagnostic_daily_pricing():
+    cursor.execute('SELECT date, price_per_kwh FROM daily_pricing ORDER BY date ASC')
+    rows = cursor.fetchall()
+    return [{"date": row[0], "price": row[1]} for row in rows]
+
 
 
 
