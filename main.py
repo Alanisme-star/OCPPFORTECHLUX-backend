@@ -1838,6 +1838,40 @@ async def diagnostic_daily_pricing():
     rows = cursor.fetchall()
     return [{"date": row[0], "price": row[1]} for row in rows]
 
+@app.get("/api/diagnostic/missing-cost-transactions")
+async def missing_cost_transactions():
+    cursor.execute('''
+        SELECT transaction_id, charge_point_id, meter_start, meter_stop, start_timestamp
+        FROM transactions
+        WHERE meter_stop IS NOT NULL
+    ''')
+    rows = cursor.fetchall()
+
+    missing = []
+
+    for row in rows:
+        txn_id, cp_id, meter_start, meter_stop, start_ts = row
+        try:
+            ts_obj = datetime.fromisoformat(start_ts)
+            date_str = ts_obj.strftime("%Y-%m-%d")
+            cursor.execute('SELECT price_per_kwh FROM daily_pricing WHERE date = ?', (date_str,))
+            price_row = cursor.fetchone()
+            if not price_row:
+                missing.append({
+                    "transaction_id": txn_id,
+                    "date": date_str,
+                    "chargePointId": cp_id,
+                    "reason": "No daily pricing found"
+                })
+        except:
+            missing.append({
+                "transaction_id": txn_id,
+                "date": start_ts,
+                "chargePointId": cp_id,
+                "reason": "Invalid timestamp format"
+            })
+
+    return missing
 
 
 
