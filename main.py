@@ -1795,14 +1795,15 @@ async def recalculate_all_payments():
     for row in rows:
         txn_id, cp_id, meter_start, meter_stop, start_ts, stop_ts = row
         try:
-            # 安全轉換 start_ts 為日期字串（避免格式錯誤）
+            # 安全轉換日期字串
             ts_obj = datetime.fromisoformat(start_ts)
             date_str = ts_obj.strftime("%Y-%m-%d")
 
-            # 取得該筆交易的日電價
             cursor.execute('SELECT price_per_kwh FROM daily_pricing WHERE date = ?', (date_str,))
             price_row = cursor.fetchone()
+
             if not price_row:
+                print(f"⚠️ Skipped txn {txn_id} | 日期 {date_str} 找不到電價 (原始時間: {start_ts})")
                 skipped += 1
                 continue
 
@@ -1818,14 +1819,15 @@ async def recalculate_all_payments():
                 VALUES (?, ?, ?, ?, ?)
             ''', (txn_id, base_fee, energy_fee, overuse_fee, total_amount))
             created += 1
+            print(f"✅ Created txn {txn_id} | 日期 {date_str} 成本 {total_amount} 元")
 
         except Exception as e:
-            print(f"❌ 計算錯誤 txn {txn_id}: {e}")
+            print(f"❌ 錯誤 txn {txn_id} | {e}")
             skipped += 1
 
     conn.commit()
     return {
-        "message": "✅ 已重新計算所有交易成本",
+        "message": "✅ 已重新計算所有交易成本（debug 模式）",
         "created": created,
         "skipped": skipped
     }
