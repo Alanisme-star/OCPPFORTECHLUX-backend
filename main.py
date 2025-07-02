@@ -1694,3 +1694,43 @@ async def delete_weekly_pricing(id: int = Path(...)):
     conn.commit()
     return {"message": "刪除成功"}
 
+@app.post("/api/internal/meter_values")
+async def add_meter_values(data: dict = Body(...)):
+    try:
+        cursor.execute('''
+            INSERT INTO meter_values (
+                transaction_id, charge_point_id, connector_id, timestamp, value, measurand, unit, context, format
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            data["transaction_id"],
+            data["charge_point_id"],
+            data["connector_id"],
+            data["timestamp"],
+            data["value"],
+            data.get("measurand", "Energy.Active.Import.Register"),
+            data.get("unit", "Wh"),
+            data.get("context", "Sample.Periodic"),
+            data.get("format", "Raw")
+        ))
+        conn.commit()
+        return {"message": "Meter value added successfully"}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/api/payments")
+async def add_payment(data: dict = Body(...)):
+    try:
+        cursor.execute('''
+            INSERT INTO payments (transaction_id, id_tag, amount, timestamp)
+            VALUES (?, ?, ?, ?)
+        ''', (
+            data["transaction_id"],
+            data.get("id_tag", "TEST123"),  # 預設卡片 ID
+            data["total_amount"],
+            datetime.utcnow().isoformat()
+        ))
+        conn.commit()
+        return {"message": "Payment added successfully"}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
