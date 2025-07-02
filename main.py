@@ -498,6 +498,34 @@ async def on_status_notification(self, connector_id, status, timestamp, **kwargs
 
 
 
+@app.post("/api/transactions")
+async def create_transaction_api(data: dict = Body(...)):
+    try:
+        txn_id = int(datetime.utcnow().timestamp() * 1000)
+        cursor.execute('''
+            INSERT INTO transactions (
+                transaction_id, charge_point_id, connector_id, id_tag,
+                meter_start, start_timestamp, meter_stop, stop_timestamp, reason
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            txn_id,
+            data["chargePointId"],
+            1,
+            data["idTag"],
+            data["meter_start"],
+            data["start_timestamp"],
+            data["meter_stop"],
+            data["stop_timestamp"],
+            None
+        ))
+        conn.commit()
+        return {"transaction_id": txn_id}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+
+
 
 @app.get("/api/transactions")
 async def get_transactions(
@@ -1665,3 +1693,4 @@ async def delete_weekly_pricing(id: int = Path(...)):
     cursor.execute('DELETE FROM weekly_pricing WHERE id = ?', (id,))
     conn.commit()
     return {"message": "刪除成功"}
+
