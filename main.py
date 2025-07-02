@@ -485,8 +485,17 @@ async def on_status_notification(self, connector_id, status, timestamp, **kwargs
         VALUES (?, ?, ?, ?)
     ''', (self.id, connector_id, status, timestamp))
     conn.commit()
+
+    # ✅ 新增：更新全域狀態變數
+    charging_point_status[self.id] = {
+        "connectorId": connector_id,
+        "status": status,
+        "timestamp": timestamp
+    }
+
     logging.info(f"📡 StatusNotification | CP={self.id} | connector={connector_id} | status={status}")
     return StatusNotificationPayload()
+
 
 
 
