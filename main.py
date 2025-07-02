@@ -1765,6 +1765,53 @@ async def mock_daily_pricing():
     conn.commit()
     return {"message": "✅ 已建立 6 月每日 10 元/kWh 電價資料"}
 
+@app.post("/api/internal/recalculate-all-payments")
+async def recalculate_all_payments():
+    # 清除舊資料
+    cursor.execute('DELETE FROM payments')
+    conn.commit()
+
+    cursor.execute('SELECT transaction_id, charge_point_id, meter_start, meter_stop, start_timestamp, stop_timestamp FROM transactions WHERE meter_stop IS NOT NULL')
+    rows = cursor.fetchall()
+    created = 0
+    skipped = 0
+
+    for row in rows:
+        txn_id, cp_id, meter_start, meter_stop, start_ts, stop_ts = row
+        try:
+            # 取得該筆交易的日電價
+            date_str = start_ts[:10]
+            cursor.execute('SELECT price_per_kwh FROM daily_pricing WHERE date = ?', (date_str,))
+            price_row = cursor.fetchone()
+            if not price_row:
+                skipped += 1
+                continue
+
+            price_per_kwh = price_row[0]
+            kWh = (meter_stop - meter_start) / 1000
+            base_fee = 20.0
+            energy_fee = round(kWh * price_per_kwh, 2)
+            overuse_fee = round(kWh * 2 if kWh > 5 else 0, 2)
+            total_amount = round(base_fee + energy_fee + overuse_fee, 2)
+
+            cursor.execute('''
+                INSERT INTO payments (transaction_id, base_fee, energy_fee, overuse_fee, total_amount)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (txn_id, base_fee, energy_fee, overuse_fee, total_amount))
+            created += 1
+
+        except Exception as e:
+            print(f"❌ 計算錯誤 txn {txn_id}: {e}")
+            skipped += 1
+
+    conn.commit()
+    return {
+        "message": "✅ 已重新計算所有交易成本",
+        "created": created,
+        "skipped": skipped
+    }
+
+
 
 
 
