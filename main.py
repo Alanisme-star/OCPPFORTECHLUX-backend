@@ -1717,6 +1717,32 @@ async def add_meter_values(data: dict = Body(...)):
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+
+@app.post("/api/internal/mock-status")
+async def mock_status(data: dict = Body(...)):
+    cp_id = data.get("chargePointId", "CP001")
+    connector_id = data.get("connectorId", 1)
+    status = data.get("status", "Available")
+    timestamp = data.get("timestamp", datetime.utcnow().isoformat())
+
+    # 寫入資料庫
+    cursor.execute('''
+        INSERT INTO status_logs (charge_point_id, connector_id, status, timestamp)
+        VALUES (?, ?, ?, ?)
+    ''', (cp_id, connector_id, status, timestamp))
+    conn.commit()
+
+    # 更新記憶體快取
+    charging_point_status[cp_id] = {
+        "connectorId": connector_id,
+        "status": status,
+        "timestamp": timestamp
+    }
+
+    return {"message": f"狀態已模擬寫入：{cp_id} = {status}"}
+
+
+
 @app.post("/api/payments")
 async def add_payment(data: dict = Body(...)):
     try:
@@ -1734,3 +1760,23 @@ async def add_payment(data: dict = Body(...)):
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+
+@app.get("/api/status")
+async def get_status():
+    # 若記憶體中的 status 沒有，從資料庫抓取最新一筆
+    if not charging_point_status:
+        cursor.execute('''
+            SELECT charge_point_id, connector_id, status, timestamp
+            FROM status_logs
+            ORDER BY timestamp DESC
+            LIMIT 10
+        ''')
+        rows = cursor.fetchall()
+        for row in rows:
+            cp_id = row[0]
+            charging_point_status[cp_id] = {
+                "connectorId": row[1],
+                "status": row[2],
+                "timestamp": row[3]
+            }
+    return JSONResponse(content=charging_point_status)
