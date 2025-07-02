@@ -92,6 +92,16 @@ CREATE TABLE IF NOT EXISTS cards (
 )
 ''')
 
+# 建立 daily_pricing 表（若尚未存在）
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS daily_pricing (
+    date TEXT PRIMARY KEY,
+    price_per_kwh REAL
+)
+''')
+conn.commit()
+
+
 # 測試卡片初始資料（可選）
 cursor.execute('INSERT OR IGNORE INTO cards (card_id, balance) VALUES (?, ?)', ("ABC123", 200))
 cursor.execute('INSERT OR IGNORE INTO cards (card_id, balance) VALUES (?, ?)', ("TAG001", 50))
