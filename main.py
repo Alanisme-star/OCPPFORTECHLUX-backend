@@ -1795,8 +1795,11 @@ async def recalculate_all_payments():
     for row in rows:
         txn_id, cp_id, meter_start, meter_stop, start_ts, stop_ts = row
         try:
+            # 安全轉換 start_ts 為日期字串（避免格式錯誤）
+            ts_obj = datetime.fromisoformat(start_ts)
+            date_str = ts_obj.strftime("%Y-%m-%d")
+
             # 取得該筆交易的日電價
-            date_str = start_ts[:10]
             cursor.execute('SELECT price_per_kwh FROM daily_pricing WHERE date = ?', (date_str,))
             price_row = cursor.fetchone()
             if not price_row:
