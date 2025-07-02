@@ -420,10 +420,16 @@ class ChargePoint(OcppChargePoint):
         return StopTransactionPayload(id_tag_info={"status": "Accepted"})
 
 
-ALTER TABLE payments ADD COLUMN base_fee REAL;
-ALTER TABLE payments ADD COLUMN energy_fee REAL;
-ALTER TABLE payments ADD COLUMN overuse_fee REAL;
-ALTER TABLE payments ADD COLUMN total_amount REAL;
+# 建立扣款紀錄表
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS payments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    transaction_id INTEGER,
+    id_tag TEXT,
+    amount REAL,
+    timestamp TEXT
+)
+''')
 
 # ✅ 時段電價設定管理：新增與刪除
 @app.post("/api/pricing-rules")
