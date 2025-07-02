@@ -1745,14 +1745,24 @@ async def add_payment(data: dict = Body(...)):
         raise HTTPException(status_code=400, detail=str(e))
 
 
+from fastapi import Query
+
 @app.post("/api/internal/mock-daily-pricing")
-async def mock_daily_pricing():
-    base = datetime(2025, 6, 1)
-    for i in range(30):
+async def mock_daily_pricing(
+    start: str = Query("2025-06-01", description="起始日期（格式 YYYY-MM-DD）"),
+    days: int = Query(30, description="建立幾天的電價")
+):
+    try:
+        base = datetime.strptime(start, "%Y-%m-%d")
+    except ValueError:
+        return JSONResponse(status_code=400, content={"error": "Invalid start date format. Use YYYY-MM-DD"})
+
+    count = 0
+    for i in range(days):
         day = base + timedelta(days=i)
         date_str = day.strftime("%Y-%m-%d")
 
-        # 檢查是否已存在
+        # 跳過已存在的
         cursor.execute('SELECT * FROM daily_pricing WHERE date = ?', (date_str,))
         if cursor.fetchone():
             continue
@@ -1761,9 +1771,15 @@ async def mock_daily_pricing():
             INSERT INTO daily_pricing (date, price_per_kwh)
             VALUES (?, ?)
         ''', (date_str, 10.0))
+        count += 1
 
     conn.commit()
-    return {"message": "✅ 已建立 6 月每日 10 元/kWh 電價資料"}
+    return {
+        "message": f"✅ 已建立 {count} 筆日電價",
+        "start": start,
+        "days": days
+    }
+
 
 @app.post("/api/internal/recalculate-all-payments")
 async def recalculate_all_payments():
