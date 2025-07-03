@@ -823,18 +823,22 @@ async def list_id_tags():
 
 @app.post("/api/id_tags")
 async def add_id_tag(data: dict = Body(...)):
+    print("📥 收到新增卡片資料：", data)
+
     id_tag = data.get("idTag")
     status = data.get("status", "Accepted")
     valid_until = data.get("validUntil", "2099-12-31T23:59:59")
 
     if not id_tag:
+        print("❌ idTag 缺失")
         raise HTTPException(status_code=400, detail="idTag is required")
 
     try:
-        # ✅ 解析格式（允許缺秒）
+        # ✅ 解析格式（允許無秒的 ISO 格式）
         valid_dt = parse_date(valid_until)
         valid_str = valid_dt.strftime("%Y-%m-%dT%H:%M:%S")
     except Exception as e:
+        print(f"❌ validUntil 格式錯誤：{valid_until}，錯誤訊息：{e}")
         raise HTTPException(status_code=400, detail="Invalid validUntil format")
 
     try:
@@ -843,8 +847,13 @@ async def add_id_tag(data: dict = Body(...)):
             (id_tag, status, valid_str)
         )
         conn.commit()
-    except sqlite3.IntegrityError:
+        print(f"✅ 已成功新增卡片：{id_tag}, {status}, {valid_str}")
+    except sqlite3.IntegrityError as e:
+        print(f"❌ 資料庫重複錯誤：{e}")
         raise HTTPException(status_code=409, detail="idTag already exists")
+    except Exception as e:
+        print(f"❌ 未知新增錯誤：{e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
     return {"message": "Added successfully"}
 
