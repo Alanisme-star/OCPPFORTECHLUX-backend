@@ -618,54 +618,47 @@ async def calculate_transaction_cost(transaction_id: int):
 
    
 
-
-
-
-
-
 @app.get("/api/transactions/cost-summary")
-
 async def transaction_cost_summary(
     start: str = Query(None),
     end: str = Query(None)
 ):
-    # SQL 查詢語句（查找已結束交易）
     query = """
-        SELECT transaction_id FROM transactions
-        WHERE meter_stop IS NOT NULL
+        SELECT t.transaction_id, (t.meter_stop - t.meter_start)/1000.0 as kWh,
+               p.base_fee, p.energy_fee, p.overuse_fee, p.total_amount
+        FROM transactions t
+        JOIN payments p ON t.transaction_id = p.transaction_id
+        WHERE t.meter_stop IS NOT NULL
     """
     params = []
+
     if start:
-        query += " AND start_timestamp >= ?"
+        query += " AND t.start_timestamp >= ?"
         params.append(start)
     if end:
-        query += " AND start_timestamp <= ?"
+        query += " AND t.start_timestamp <= ?"
         params.append(end)
 
-    # 執行查詢
-    
     cursor.execute(query, params)
-    txn_ids = [row[0] for row in cursor.fetchall()]
+    rows = cursor.fetchall()
 
     result = []
-
-    # 對每個交易 ID 進行費用計算
-    for txn_id in txn_ids:
-        try:
-            cost_data = compute_transaction_cost(txn_id)
-            result.append({
-                "transactionId": txn_id,
-                "totalKWh": round(cost_data["kWh"], 3),
-                "basicFee": cost_data["baseFee"],
-                "energyCost": cost_data["energyFee"],
-                "overuseFee": cost_data["overuseFee"],
-                "totalCost": cost_data["totalAmount"]
-            })
-        except Exception as e:
-            print(f"⚠️ 計算交易 {txn_id} 失敗：{e}")
-            continue
+    for row in rows:
+        result.append({
+            "transactionId": row[0],
+            "totalKWh": round(row[1], 3),
+            "basicFee": row[2],
+            "energyCost": row[3],
+            "overuseFee": row[4],
+            "totalCost": row[5]
+        })
 
     return result
+
+
+
+
+
 
 @app.get("/api/transactions/{transaction_id}")
 async def get_transaction_detail(transaction_id: int):
