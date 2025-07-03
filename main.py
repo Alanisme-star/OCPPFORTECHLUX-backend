@@ -1883,8 +1883,23 @@ from fastapi import Request
 
 @app.post("/users")
 async def create_user(user: dict):
-    # 你可以寫入資料庫或暫存變數，這裡先簡單列印
-    print("✅ 新增使用者：", user)
-    return {"message": "User added successfully", "user": user}
+    id_tag = user.get("idTag")
+    name = user.get("name")
+    department = user.get("department")
+    card_number = user.get("cardNumber")
+
+    if not id_tag:
+        raise HTTPException(status_code=400, detail="idTag is required")
+
+    try:
+        cursor.execute('''
+            INSERT INTO users (id_tag, name, department, card_number)
+            VALUES (?, ?, ?, ?)
+        ''', (id_tag, name, department, card_number))
+        conn.commit()
+        return {"message": "User added successfully"}
+    except sqlite3.IntegrityError:
+        raise HTTPException(status_code=409, detail="User already exists")
+
 
 
