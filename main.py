@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from fastapi import FastAPI, Request, Query, Body, Path, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
+from dateutil.parser import parse as parse_date  # ✅ 加入這行
 
 import uvicorn
 from websockets.server import serve
