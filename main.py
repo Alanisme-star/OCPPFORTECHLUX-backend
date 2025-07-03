@@ -813,7 +813,6 @@ async def get_latest_meter_value(charge_point_id: str):
         raise HTTPException(status_code=404, detail="No meter values found.")
 
 
-
 @app.get("/api/id_tags")
 async def list_id_tags():
     cursor.execute("SELECT id_tag, status, valid_until FROM id_tags")
@@ -827,15 +826,28 @@ async def add_id_tag(data: dict = Body(...)):
     id_tag = data.get("idTag")
     status = data.get("status", "Accepted")
     valid_until = data.get("validUntil", "2099-12-31T23:59:59")
+
     if not id_tag:
         raise HTTPException(status_code=400, detail="idTag is required")
 
     try:
-        cursor.execute('INSERT INTO id_tags (id_tag, status, valid_until) VALUES (?, ?, ?)', (id_tag, status, valid_until))
+        # ✅ 解析格式（允許缺秒）
+        valid_dt = parse_date(valid_until)
+        valid_str = valid_dt.strftime("%Y-%m-%dT%H:%M:%S")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Invalid validUntil format")
+
+    try:
+        cursor.execute(
+            'INSERT INTO id_tags (id_tag, status, valid_until) VALUES (?, ?, ?)',
+            (id_tag, status, valid_str)
+        )
         conn.commit()
     except sqlite3.IntegrityError:
         raise HTTPException(status_code=409, detail="idTag already exists")
+
     return {"message": "Added successfully"}
+
 
 @app.put("/api/id_tags/{id_tag}")
 async def update_id_tag(
