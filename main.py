@@ -624,8 +624,11 @@ async def calculate_transaction_cost(transaction_id: int):
 
 
 @app.get("/api/transactions/cost-summary")
-async def transaction_cost_summary(start: str = Query(None), end: str = Query(None)):
 
+async def transaction_cost_summary(
+    start: str = Query(None),
+    end: str = Query(None)
+):
     # SQL 查詢語句（查找已結束交易）
     query = """
         SELECT transaction_id FROM transactions
