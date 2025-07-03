@@ -1879,27 +1879,4 @@ async def mock_status(data: dict = Body(...)):
     return {"message": f"Mock status for {cp_id} 已注入"}
 
 
-from fastapi import Request
-
-@app.post("/users")
-async def create_user(user: dict):
-    id_tag = user.get("idTag")
-    name = user.get("name")
-    department = user.get("department")
-    card_number = user.get("cardNumber")
-
-    if not id_tag:
-        raise HTTPException(status_code=400, detail="idTag is required")
-
-    try:
-        cursor.execute('''
-            INSERT INTO users (id_tag, name, department, card_number)
-            VALUES (?, ?, ?, ?)
-        ''', (id_tag, name, department, card_number))
-        conn.commit()
-        return {"message": "User added successfully"}
-    except sqlite3.IntegrityError:
-        raise HTTPException(status_code=409, detail="User already exists")
-
-
 
