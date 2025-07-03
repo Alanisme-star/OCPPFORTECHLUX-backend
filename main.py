@@ -624,11 +624,8 @@ async def calculate_transaction_cost(transaction_id: int):
 
 
 @app.get("/api/transactions/cost-summary")
+async def transaction_cost_summary(start: str = Query(None), end: str = Query(None)):
 
-async def transaction_cost_summary(
-    start: str = Query(None),
-    end: str = Query(None)
-):
     # SQL 查詢語句（查找已結束交易）
     query = """
         SELECT transaction_id FROM transactions
@@ -653,18 +650,19 @@ async def transaction_cost_summary(
     for txn_id in txn_ids:
         try:
             cost_data = compute_transaction_cost(txn_id)
-            result.append(cost_data)
-
+            result.append({
+                "transactionId": txn_id,
+                "totalKWh": round(cost_data["kWh"], 3),
+                "basicFee": cost_data["baseFee"],
+                "energyCost": cost_data["energyFee"],
+                "overuseFee": cost_data["overuseFee"],
+                "totalCost": cost_data["totalAmount"]
+            })
         except Exception as e:
             print(f"⚠️ 計算交易 {txn_id} 失敗：{e}")
             continue
 
-    return result
-
-
-
-
-
+        return result
 
 @app.get("/api/transactions/{transaction_id}")
 async def get_transaction_detail(transaction_id: int):
