@@ -619,10 +619,7 @@ async def calculate_transaction_cost(transaction_id: int):
    
 
 @app.get("/api/transactions/cost-summary")
-async def transaction_cost_summary(
-    start: str = Query(None),
-    end: str = Query(None)
-):
+async def transaction_cost_summary():
     query = """
         SELECT t.transaction_id, (t.meter_stop - t.meter_start)/1000.0 as kWh,
                p.base_fee, p.energy_fee, p.overuse_fee, p.total_amount
@@ -630,16 +627,7 @@ async def transaction_cost_summary(
         JOIN payments p ON t.transaction_id = p.transaction_id
         WHERE t.meter_stop IS NOT NULL
     """
-    params = []
-
-    if start:
-        query += " AND t.start_timestamp >= ?"
-        params.append(start)
-    if end:
-        query += " AND t.start_timestamp <= ?"
-        params.append(end)
-
-    cursor.execute(query, params)
+    cursor.execute(query)
     rows = cursor.fetchall()
 
     result = []
@@ -654,8 +642,6 @@ async def transaction_cost_summary(
         })
 
     return result
-
-
 
 
 
