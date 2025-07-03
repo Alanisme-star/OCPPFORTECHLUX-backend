@@ -1879,5 +1879,12 @@ async def mock_status(data: dict = Body(...)):
     return {"message": f"Mock status for {cp_id} 已注入"}
 
 
+from fastapi import Request
+
+@app.post("/users")
+async def create_user(user: dict):
+    # 你可以寫入資料庫或暫存變數，這裡先簡單列印
+    print("✅ 新增使用者：", user)
+    return {"message": "User added successfully", "user": user}
 
 
