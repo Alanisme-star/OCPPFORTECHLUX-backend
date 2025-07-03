@@ -1901,4 +1901,25 @@ async def mock_status(data: dict = Body(...)):
     return {"message": f"Mock status for {cp_id} 已注入"}
 
 
+@app.get("/api/dashboard/rank_by_idTag")
+async def get_dashboard_top_idtags(limit: int = Query(10)):
+    cursor.execute("""
+        SELECT id_tag,
+               COUNT(*) as transaction_count,
+               SUM(meter_stop - meter_start) as total_energy
+        FROM transactions
+        WHERE meter_stop IS NOT NULL
+        GROUP BY id_tag
+        ORDER BY total_energy DESC
+        LIMIT ?
+    """, (limit,))
+    rows = cursor.fetchall()
+
+    return [
+        {
+            "idTag": row[0],
+            "transactionCount": row[1],
+            "totalEnergy": round((row[2] or 0) / 1000, 3)  # 換算成 kWh
+        } for row in rows
+    ]
 
