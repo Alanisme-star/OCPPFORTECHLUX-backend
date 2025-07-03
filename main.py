@@ -662,7 +662,7 @@ async def transaction_cost_summary(start: str = Query(None), end: str = Query(No
             print(f"⚠️ 計算交易 {txn_id} 失敗：{e}")
             continue
 
-        return result
+    return result
 
 @app.get("/api/transactions/{transaction_id}")
 async def get_transaction_detail(transaction_id: int):
