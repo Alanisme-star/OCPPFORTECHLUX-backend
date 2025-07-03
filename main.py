@@ -1865,4 +1865,19 @@ async def missing_cost_transactions():
     return missing
 
 
+from fastapi import Body
+from datetime import datetime
+
+@app.post("/api/internal/mock-status")
+async def mock_status(data: dict = Body(...)):
+    cp_id = data["cp_id"]
+    charging_point_status[cp_id] = {
+        "connectorId": data.get("connector_id", 1),
+        "status": data.get("status", "Available"),
+        "timestamp": data.get("timestamp") or datetime.utcnow().isoformat()
+    }
+    return {"message": f"Mock status for {cp_id} 已注入"}
+
+
+
 
