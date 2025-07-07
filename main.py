@@ -1923,3 +1923,44 @@ async def get_dashboard_top_idtags(limit: int = Query(10)):
         } for row in rows
     ]
 
+@app.post("/api/internal/duplicate-daily-pricing")
+async def duplicate_by_rule(data: dict = Body(...)):
+    """
+    根據 weekday/saturday/sunday 套用規則，套用至整月符合條件的日期
+    請求內容：
+    {
+        "type": "weekday" | "saturday" | "sunday",
+        "rules": [...],
+        "start": "2025-07-01"
+    }
+    """
+    try:
+        type = data["type"]
+        rules = data["rules"]
+        start = datetime.strptime(data["start"], "%Y-%m-%d")
+        days_in_month = (start.replace(month=start.month % 12 + 1, day=1) - timedelta(days=1)).day
+
+        inserted = 0
+        for d in range(1, days_in_month + 1):
+            current = datetime(start.year, start.month, d)
+            weekday = current.weekday()  # 0=Mon, ..., 6=Sun
+
+            # 篩選符合類型的日期
+            if (type == "weekday" and weekday < 5) or \
+               (type == "saturday" and weekday == 5) or \
+               (type == "sunday" and weekday == 6):
+                date_str = current.strftime("%Y-%m-%d")
+                # 先刪除既有設定
+                cursor.execute("DELETE FROM daily_pricing_rules WHERE date = ?", (date_str,))
+                for r in rules:
+                    cursor.execute("""
+                        INSERT INTO daily_pricing_rules (date, start_time, end_time, price, label)
+                        VALUES (?, ?, ?, ?, ?)
+                    """, (date_str, r["startTime"], r["endTime"], float(r["price"]), r["label"]))
+                inserted += 1
+
+        conn.commit()
+        return {"message": f"✅ 套用完成，共更新 {inserted} 天"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
