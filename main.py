@@ -1964,3 +1964,9 @@ async def duplicate_by_rule(data: dict = Body(...)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# 新增：依據日期批次刪除 daily_pricing_rules
+@app.delete("/api/daily-pricing")
+async def delete_daily_pricing_by_date(date: str = Query(...)):
+    cursor.execute("DELETE FROM daily_pricing_rules WHERE date = ?", (date,))
+    conn.commit()
+    return {"message": f"已刪除 {date} 所有設定"}
