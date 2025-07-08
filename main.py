@@ -955,6 +955,17 @@ async def on_connect(websocket, path):
     await cp.start()
 
 # 啟動 WebSocket Server
+async def start_websocket():
+    server = await serve(
+        on_connect,
+        "0.0.0.0",  # 可依需求改為 localhost
+        9000,
+        subprotocols=["ocpp1.6"]
+    )
+    logging.info("✅ WebSocket Server 已啟動 ws://0.0.0.0:9000")
+    await server.wait_closed()
+
+
 
 import requests
 
