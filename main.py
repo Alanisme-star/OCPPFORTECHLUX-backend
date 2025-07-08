@@ -15,7 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from dateutil.parser import parse as parse_date  # ✅ 加入這行
 
 import uvicorn
-from websockets.server import serve
+
 from websockets.exceptions import ConnectionClosedOK
 
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -31,17 +31,8 @@ from ocpp.v16.call_result import (
 )
 from ocpp.v16.enums import Action, RegistrationStatus
 from ocpp.routing import on
-from threading import Thread
 
 
-
-
-
-
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from urllib.parse import urlparse, parse_qs
-from ocpp.v16 import ChargePoint as cp
-from ocpp.v16 import call_result
 
 app = FastAPI()
 logging.basicConfig(level=logging.INFO)
@@ -53,17 +44,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# 自訂 ChargePoint 類別
-class ChargePoint(cp):
-    @on("BootNotification")
-    async def on_boot_notification(self, charge_point_model, charge_point_vendor, **kwargs):
-        logging.info(f"🔌 BootNotification from {self.id}")
-        return call_result.BootNotificationPayload(
-            current_time="2025-07-09T00:00:00Z",
-            interval=10,
-            status="Accepted"
-        )
 
 # WebSocket 連線端點（共用 PORT）
 @app.websocket("/")
@@ -92,24 +72,8 @@ async def websocket_endpoint(websocket: WebSocket):
 
 
 
-
-# 建立 FastAPI app
-app = FastAPI()
-
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origin_regex=r"https://.*\.onrender\.com",  # ✅ 僅保留 regex，前面加 r 原始字串
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"]
-)
-
-
 # 初始化狀態儲存
 charging_point_status = {}
-
-logging.basicConfig(level=logging.INFO)
 
 # HTTP 端點：查詢狀態
 @app.get("/status/{cp_id}")
@@ -122,17 +86,6 @@ async def authorize(cp_id: str, badge_id: str = Body(..., embed=True)):
     # 查 DB，回傳 AuthorizePayload
     loop = asyncio.get_event_loop()
     return {"idTagInfo": {"status": "Accepted"}}
-
-# 以下開始 WebSocket 與 OCPP 部分
-
-
-
-logging.basicConfig(level=logging.INFO)
-# 啟用 logging
-logging.basicConfig(level=logging.INFO)
-
-# 用於記錄所有充電樁的狀態
-charging_point_status = {}
 
 
 # 初始化 SQLite 資料庫
@@ -556,12 +509,6 @@ async def on_status_notification(self, connector_id, status, timestamp, **kwargs
     ''', (self.id, connector_id, status, timestamp))
     conn.commit()
 
-    # ✅ 新增：更新全域狀態變數
-    charging_point_status[self.id] = {
-        "connectorId": connector_id,
-        "status": status,
-        "timestamp": timestamp
-    }
 
     logging.info(f"📡 StatusNotification | CP={self.id} | connector={connector_id} | status={status}")
     return StatusNotificationPayload()
@@ -1004,26 +951,6 @@ async def get_top_consumers(
 
     return JSONResponse(content=result)  
 
-# WebSocket 充電樁接入時呼叫的處理函式
-
-async def on_connect(websocket, path):
-    # Log 原始 path 供除錯
-    logging.info(f"📥 WebSocket path received: {path}")
-
-    # 解析 query string，取得充電樁 ID
-    parsed = urlparse(path)
-    query = parse_qs(parsed.query)
-    charge_point_id = query.get("id", ["unknown"])[0]
-
-    logging.info(f"🔌 WebSocket connected. ID: {charge_point_id}")
-
-    cp = ChargePoint(charge_point_id, websocket)
-
-    try:
-        await cp.start()
-    except Exception as e:
-        logging.error(f"⚠️ 充電樁 {charge_point_id} WebSocket 錯誤：{e}")
-
 
 
 from datetime import datetime, timedelta
@@ -1091,23 +1018,6 @@ async def test_line_messaging(payload: dict = Body(...)):
 
     return {"message": f"Sent to {len(recipient_ids)} users"}
 
-
-
-# 加上允許所有 WebSocket 請求
-import websockets
-
-# 允許所有 WebSocket 請求（避免 Render 擋住）
-async def accept_all_requests(path, request_headers):
-    return None
-
-# WebSocket 連線處理
-async def on_connect(websocket, path):
-    logging.info(f"📥 WebSocket path received: {path}")
-    parsed = urlparse(path)
-    query = parse_qs(parsed.query)
-    charge_point_id = query.get("id", ["unknown"])[0]
-    logging.info(f"🔌 WebSocket connected. ID: {charge_point_id}")
-    # 後續 WebSocket 處理邏輯...
 
 
 
