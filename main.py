@@ -1774,7 +1774,12 @@ async def recalculate_all_payments():
     cursor.execute('DELETE FROM payments')
     conn.commit()
 
-    cursor.execute('SELECT transaction_id, charge_point_id, meter_start, meter_stop, start_timestamp, stop_timestamp, id_tag FROM transactions WHERE meter_stop IS NOT NULL')
+    cursor.execute('''
+        SELECT transaction_id, charge_point_id, meter_start, meter_stop,
+               start_timestamp, stop_timestamp, id_tag
+        FROM transactions
+        WHERE meter_stop IS NOT NULL
+    ''')
     rows = cursor.fetchall()
     created = 0
     skipped = 0
@@ -1821,20 +1826,21 @@ async def recalculate_all_payments():
                 skipped += 1
                 continue
 
+            # 成本計算
             kWh = (meter_stop - meter_start) / 1000
             base_fee = 20.0
             energy_fee = round(kWh * price, 2)
             overuse_fee = round(kWh * 2 if kWh > 5 else 0, 2)
             total_amount = round(base_fee + energy_fee + overuse_fee, 2)
 
-            # 寫入 payments
+            # 寫入 payments 表
             cursor.execute('''
                 INSERT INTO payments (transaction_id, base_fee, energy_fee, overuse_fee, total_amount)
                 VALUES (?, ?, ?, ?, ?)
             ''', (txn_id, base_fee, energy_fee, overuse_fee, total_amount))
             created += 1
 
-            # 自動扣款卡片餘額（需查詢卡號）
+            # 依照 id_tag → 查出卡片 → 扣除餘額
             cursor.execute('SELECT card_id FROM id_tags WHERE id_tag = ?', (id_tag,))
             card_row = cursor.fetchone()
             if card_row:
@@ -1843,12 +1849,16 @@ async def recalculate_all_payments():
                 balance_row = cursor.fetchone()
                 if balance_row:
                     old_balance = balance_row[0]
-                    new_balance = round(old_balance - total_amount, 2)
-                    if new_balance < 0:
-                        print(f"⚠️ 卡片餘額不足：{card_id} 扣款失敗")
-                    else:
+                    if old_balance >= total_amount:
+                        new_balance = round(old_balance - total_amount, 2)
                         cursor.execute('UPDATE cards SET balance = ? WHERE card_id = ?', (new_balance, card_id))
                         print(f"💳 扣款成功：{card_id} | {old_balance} → {new_balance} 元")
+                    else:
+                        print(f"⚠️ 卡片餘額不足：{card_id} 扣款失敗 | 餘額={old_balance}，需={total_amount}")
+                else:
+                    print(f"⚠️ 找不到卡片餘額：card_id={card_id}")
+            else:
+                print(f"⚠️ 找不到對應卡片：idTag={id_tag}")
 
         except Exception as e:
             print(f"❌ 錯誤 txn {txn_id} | idTag={id_tag} | {e}")
@@ -1860,6 +1870,7 @@ async def recalculate_all_payments():
         "created": created,
         "skipped": skipped
     }
+
 
 
 
