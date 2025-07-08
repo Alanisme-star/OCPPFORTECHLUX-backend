@@ -948,15 +948,26 @@ async def get_top_consumers(
     return JSONResponse(content=result)  
 
 # WebSocket 充電樁接入時呼叫的處理函式
+from urllib.parse import urlparse, parse_qs
+
 async def on_connect(websocket, path):
-    cp_id = path.strip("/")
-    cp = ChargePoint(cp_id, websocket)
-    logging.info(f"🔌 充電樁已連線：{cp_id}")
-    await cp.start()
+    # Log 原始 path 供除錯
+    logging.info(f"📥 WebSocket path received: {path}")
 
+    # 解析 query string，取得充電樁 ID
+    parsed = urlparse(path)
+    query = parse_qs(parsed.query)
+    charge_point_id = query.get("id", ["unknown"])[0]
 
+    logging.info(f"🔌 WebSocket connected. ID: {charge_point_id}")
 
-import requests
+    cp = ChargePoint(charge_point_id, websocket)
+
+    try:
+        await cp.start()
+    except Exception as e:
+        logging.error(f"⚠️ 充電樁 {charge_point_id} WebSocket 錯誤：{e}")
+
 
 
 from datetime import datetime, timedelta
