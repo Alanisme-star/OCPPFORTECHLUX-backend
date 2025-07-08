@@ -1829,7 +1829,6 @@ async def recalculate_all_payments():
             price = None
             for seg in pricing_segments:
                 seg_start, seg_end, seg_price = seg
-                # 處理跨午夜 ex: 22:00~07:00
                 if seg_start < seg_end:
                     if seg_start <= t_start < seg_end:
                         price = seg_price
@@ -1850,12 +1849,34 @@ async def recalculate_all_payments():
             overuse_fee = round(kWh * 2 if kWh > 5 else 0, 2)
             total_amount = round(base_fee + energy_fee + overuse_fee, 2)
 
+            # 查詢卡片餘額
+            cursor.execute("SELECT balance FROM cards WHERE card_id = ?", (id_tag,))
+            card = cursor.fetchone()
+            if card is None:
+                print(f"[❌] 找不到卡片：{id_tag}")
+                skipped += 1
+                continue
+
+            if card[0] < total_amount:
+                print(f"[❌] 餘額不足，無法扣款：{id_tag}，現有 {card[0]}，需扣 {total_amount}")
+                skipped += 1
+                continue
+
+            # 建立付款紀錄
             cursor.execute('''
                 INSERT INTO payments (transaction_id, base_fee, energy_fee, overuse_fee, total_amount)
                 VALUES (?, ?, ?, ?, ?)
             ''', (txn_id, base_fee, energy_fee, overuse_fee, total_amount))
+
+            # 扣款寫回卡片餘額
+            cursor.execute("""
+                UPDATE cards
+                SET balance = balance - ?
+                WHERE card_id = ?
+            """, (total_amount, id_tag))
+
             created += 1
-            print(f"✅ Created txn {txn_id} | 日期 {date_str} 成本 {total_amount} 元 | kWh={kWh} | 單價={price} | idTag={id_tag}")
+            print(f"✅ Created txn {txn_id} | {date_str} 扣款 {total_amount} 元（餘額剩餘 {card[0] - total_amount} 元） | 單價={price} | idTag={id_tag}")
 
         except Exception as e:
             print(f"❌ 錯誤 txn {txn_id} | idTag={id_tag} | {e}")
@@ -1864,7 +1885,7 @@ async def recalculate_all_payments():
     conn.commit()
     print(f"== recalculate 統計：created={created}, skipped={skipped}, total={len(rows)} ==")
     return {
-        "message": "✅ 已重新計算所有交易成本（daily_pricing_rules 分段）",
+        "message": "✅ 已重新計算所有交易成本（daily_pricing_rules 分段並自動扣款）",
         "created": created,
         "skipped": skipped
     }
