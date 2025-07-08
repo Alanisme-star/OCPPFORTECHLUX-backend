@@ -13,7 +13,7 @@ from fastapi import FastAPI, Request, Query, Body, Path, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from dateutil.parser import parse as parse_date  # ✅ 加入這行
-
+from ocpp.v16 import call_result
 import uvicorn
 
 from websockets.exceptions import ConnectionClosedOK
@@ -298,7 +298,10 @@ class ChargePoint(OcppChargePoint):
 
         if not res:
             logging.warning(f"⛔ StartTransaction 拒絕 | 無有效預約")
-            return StartTransaction(transaction_id=0, id_tag_info={"status": "Expired"})
+            return call_result.StartTransactionPayload(
+                transaction_id=0,
+                id_tag_info={"status": "Expired"}
+            )
         else:
             cursor.execute("UPDATE reservations SET status = 'completed' WHERE id = ?", (res[0],))
             conn.commit()
