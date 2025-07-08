@@ -1838,7 +1838,6 @@ async def recalculate_all_payments():
                 INSERT INTO payments (transaction_id, base_fee, energy_fee, overuse_fee, total_amount)
                 VALUES (?, ?, ?, ?, ?)
             ''', (txn_id, base_fee, energy_fee, overuse_fee, total_amount))
-            created += 1
 
             # 依照 id_tag → 查出卡片 → 扣除餘額
             cursor.execute('SELECT card_id FROM id_tags WHERE id_tag = ?', (id_tag,))
@@ -1852,6 +1851,7 @@ async def recalculate_all_payments():
                     if old_balance >= total_amount:
                         new_balance = round(old_balance - total_amount, 2)
                         cursor.execute('UPDATE cards SET balance = ? WHERE card_id = ?', (new_balance, card_id))
+                        conn.commit()  # 每筆扣款成功就立即寫入
                         print(f"💳 扣款成功：{card_id} | {old_balance} → {new_balance} 元")
                     else:
                         print(f"⚠️ 卡片餘額不足：{card_id} 扣款失敗 | 餘額={old_balance}，需={total_amount}")
@@ -1860,11 +1860,12 @@ async def recalculate_all_payments():
             else:
                 print(f"⚠️ 找不到對應卡片：idTag={id_tag}")
 
+            created += 1
+
         except Exception as e:
             print(f"❌ 錯誤 txn {txn_id} | idTag={id_tag} | {e}")
             skipped += 1
 
-    conn.commit()
     return {
         "message": "✅ 已重新計算所有交易成本（daily_pricing_rules 分段並自動扣款）",
         "created": created,
