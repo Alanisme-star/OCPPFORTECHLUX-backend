@@ -1419,12 +1419,23 @@ async def get_cards():
     rows = cursor.fetchall()
     return [{"id": row[0], "card_id": row[0], "balance": row[1]} for row in rows]
 
-@app.delete("/api/cards/{card_id}")
-async def delete_card(card_id: str):
-    cursor.execute("DELETE FROM cards WHERE card_id = ?", (card_id,))
-    cursor.execute("DELETE FROM id_tags WHERE id_tag = ?", (card_id,))
+@app.delete("/api/id_tags/{id_tag}")
+async def delete_id_tag(id_tag: str = Path(...)):
+    cursor.execute("DELETE FROM id_tags WHERE id_tag = ?", (id_tag,))
+    cursor.execute("DELETE FROM cards WHERE card_id = ?", (id_tag,))
     conn.commit()
-    return {"message": f"Card {card_id} deleted."}
+    return {"message": "Deleted successfully"}
+
+@app.put("/api/cards/{card_id}")
+async def update_card(card_id: str, payload: dict):
+    new_balance = payload.get("balance")
+    if new_balance is None:
+        raise HTTPException(status_code=400, detail="Missing balance")
+    cursor.execute("UPDATE cards SET balance = ? WHERE card_id = ?", (new_balance, card_id))
+    conn.commit()
+    return {"message": f"Card {card_id} updated", "new_balance": new_balance}
+
+
 
 @app.post("/api/cards/{card_id}/topup")
 async def topup_card(card_id: str = Path(...), data: dict = Body(...)):
