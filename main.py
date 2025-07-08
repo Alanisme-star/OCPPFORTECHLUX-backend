@@ -1774,10 +1774,6 @@ async def recalculate_all_payments():
     cursor.execute('DELETE FROM payments')
     conn.commit()
 
-    # 可選擇清除所有卡片餘額（模擬測試時使用）
-    # cursor.execute('UPDATE cards SET balance = 0')
-    # conn.commit()
-
     cursor.execute('''
         SELECT transaction_id, charge_point_id, meter_start, meter_stop,
                start_timestamp, stop_timestamp, id_tag
@@ -1787,9 +1783,6 @@ async def recalculate_all_payments():
     rows = cursor.fetchall()
     created = 0
     skipped = 0
-
-    # 建立扣款追蹤器：{card_id: 已扣款總額}
-    deducted_amounts = {}
 
     for row in rows:
         txn_id, cp_id, meter_start, meter_stop, start_ts, stop_ts, id_tag = row
@@ -1847,21 +1840,8 @@ async def recalculate_all_payments():
             ''', (txn_id, base_fee, energy_fee, overuse_fee, total_amount))
             created += 1
 
-            # 查詢 card_id
-            cursor.execute('SELECT card_id FROM id_tags WHERE id_tag = ?', (id_tag,))
-            card_row = cursor.fetchone()
-            if not card_row:
-                print(f"⚠️ 找不到對應卡片：idTag={id_tag}")
-                continue
-
-            card_id = card_row[0]
-
-            # 避免重複扣款：查詢該筆交易是否已扣款過
-            key = f"{card_id}-{txn_id}"
-            if key in deducted_amounts:
-                print(f"🟡 已扣過款：{key}，跳過")
-                continue
-
+            # 這裡重點修正：直接用 id_tag 對應卡片卡號
+            card_id = id_tag
             cursor.execute('SELECT balance FROM cards WHERE card_id = ?', (card_id,))
             balance_row = cursor.fetchone()
             if balance_row:
@@ -1869,7 +1849,6 @@ async def recalculate_all_payments():
                 if old_balance >= total_amount:
                     new_balance = round(old_balance - total_amount, 2)
                     cursor.execute('UPDATE cards SET balance = ? WHERE card_id = ?', (new_balance, card_id))
-                    deducted_amounts[key] = total_amount
                     print(f"💳 扣款成功：{card_id} | {old_balance} → {new_balance} 元 | txn={txn_id}")
                 else:
                     print(f"⚠️ 餘額不足：{card_id} | 餘額={old_balance}，費用={total_amount}")
@@ -1886,6 +1865,7 @@ async def recalculate_all_payments():
         "created": created,
         "skipped": skipped
     }
+
 
 
 
