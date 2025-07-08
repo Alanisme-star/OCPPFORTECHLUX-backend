@@ -36,6 +36,27 @@ from fastapi import WebSocket, WebSocketDisconnect
 from urllib.parse import urlparse, parse_qs
 
 
+class FastAPIWebSocketAdapter:
+    def __init__(self, websocket):
+        self.websocket = websocket
+
+    async def recv(self):
+        msg = await self.websocket.receive_text()
+        return msg
+
+    async def send(self, data):
+        await self.websocket.send_text(data)
+
+    # ocpp 會取 subprotocol 屬性
+    @property
+    def subprotocol(self):
+        return self.websocket.headers.get('sec-websocket-protocol')
+
+
+
+
+
+
 app = FastAPI()
 logging.basicConfig(level=logging.INFO)
 
@@ -47,18 +68,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# WebSocket 連線端點（共用 PORT）
+
+
 @app.websocket("/")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept(subprotocol="ocpp1.6")
-
-    # 解析 query string 取得 ID（如：?id=TW*MSI*E000100）
     parsed = urlparse(str(websocket.url))
     query = parse_qs(parsed.query)
     charge_point_id = query.get("id", ["unknown"])[0]
     logging.info(f"📥 WebSocket connected. ID: {charge_point_id}")
 
-    cp_instance = ChargePoint(charge_point_id, websocket)
+    # 用 adapter 包裝
+    ws_adapter = FastAPIWebSocketAdapter(websocket)
+    cp_instance = ChargePoint(charge_point_id, ws_adapter)
 
     try:
         await cp_instance.start()
@@ -66,10 +88,6 @@ async def websocket_endpoint(websocket: WebSocket):
         logging.info(f"⚠️ 充電樁 {charge_point_id} 已離線")
     except Exception as e:
         logging.error(f"❌ 發生錯誤：{e}")
-
-
-
-
 
 
 
