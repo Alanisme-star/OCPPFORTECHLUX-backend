@@ -1768,9 +1768,9 @@ async def mock_daily_pricing(
     }
 
 
+
 @app.post("/api/internal/recalculate-all-payments")
 async def recalculate_all_payments():
-    # 清除舊資料
     cursor.execute('DELETE FROM payments')
     conn.commit()
 
@@ -1780,40 +1780,23 @@ async def recalculate_all_payments():
     skipped = 0
 
     for row in rows:
-        if len(row) == 7:
-            txn_id, cp_id, meter_start, meter_stop, start_ts, stop_ts, id_tag = row
-        else:
-            txn_id, cp_id, meter_start, meter_stop, start_ts, stop_ts = row
-            id_tag = "N/A"
+        txn_id, cp_id, meter_start, meter_stop, start_ts, stop_ts, id_tag = row
 
         try:
-            if not meter_start or not meter_stop:
-                print(f"🟠 Skipped txn {txn_id} | meter_start or meter_stop 缺失")
-                skipped += 1
-                continue
-            if not start_ts or not stop_ts:
-                print(f"🟠 Skipped txn {txn_id} | start_timestamp or stop_timestamp 缺失")
+            if not meter_start or not meter_stop or not start_ts or not stop_ts:
                 skipped += 1
                 continue
 
-            try:
-                start_obj = datetime.fromisoformat(start_ts)
-                stop_obj = datetime.fromisoformat(stop_ts)
-            except Exception as e:
-                print(f"🟠 Skipped txn {txn_id} | 無法解析日期: {start_ts},{stop_ts} | error: {e}")
-                skipped += 1
-                continue
+            start_obj = datetime.fromisoformat(start_ts)
+            stop_obj = datetime.fromisoformat(stop_ts)
 
             if start_obj.date() != stop_obj.date():
-                print(f"⚠️ Skipped txn {txn_id} | 不支援跨日（請人工分段）")
                 skipped += 1
                 continue
 
             date_str = start_obj.strftime("%Y-%m-%d")
             t_start = start_obj.strftime("%H:%M")
-            t_stop = stop_obj.strftime("%H:%M")
 
-            # 取出當天所有分段
             cursor.execute('''
                 SELECT start_time, end_time, price FROM daily_pricing_rules
                 WHERE date = ?
@@ -1821,14 +1804,11 @@ async def recalculate_all_payments():
             ''', (date_str,))
             pricing_segments = cursor.fetchall()
             if not pricing_segments:
-                print(f"⚠️ Skipped txn {txn_id} | 日期 {date_str} 找不到 daily_pricing_rules（idTag={id_tag}，原始時間: {start_ts})")
                 skipped += 1
                 continue
 
-            # 預設用起始分段單價
             price = None
-            for seg in pricing_segments:
-                seg_start, seg_end, seg_price = seg
+            for seg_start, seg_end, seg_price in pricing_segments:
                 if seg_start < seg_end:
                     if seg_start <= t_start < seg_end:
                         price = seg_price
@@ -1837,9 +1817,7 @@ async def recalculate_all_payments():
                     if t_start >= seg_start or t_start < seg_end:
                         price = seg_price
                         break
-
             if price is None:
-                print(f"⚠️ Skipped txn {txn_id} | 時間 {t_start} 找不到對應分段（idTag={id_tag}）")
                 skipped += 1
                 continue
 
@@ -1849,46 +1827,40 @@ async def recalculate_all_payments():
             overuse_fee = round(kWh * 2 if kWh > 5 else 0, 2)
             total_amount = round(base_fee + energy_fee + overuse_fee, 2)
 
-            # 查詢卡片餘額
-            cursor.execute("SELECT balance FROM cards WHERE card_id = ?", (id_tag,))
-            card = cursor.fetchone()
-            if card is None:
-                print(f"[❌] 找不到卡片：{id_tag}")
-                skipped += 1
-                continue
-
-            if card[0] < total_amount:
-                print(f"[❌] 餘額不足，無法扣款：{id_tag}，現有 {card[0]}，需扣 {total_amount}")
-                skipped += 1
-                continue
-
-            # 建立付款紀錄
+            # 寫入 payments
             cursor.execute('''
                 INSERT INTO payments (transaction_id, base_fee, energy_fee, overuse_fee, total_amount)
                 VALUES (?, ?, ?, ?, ?)
             ''', (txn_id, base_fee, energy_fee, overuse_fee, total_amount))
-
-            # 扣款寫回卡片餘額
-            cursor.execute("""
-                UPDATE cards
-                SET balance = balance - ?
-                WHERE card_id = ?
-            """, (total_amount, id_tag))
-
             created += 1
-            print(f"✅ Created txn {txn_id} | {date_str} 扣款 {total_amount} 元（餘額剩餘 {card[0] - total_amount} 元） | 單價={price} | idTag={id_tag}")
+
+            # 自動扣款卡片餘額（需查詢卡號）
+            cursor.execute('SELECT card_id FROM id_tags WHERE id_tag = ?', (id_tag,))
+            card_row = cursor.fetchone()
+            if card_row:
+                card_id = card_row[0]
+                cursor.execute('SELECT balance FROM cards WHERE card_id = ?', (card_id,))
+                balance_row = cursor.fetchone()
+                if balance_row:
+                    old_balance = balance_row[0]
+                    new_balance = round(old_balance - total_amount, 2)
+                    if new_balance < 0:
+                        print(f"⚠️ 卡片餘額不足：{card_id} 扣款失敗")
+                    else:
+                        cursor.execute('UPDATE cards SET balance = ? WHERE card_id = ?', (new_balance, card_id))
+                        print(f"💳 扣款成功：{card_id} | {old_balance} → {new_balance} 元")
 
         except Exception as e:
             print(f"❌ 錯誤 txn {txn_id} | idTag={id_tag} | {e}")
             skipped += 1
 
     conn.commit()
-    print(f"== recalculate 統計：created={created}, skipped={skipped}, total={len(rows)} ==")
     return {
         "message": "✅ 已重新計算所有交易成本（daily_pricing_rules 分段並自動扣款）",
         "created": created,
         "skipped": skipped
     }
+
 
 
 
