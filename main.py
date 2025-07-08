@@ -1026,17 +1026,19 @@ async def test_line_messaging(payload: dict = Body(...)):
 
 
 
+# 加上允許所有 WebSocket 請求
 async def accept_all_requests(path, request_headers):
-    return None  # 表示允許所有 WebSocket 請求，不要回傳 403
+    return None
 
-server = await websockets.serve(
-    on_connect,
-    host="0.0.0.0",
-    port=port,
-    subprotocols=["ocpp1.6"],
-    process_request=accept_all_requests  # ✅ 加上這行
-)
-
+# 啟動 WebSocket Server
+async def start_websocket():
+    server = await websockets.serve(
+        on_connect,
+        host="0.0.0.0",
+        port=port,
+        subprotocols=["ocpp1.6"],
+        process_request=accept_all_requests  # ✅ 關鍵設定：允許所有請求
+    )
     logging.info(f"✅ WebSocket Server 已啟動 ws://0.0.0.0:{port}")
     await server.wait_closed()
 
