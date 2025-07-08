@@ -1419,6 +1419,13 @@ async def get_cards():
     rows = cursor.fetchall()
     return [{"id": row[0], "card_id": row[0], "balance": row[1]} for row in rows]
 
+@app.delete("/api/cards/{card_id}")
+async def delete_card(card_id: str):
+    cursor.execute("DELETE FROM cards WHERE card_id = ?", (card_id,))
+    cursor.execute("DELETE FROM id_tags WHERE id_tag = ?", (card_id,))
+    conn.commit()
+    return {"message": f"Card {card_id} deleted."}
+
 @app.post("/api/cards/{card_id}/topup")
 async def topup_card(card_id: str = Path(...), data: dict = Body(...)):
     amount = data.get("amount")
