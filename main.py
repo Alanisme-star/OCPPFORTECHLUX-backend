@@ -406,13 +406,6 @@ class ChargePoint(OcppChargePoint):
             conn.commit()
             logging.info(f"💳 扣款完成 | 卡片={id_tag} | 原餘額={card[0]} | 扣款={cost} 元 | 剩餘={new_balance} 元")
 
-            # 儲存扣款紀錄
-            cursor.execute('''
-                INSERT INTO payments (transaction_id, id_tag, amount, timestamp)
-                VALUES (?, ?, ?, ?)
-            ''', (transaction_id, id_tag, cost, timestamp))
-            conn.commit()
-
             # 若餘額過低，自動通知
             if new_balance < 100:
                 logging.info(f"⚠️ 卡片 {id_tag} 餘額僅剩 {new_balance} 元")
@@ -436,6 +429,7 @@ CREATE TABLE payments (
     total_amount REAL
 )
 ''')
+
 
 
 
@@ -484,18 +478,17 @@ conn.commit()
 
 @app.get("/api/payments")
 async def list_payments():
-    cursor.execute("SELECT transaction_id, id_tag, amount, timestamp FROM payments ORDER BY timestamp DESC")
+    cursor.execute("SELECT transaction_id, base_fee, energy_fee, overuse_fee, total_amount FROM payments ORDER BY transaction_id DESC")
     rows = cursor.fetchall()
     return [
         {
             "transactionId": r[0],
-            "idTag": r[1],
-            "amount": round(r[2], 2),
-            "timestamp": r[3]
+            "baseFee": r[1],
+            "energyFee": r[2],
+            "overuseFee": r[3],
+            "totalAmount": r[4]
         } for r in rows
     ]
-
-
 ...
 
 @on(Action.StatusNotification)
@@ -1735,23 +1728,6 @@ async def add_meter_values(data: dict = Body(...)):
         ))
         conn.commit()
         return {"message": "Meter value added successfully"}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-@app.post("/api/payments")
-async def add_payment(data: dict = Body(...)):
-    try:
-        cursor.execute('''
-            INSERT INTO payments (transaction_id, id_tag, amount, timestamp)
-            VALUES (?, ?, ?, ?)
-        ''', (
-            data["transaction_id"],
-            data.get("id_tag", "TEST123"),  # 預設卡片 ID
-            data["total_amount"],
-            datetime.utcnow().isoformat()
-        ))
-        conn.commit()
-        return {"message": "Payment added successfully"}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
