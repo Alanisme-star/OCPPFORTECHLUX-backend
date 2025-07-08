@@ -1028,10 +1028,23 @@ async def test_line_messaging(payload: dict = Body(...)):
 
 # Thread 啟動 WebSocket 與 FastAPI 共存
 @app.on_event("startup")
-async def on_startup():
-    def run_notify():
-        weekly_notify_task()
-    Thread(target=run_notify, daemon=True).start()
+async def startup_event():
+    def run_ws():
+        asyncio.run(start_websocket())
+    ws_thread = threading.Thread(target=run_ws)
+    ws_thread.start()
+
+async def start_websocket():
+    server = await websockets.serve(
+        on_connect,
+        host="0.0.0.0",
+        port=10000,
+        subprotocols=["ocpp1.6"],
+        process_request=None,  # 預設允許所有請求
+    )
+    logging.info("✅ WebSocket Server 已啟動 ws://0.0.0.0:10000")
+    await server.wait_closed()
+
 
 @app.post("/webhook")
 async def webhook(request: Request):
