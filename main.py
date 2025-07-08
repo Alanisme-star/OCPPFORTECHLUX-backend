@@ -1426,6 +1426,13 @@ async def delete_id_tag(id_tag: str = Path(...)):
     conn.commit()
     return {"message": "Deleted successfully"}
 
+@app.delete("/api/cards/{card_id}")
+async def delete_card(card_id: str):
+    cursor.execute("DELETE FROM cards WHERE card_id = ?", (card_id,))
+    conn.commit()
+    return {"message": f"Card {card_id} deleted"}
+
+
 @app.put("/api/cards/{card_id}")
 async def update_card(card_id: str, payload: dict):
     new_balance = payload.get("balance")
