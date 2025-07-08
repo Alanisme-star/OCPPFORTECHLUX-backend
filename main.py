@@ -954,17 +954,6 @@ async def on_connect(websocket, path):
     logging.info(f"🔌 充電樁已連線：{cp_id}")
     await cp.start()
 
-# 啟動 WebSocket Server
-async def start_websocket():
-    server = await serve(
-        on_connect,
-        "0.0.0.0",  # 可依需求改為 localhost
-        9000,
-        subprotocols=["ocpp1.6"]
-    )
-    logging.info("✅ WebSocket Server 已啟動 ws://0.0.0.0:9000")
-    await server.wait_closed()
-
 
 
 import requests
@@ -1039,11 +1028,7 @@ async def test_line_messaging(payload: dict = Body(...)):
 
 # Thread 啟動 WebSocket 與 FastAPI 共存
 @app.on_event("startup")
-async def start_ws_server():
-    def run_ws():
-        asyncio.run(start_websocket())
-    Thread(target=run_ws, daemon=True).start()
-
+async def on_startup():
     def run_notify():
         weekly_notify_task()
     Thread(target=run_notify, daemon=True).start()
