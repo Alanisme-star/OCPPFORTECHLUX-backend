@@ -32,6 +32,8 @@ from ocpp.v16.call_result import (
 from ocpp.v16.enums import Action, RegistrationStatus
 from ocpp.routing import on
 
+from fastapi import WebSocket, WebSocketDisconnect
+from urllib.parse import urlparse, parse_qs
 
 
 app = FastAPI()
