@@ -1109,27 +1109,6 @@ async def on_connect(websocket, path):
     logging.info(f"🔌 WebSocket connected. ID: {charge_point_id}")
     # 後續 WebSocket 處理邏輯...
 
-# 啟動 WebSocket Server
-async def start_websocket():
-    port = int(os.environ.get("PORT", 10000))  # 支援 Render 的 PORT 環境變數
-    server = await websockets.serve(
-        on_connect,
-        host="0.0.0.0",
-        port=port,
-        subprotocols=["ocpp1.6"],
-        process_request=accept_all_requests  # ✅ 關鍵補上
-    )
-    logging.info(f"✅ WebSocket Server 已啟動 ws://0.0.0.0:{port}")
-    await server.wait_closed()
-
-# FastAPI 啟動時，啟動 WebSocket
-@app.on_event("startup")
-async def startup_event():
-    def run_ws():
-        asyncio.run(start_websocket())
-    ws_thread = threading.Thread(target=run_ws)
-    ws_thread.start()
-
 
 
 @app.post("/webhook")
