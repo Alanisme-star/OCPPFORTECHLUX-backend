@@ -35,10 +35,67 @@ from threading import Thread
 
 
 
+
+
+
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from urllib.parse import urlparse, parse_qs
+from ocpp.v16 import ChargePoint as cp
+from ocpp.v16 import call_result
+
+app = FastAPI()
+logging.basicConfig(level=logging.INFO)
+
+# 允許跨域（若前端使用）
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# 自訂 ChargePoint 類別
+class ChargePoint(cp):
+    @on("BootNotification")
+    async def on_boot_notification(self, charge_point_model, charge_point_vendor, **kwargs):
+        logging.info(f"🔌 BootNotification from {self.id}")
+        return call_result.BootNotificationPayload(
+            current_time="2025-07-09T00:00:00Z",
+            interval=10,
+            status="Accepted"
+        )
+
+# WebSocket 連線端點（共用 PORT）
+@app.websocket("/")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept(subprotocol="ocpp1.6")
+
+    # 解析 query string 取得 ID（如：?id=TW*MSI*E000100）
+    parsed = urlparse(str(websocket.url))
+    query = parse_qs(parsed.query)
+    charge_point_id = query.get("id", ["unknown"])[0]
+    logging.info(f"📥 WebSocket connected. ID: {charge_point_id}")
+
+    cp_instance = ChargePoint(charge_point_id, websocket)
+
+    try:
+        await cp_instance.start()
+    except WebSocketDisconnect:
+        logging.info(f"⚠️ 充電樁 {charge_point_id} 已離線")
+    except Exception as e:
+        logging.error(f"❌ 發生錯誤：{e}")
+
+
+
+
+
+
+
+
+
 # 建立 FastAPI app
 app = FastAPI()
 
-from fastapi.middleware.cors import CORSMiddleware
 
 app.add_middleware(
     CORSMiddleware,
@@ -948,7 +1005,6 @@ async def get_top_consumers(
     return JSONResponse(content=result)  
 
 # WebSocket 充電樁接入時呼叫的處理函式
-from urllib.parse import urlparse, parse_qs
 
 async def on_connect(websocket, path):
     # Log 原始 path 供除錯
