@@ -956,13 +956,14 @@ async def on_connect(websocket, path):
 
 # 啟動 WebSocket Server
 async def start_websocket():
+    port = int(os.environ.get("PORT", 10000))  # 改成用系統變數，Render 自動分配
     server = await serve(
         on_connect,
-        "0.0.0.0",  # 可依需求改為 localhost
-        9000,
+        "0.0.0.0",
+        port,
         subprotocols=["ocpp1.6"]
     )
-    logging.info("✅ WebSocket Server 已啟動 ws://0.0.0.0:9000")
+    logging.info(f"✅ WebSocket Server 已啟動 ws://0.0.0.0:{port}")
     await server.wait_closed()
 
 
