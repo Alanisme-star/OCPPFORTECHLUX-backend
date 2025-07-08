@@ -1038,20 +1038,42 @@ async def test_line_messaging(payload: dict = Body(...)):
 
 
 # 加上允許所有 WebSocket 請求
+import websockets
+
+# 允許所有 WebSocket 請求（避免 Render 擋住）
 async def accept_all_requests(path, request_headers):
     return None
 
+# WebSocket 連線處理
+async def on_connect(websocket, path):
+    logging.info(f"📥 WebSocket path received: {path}")
+    parsed = urlparse(path)
+    query = parse_qs(parsed.query)
+    charge_point_id = query.get("id", ["unknown"])[0]
+    logging.info(f"🔌 WebSocket connected. ID: {charge_point_id}")
+    # 後續 WebSocket 處理邏輯...
+
 # 啟動 WebSocket Server
 async def start_websocket():
+    port = int(os.environ.get("PORT", 10000))  # 支援 Render 的 PORT 環境變數
     server = await websockets.serve(
         on_connect,
         host="0.0.0.0",
         port=port,
         subprotocols=["ocpp1.6"],
-        process_request=accept_all_requests  # ✅ 關鍵設定：允許所有請求
+        process_request=accept_all_requests  # ✅ 關鍵補上
     )
     logging.info(f"✅ WebSocket Server 已啟動 ws://0.0.0.0:{port}")
     await server.wait_closed()
+
+# FastAPI 啟動時，啟動 WebSocket
+@app.on_event("startup")
+async def startup_event():
+    def run_ws():
+        asyncio.run(start_websocket())
+    ws_thread = threading.Thread(target=run_ws)
+    ws_thread.start()
+
 
 
 @app.post("/webhook")
