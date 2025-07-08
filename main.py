@@ -1791,31 +1791,62 @@ async def recalculate_all_payments():
                 print(f"🟠 Skipped txn {txn_id} | meter_start or meter_stop 缺失")
                 skipped += 1
                 continue
-            if not start_ts:
-                print(f"🟠 Skipped txn {txn_id} | start_timestamp 缺失")
+            if not start_ts or not stop_ts:
+                print(f"🟠 Skipped txn {txn_id} | start_timestamp or stop_timestamp 缺失")
                 skipped += 1
                 continue
 
             try:
-                ts_obj = datetime.fromisoformat(start_ts)
+                start_obj = datetime.fromisoformat(start_ts)
+                stop_obj = datetime.fromisoformat(stop_ts)
             except Exception as e:
-                print(f"🟠 Skipped txn {txn_id} | 無法解析日期: {start_ts} | error: {e}")
+                print(f"🟠 Skipped txn {txn_id} | 無法解析日期: {start_ts},{stop_ts} | error: {e}")
                 skipped += 1
                 continue
 
-            date_str = ts_obj.strftime("%Y-%m-%d")
-            cursor.execute('SELECT price_per_kwh FROM daily_pricing WHERE date = ?', (date_str,))
-            price_row = cursor.fetchone()
-
-            if not price_row:
-                print(f"⚠️ Skipped txn {txn_id} | 日期 {date_str} 找不到 daily_pricing（idTag={id_tag}，原始時間: {start_ts})")
+            if start_obj.date() != stop_obj.date():
+                print(f"⚠️ Skipped txn {txn_id} | 不支援跨日（請人工分段）")
                 skipped += 1
                 continue
 
-            price_per_kwh = price_row[0]
+            date_str = start_obj.strftime("%Y-%m-%d")
+            t_start = start_obj.strftime("%H:%M")
+            t_stop = stop_obj.strftime("%H:%M")
+
+            # 取出當天所有分段
+            cursor.execute('''
+                SELECT start_time, end_time, price FROM daily_pricing_rules
+                WHERE date = ?
+                ORDER BY start_time ASC
+            ''', (date_str,))
+            pricing_segments = cursor.fetchall()
+            if not pricing_segments:
+                print(f"⚠️ Skipped txn {txn_id} | 日期 {date_str} 找不到 daily_pricing_rules（idTag={id_tag}，原始時間: {start_ts})")
+                skipped += 1
+                continue
+
+            # 預設用起始分段單價
+            price = None
+            for seg in pricing_segments:
+                seg_start, seg_end, seg_price = seg
+                # 處理跨午夜 ex: 22:00~07:00
+                if seg_start < seg_end:
+                    if seg_start <= t_start < seg_end:
+                        price = seg_price
+                        break
+                else:
+                    if t_start >= seg_start or t_start < seg_end:
+                        price = seg_price
+                        break
+
+            if price is None:
+                print(f"⚠️ Skipped txn {txn_id} | 時間 {t_start} 找不到對應分段（idTag={id_tag}）")
+                skipped += 1
+                continue
+
             kWh = (meter_stop - meter_start) / 1000
             base_fee = 20.0
-            energy_fee = round(kWh * price_per_kwh, 2)
+            energy_fee = round(kWh * price, 2)
             overuse_fee = round(kWh * 2 if kWh > 5 else 0, 2)
             total_amount = round(base_fee + energy_fee + overuse_fee, 2)
 
@@ -1824,7 +1855,7 @@ async def recalculate_all_payments():
                 VALUES (?, ?, ?, ?, ?)
             ''', (txn_id, base_fee, energy_fee, overuse_fee, total_amount))
             created += 1
-            print(f"✅ Created txn {txn_id} | 日期 {date_str} 成本 {total_amount} 元 | kWh={kWh} | 電價={price_per_kwh} | idTag={id_tag}")
+            print(f"✅ Created txn {txn_id} | 日期 {date_str} 成本 {total_amount} 元 | kWh={kWh} | 單價={price} | idTag={id_tag}")
 
         except Exception as e:
             print(f"❌ 錯誤 txn {txn_id} | idTag={id_tag} | {e}")
@@ -1833,11 +1864,10 @@ async def recalculate_all_payments():
     conn.commit()
     print(f"== recalculate 統計：created={created}, skipped={skipped}, total={len(rows)} ==")
     return {
-        "message": "✅ 已重新計算所有交易成本（debug 模式）",
+        "message": "✅ 已重新計算所有交易成本（daily_pricing_rules 分段）",
         "created": created,
         "skipped": skipped
     }
-
 
 
 
