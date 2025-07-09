@@ -1485,19 +1485,19 @@ async def list_charge_points():
 async def add_charge_point(data: dict = Body(...)):
     cp_id = data.get("chargePointId")
     name = data.get("name", "")
-    status = data.get("status", "enabled")
+    status = (data.get("status") or "enabled").lower()  # ✅ 修正這一行
     if not cp_id:
         raise HTTPException(status_code=400, detail="chargePointId is required")
     try:
-        created_at = datetime.utcnow().isoformat()
         cursor.execute(
-            "INSERT INTO charge_points (charge_point_id, name, status, created_at) VALUES (?, ?, ?, ?)",
-            (cp_id, name, status, created_at)
+            "INSERT INTO charge_points (charge_point_id, name, status) VALUES (?, ?, ?)",
+            (cp_id, name, status)
         )
         conn.commit()
         return {"message": "新增成功"}
     except sqlite3.IntegrityError:
         raise HTTPException(status_code=409, detail="充電樁已存在")
+
 
 @app.put("/api/charge-points/{cp_id}")
 async def update_charge_point(cp_id: str = Path(...), data: dict = Body(...)):
