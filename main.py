@@ -1496,7 +1496,8 @@ async def list_charge_points():
 
 @app.post("/api/charge-points")
 async def add_charge_point(data: dict = Body(...)):
-    cp_id = data.get("chargePointId") or data.get("charge_point_id")  # ✅ 雙格式兼容
+    print("🔥 payload=", data)  # 新增，除錯用
+    cp_id = data.get("chargePointId") or data.get("charge_point_id")
     name = data.get("name", "")
     status = (data.get("status") or "enabled").lower()
     if not cp_id:
@@ -1507,9 +1508,17 @@ async def add_charge_point(data: dict = Body(...)):
             (cp_id, name, status)
         )
         conn.commit()
+        print(f"✅ 新增白名單到資料庫: {cp_id}, {name}, {status}")  # 新增，除錯用
+        cursor.execute("SELECT * FROM charge_points")
+        print("所有白名單=", cursor.fetchall())  # 新增，除錯用
         return {"message": "新增成功"}
-    except sqlite3.IntegrityError:
+    except sqlite3.IntegrityError as e:
+        print("❌ IntegrityError:", e)
         raise HTTPException(status_code=409, detail="充電樁已存在")
+    except Exception as e:
+        print("❌ 其他新增錯誤:", e)
+        raise HTTPException(status_code=500, detail="內部錯誤")
+
 
 
 @app.put("/api/charge-points/{cp_id}")
