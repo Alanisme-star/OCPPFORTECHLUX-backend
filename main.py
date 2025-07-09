@@ -7,20 +7,16 @@ import uuid
 import asyncio
 import logging
 import sqlite3
-from datetime import datetime, timezone
-
-from fastapi import FastAPI, Request, Query, Body, Path, HTTPException
-from fastapi.responses import JSONResponse, StreamingResponse
-from fastapi.middleware.cors import CORSMiddleware
-from dateutil.parser import parse as parse_date  # ✅ 加入這行
-from ocpp.v16 import call_result
 import uvicorn
 
+from datetime import datetime, timedelta, timezone
+from fastapi import FastAPI, Request, Query, Body, Path, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
+from dateutil.parser import parse as parse_date
 from websockets.exceptions import ConnectionClosedOK
-
 from werkzeug.security import generate_password_hash, check_password_hash
-
-from ocpp.v16 import call
+from ocpp.v16 import call, call_result, ChargePoint as OcppChargePoint
 from ocpp.v16.call_result import (
     BootNotificationPayload,
     HeartbeatPayload,
@@ -31,8 +27,6 @@ from ocpp.v16.call_result import (
 )
 from ocpp.v16.enums import Action, RegistrationStatus
 from ocpp.routing import on
-
-from fastapi import WebSocket, WebSocketDisconnect
 from urllib.parse import urlparse, parse_qs
 
 
@@ -53,6 +47,11 @@ class FastAPIWebSocketAdapter:
         return self.websocket.headers.get('sec-websocket-protocol')
 
 
+connected_devices = {}
+
+@app.get("/api/connections")
+def get_active_connections():
+    return [{"charge_point_id": cp_id, "connected_at": data["time"], "ip": data["ip"]} for cp_id, data in connected_devices.items()]
 
 
 
@@ -70,26 +69,29 @@ app.add_middleware(
 
 
 
-@app.websocket("/")
-async def websocket_endpoint(websocket: WebSocket):
+@app.websocket("/ws/{charge_point_id}")
+async def websocket_endpoint(websocket: WebSocket, charge_point_id: str):
     await websocket.accept(subprotocol="ocpp1.6")
-    parsed = urlparse(str(websocket.url))
-    query = parse_qs(parsed.query)
-    charge_point_id = query.get("id", ["unknown"])[0]
-    logging.info(f"📥 WebSocket connected. ID: {charge_point_id}")
 
-    # 用 adapter 包裝
-    ws_adapter = FastAPIWebSocketAdapter(websocket)
-    cp_instance = ChargePoint(charge_point_id, ws_adapter)
+    client_ip = websocket.client.host
+    now = datetime.utcnow().isoformat()
+    connected_devices[charge_point_id] = {"time": now, "ip": client_ip}
+
+
+      # ✅ 寫入資料庫紀錄
+    cursor.execute(
+        "INSERT INTO connection_logs (charge_point_id, ip, time) VALUES (?, ?, ?)",
+        (charge_point_id, client_ip, now)
+    )
+    conn.commit()
+
+    logger.info(f"✅ WebSocket connected: {charge_point_id} from {client_ip} at {now}")
 
     try:
-        await cp_instance.start()
+        await on_connect(websocket, charge_point_id)
     except WebSocketDisconnect:
-        logging.info(f"⚠️ 充電樁 {charge_point_id} 已離線")
-    except Exception as e:
-        logging.error(f"❌ 發生錯誤：{e}")
-
-
+        logger.warning(f"⚠️ Disconnected: {charge_point_id}")
+        connected_devices.pop(charge_point_id, None)
 
 
 # 初始化狀態儲存
@@ -112,6 +114,18 @@ async def authorize(cp_id: str, badge_id: str = Body(..., embed=True)):
 DB_FILE = "ocpp_data.db"
 conn = sqlite3.connect(DB_FILE, check_same_thread=False)
 cursor = conn.cursor()
+
+# 初始化 connection_logs 表格（如不存在就建立）
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS connection_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    charge_point_id TEXT,
+    ip TEXT,
+    time TEXT
+)
+""")
+conn.commit()
+
 
 
 # === 新增 cards 資料表，用於管理卡片餘額 ===
@@ -230,7 +244,7 @@ conn.commit()
 
 
 
-from ocpp.v16 import ChargePoint as OcppChargePoint
+
 
 class ChargePoint(OcppChargePoint):
 
@@ -768,10 +782,6 @@ async def export_transactions_csv(
 async def get_status():
     return JSONResponse(content=charging_point_status)
 
-from fastapi import HTTPException, Body, Path
-
-
-
 @app.get("/api/status/logs")
 async def get_status_logs(
     chargePointId: str = Query(None),
@@ -974,9 +984,6 @@ async def get_top_consumers(
 
     return JSONResponse(content=result)  
 
-
-
-from datetime import datetime, timedelta
 import threading
 
 # 每週定時通知任務
@@ -1407,8 +1414,6 @@ def get_holiday(date: str):
 
 
 
-from fastapi import HTTPException
-
 @app.get("/api/cards")
 async def get_cards():
     cursor.execute("SELECT card_id, balance FROM cards")
@@ -1484,7 +1489,6 @@ def version_check():
 
 @app.get("/api/dashboard/summary")
 async def get_dashboard_summary():
-    from datetime import datetime
     today = datetime.now().strftime("%Y-%m-%d")
 
     try:
@@ -1589,7 +1593,6 @@ from fastapi import Query
 
 
 # 新增：每日電價設定 daily_pricing_rules API 與資料表
-from fastapi import Body, Path
 
 # 建立資料表
 cursor.execute('''
@@ -1674,10 +1677,6 @@ async def root():
     return {"status": "API is running"}
 
 
-from fastapi import HTTPException
-
-from fastapi import Query
-
 # 取得
 @app.get("/api/weekly-pricing")
 async def get_weekly_pricing(season: str = Query(...)):
@@ -1752,8 +1751,6 @@ async def add_meter_values(data: dict = Body(...)):
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-
-from fastapi import Query
 
 @app.post("/api/internal/mock-daily-pricing")
 async def mock_daily_pricing(
@@ -1933,9 +1930,6 @@ async def missing_cost_transactions():
 
     return missing
 
-
-from fastapi import Body
-from datetime import datetime
 
 @app.post("/api/internal/mock-status")
 async def mock_status(data: dict = Body(...)):
