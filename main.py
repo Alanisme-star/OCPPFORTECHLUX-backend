@@ -71,9 +71,17 @@ app.add_middleware(
 
 @app.websocket("/ws/{charge_point_id}")
 async def websocket_endpoint(websocket: WebSocket, charge_point_id: str):
+    print(f"👉 [WS] 實際收到 charge_point_id = '{charge_point_id}'")
+    cursor.execute("SELECT charge_point_id, status FROM charge_points")
+    all_rows = cursor.fetchall()
+    print(f"👉 [WS] 白名單所有ID：{[row[0] for row in all_rows]}")
+    print(f"👉 [WS] 白名單所有狀態：{all_rows}")
     cursor.execute("SELECT status FROM charge_points WHERE charge_point_id = ?", (charge_point_id,))
     row = cursor.fetchone()
+    print(f"👉 [WS] 單一查詢結果 = {row}")
+
     if not row or row[0] != "enabled":
+        print("❌ [WS] 查無對應白名單 or 狀態非 enabled，拒絕連線")
         await websocket.close(code=4001)
         return
     await websocket.accept(subprotocol="ocpp1.6")
