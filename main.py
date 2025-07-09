@@ -71,41 +71,39 @@ app.add_middleware(
 
 @app.websocket("/{charge_point_id}")
 async def websocket_endpoint(websocket: WebSocket, charge_point_id: str):
-    charge_point_id = charge_point_id.lstrip("/")
+    try:
+        charge_point_id = charge_point_id.lstrip("/")
+        print("🚨 WebSocket 連線請求進入")
+        print(f"👉 解析後 charge_point_id = {charge_point_id}")
+        print(f"🔍 client IP = {websocket.client.host}")
+        print(f"🔍 headers = {dict(websocket.headers)}")
 
-    print(f"🚨 WebSocket 連線請求進入")
-    print(f"👉 解析後 charge_point_id = '{charge_point_id}'")
+        await websocket.accept(subprotocol="ocpp1.6")
+        print("✅ WebSocket accept 成功")
 
-    cursor.execute("SELECT charge_point_id, status FROM charge_points")
-    all_rows = cursor.fetchall()
-    whitelist_ids = [row[0] for row in all_rows]
+        # 白名單查詢
+        cursor.execute("SELECT charge_point_id FROM charge_points")
+        all_ids = [row[0] for row in cursor.fetchall()]
+        print(f"👉 白名單清單 = {all_ids}")
 
-    print(f"👉 白名單清單 = {whitelist_ids}")
+        cursor.execute("SELECT * FROM charge_points WHERE charge_point_id = ?", (charge_point_id,))
+        result = cursor.fetchone()
+        print(f"👉 單一查詢結果 = {result}")
 
-    cursor.execute("SELECT status FROM charge_points WHERE charge_point_id = ?", (charge_point_id,))
-    row = cursor.fetchone()
+        if not result:
+            print(f"❌ {charge_point_id} 未通過白名單驗證")
+            await websocket.close()
+            return
+        else:
+            print(f"✅ {charge_point_id} 通過白名單驗證")
 
-    print(f"👉 單一查詢結果 = {row}")
+        # OCPP handler
+        cp = ChargePoint(charge_point_id, websocket)
+        await cp.start()
 
-    if row is None:
-        print(f"❌ 查無 {charge_point_id}，WebSocket 拒絕連線")
+    except Exception as e:
+        print(f"❌ WebSocket 發生例外：{e}")
         await websocket.close()
-        return
-
-    if row[0] != "enabled":
-        print(f"❌ {charge_point_id} 狀態為 {row[0]}，WebSocket 拒絕連線")
-        await websocket.close()
-        return
-
-    print(f"✅ 通過白名單驗證，允許 WebSocket 連線：{charge_point_id}")
-
-
-
-    await websocket.accept(subprotocol="ocpp1.6")
-
-    client_ip = websocket.client.host
-    now = datetime.utcnow().isoformat()
-    connected_devices[charge_point_id] = {"time": now, "ip": client_ip}
 
 
       # ✅ 寫入資料庫紀錄
