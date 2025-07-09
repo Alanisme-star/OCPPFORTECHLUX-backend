@@ -69,7 +69,7 @@ app.add_middleware(
 )
 
 
-@app.websocket("/ws/{charge_point_id}")
+@app.websocket("/{charge_point_id}")
 async def websocket_endpoint(websocket: WebSocket, charge_point_id: str):
     print(f"👉 [WS] 實際收到 charge_point_id = '{charge_point_id}'")
     cursor.execute("SELECT charge_point_id, status FROM charge_points")
