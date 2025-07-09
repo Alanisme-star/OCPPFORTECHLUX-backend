@@ -2141,6 +2141,18 @@ async def debug_ids():
     return [row[0] for row in cursor.fetchall()]
 
 
+# ✅ 新增 StatusNotification handler
+@on(Action.StatusNotification)
+async def on_status_notification(self, connector_id, error_code, status, timestamp, **kwargs):
+    cursor.execute('''
+        INSERT INTO status_logs (charge_point_id, connector_id, status, timestamp)
+        VALUES (?, ?, ?, ?)
+    ''', (self.id, connector_id, status, timestamp))
+    conn.commit()
+
+    logging.info(f"📡 StatusNotification | CP={self.id} | connector={connector_id} | errorCode={error_code} | status={status}")
+    return StatusNotificationPayload()
+
 
 
 if __name__ == "__main__":
