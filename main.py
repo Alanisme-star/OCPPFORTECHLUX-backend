@@ -605,19 +605,6 @@ async def list_payments():
     ]
 ...
 
-@on(Action.StatusNotification)
-async def on_status_notification(self, connector_id, status, timestamp, **kwargs):
-    cursor.execute('''
-        INSERT INTO status_logs (charge_point_id, connector_id, status, timestamp)
-        VALUES (?, ?, ?, ?)
-    ''', (self.id, connector_id, status, timestamp))
-    conn.commit()
-
-
-    logging.info(f"📡 StatusNotification | CP={self.id} | connector={connector_id} | status={status}")
-    return StatusNotificationPayload()
-
-
 
 @app.post("/api/transactions")
 async def create_transaction_api(data: dict = Body(...)):
