@@ -1495,7 +1495,7 @@ async def list_charge_points():
 
 @app.post("/api/charge-points")
 async def add_charge_point(data: dict = Body(...)):
-    cp_id = data.get("chargePointId")
+    cp_id = data.get("chargePointId") or data.get("charge_point_id")
     name = data.get("name", "")
     status = (data.get("status") or "enabled").lower()  # ✅ 修正這一行
     if not cp_id:
