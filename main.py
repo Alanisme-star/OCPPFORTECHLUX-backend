@@ -138,7 +138,8 @@ async def authorize(cp_id: str, badge_id: str = Body(..., embed=True)):
 
 
 # 初始化 SQLite 資料庫
-DB_FILE = "ocpp_data.db"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_FILE = os.path.join(BASE_DIR, "ocpp_data.db")  # ✅ 固定資料庫絕對路徑
 conn = sqlite3.connect(DB_FILE, check_same_thread=False)
 cursor = conn.cursor()
 
@@ -1495,9 +1496,9 @@ async def list_charge_points():
 
 @app.post("/api/charge-points")
 async def add_charge_point(data: dict = Body(...)):
-    cp_id = data.get("chargePointId") or data.get("charge_point_id")
+    cp_id = data.get("chargePointId") or data.get("charge_point_id")  # ✅ 雙格式兼容
     name = data.get("name", "")
-    status = (data.get("status") or "enabled").lower()  # ✅ 修正這一行
+    status = (data.get("status") or "enabled").lower()
     if not cp_id:
         raise HTTPException(status_code=400, detail="chargePointId is required")
     try:
