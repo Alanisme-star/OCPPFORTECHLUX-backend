@@ -106,7 +106,7 @@ async def websocket_endpoint(websocket: WebSocket, charge_point_id: str):
         conn.commit()
 
         # 啟動 OCPP handler
-        cp = ChargePoint(charge_point_id, websocket)
+        cp = ChargePoint(charge_point_id, FastAPIWebSocketAdapter(websocket))
         await cp.start()
 
         # 其他後續處理（如有）
