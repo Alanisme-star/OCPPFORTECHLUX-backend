@@ -29,6 +29,8 @@ from ocpp.v16.enums import Action, RegistrationStatus
 from ocpp.routing import on
 from urllib.parse import urlparse, parse_qs
 
+app = FastAPI()
+
 
 class FastAPIWebSocketAdapter:
     def __init__(self, websocket):
@@ -56,7 +58,6 @@ def get_active_connections():
 
 
 
-app = FastAPI()
 logging.basicConfig(level=logging.INFO)
 
 # 允許跨域（若前端使用）
@@ -2011,3 +2012,6 @@ async def delete_daily_pricing_by_date(date: str = Query(...)):
     cursor.execute("DELETE FROM daily_pricing_rules WHERE date = ?", (date,))
     conn.commit()
     return {"message": f"已刪除 {date} 所有設定"}
+
+if __name__ == "__main__":
+    uvicorn.run("main:app", host="0.0.0.0", port=10000, reload=True)
