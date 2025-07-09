@@ -76,6 +76,8 @@ async def websocket_endpoint(websocket: WebSocket, charge_point_id: str):
     print(f"👉 [WS] 實際收到 charge_point_id = '{charge_point_id}'")
     cursor.execute("SELECT charge_point_id, status FROM charge_points")
     all_rows = cursor.fetchall()
+     # ✅ 除錯：印出白名單所有 ID（字串陣列）與原始資料
+    whitelist_ids = [row[0] for row in all_rows]
     print(f"👉 [WS] 白名單所有ID：{[row[0] for row in all_rows]}")
     print(f"👉 [WS] 白名單所有狀態：{all_rows}")
     cursor.execute("SELECT status FROM charge_points WHERE charge_point_id = ?", (charge_point_id,))
@@ -2095,6 +2097,15 @@ async def delete_daily_pricing_by_date(date: str = Query(...)):
     cursor.execute("DELETE FROM daily_pricing_rules WHERE date = ?", (date,))
     conn.commit()
     return {"message": f"已刪除 {date} 所有設定"}
+
+
+@app.get("/debug/charge-points")
+async def debug_ids():
+    cursor.execute("SELECT charge_point_id FROM charge_points")
+    return [row[0] for row in cursor.fetchall()]
+
+
+
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=10000, reload=True)
