@@ -71,6 +71,8 @@ app.add_middleware(
 
 @app.websocket("/{charge_point_id}")
 async def websocket_endpoint(websocket: WebSocket, charge_point_id: str):
+    # 👉 修正：去掉開頭的斜線（如果有的話）
+    charge_point_id = charge_point_id.lstrip("/")
     print(f"👉 [WS] 實際收到 charge_point_id = '{charge_point_id}'")
     cursor.execute("SELECT charge_point_id, status FROM charge_points")
     all_rows = cursor.fetchall()
