@@ -935,6 +935,10 @@ async def add_id_tag(data: dict = Body(...)):
         )
         conn.commit()
         print(f"✅ 已成功新增卡片：{id_tag}, {status}, {valid_str}")
+        # ⬇️ 新增這一行：如果卡片不存在於 cards，則自動新增餘額帳戶（初始餘額0元）
+        cursor.execute('INSERT OR IGNORE INTO cards (card_id, balance) VALUES (?, ?)', (id_tag, 0))
+        conn.commit()
+
     except sqlite3.IntegrityError as e:
         print(f"❌ 資料庫重複錯誤：{e}")
         raise HTTPException(status_code=409, detail="idTag already exists")
