@@ -71,55 +71,51 @@ app.add_middleware(
 
 @app.websocket("/{charge_point_id}")
 async def websocket_endpoint(websocket: WebSocket, charge_point_id: str):
+    charge_point_id = charge_point_id.lstrip("/")
+    print(f"🚨 WebSocket 連線請求進入")
+    print(f"👉 解析後 charge_point_id = {charge_point_id}")
+
+    # 查詢白名單
+    cursor.execute("SELECT charge_point_id FROM charge_points")
+    allowed_ids = [row[0] for row in cursor.fetchall()]
+    print(f"👉 白名單清單 = {allowed_ids}")
+
+    if charge_point_id not in allowed_ids:
+        print(f"❌ {charge_point_id} 未在白名單中，拒絕連線")
+        await websocket.close(code=1008)
+        return
+
     try:
-        charge_point_id = charge_point_id.lstrip("/")
-        print("🚨 WebSocket 連線請求進入")
-        print(f"👉 解析後 charge_point_id = {charge_point_id}")
-        print(f"🔍 client IP = {websocket.client.host}")
-        print(f"🔍 headers = {dict(websocket.headers)}")
-
+        # 接受連線
         await websocket.accept(subprotocol="ocpp1.6")
-        print("✅ WebSocket accept 成功")
+        print(f"✅ {charge_point_id} 通過白名單驗證，接受連線")
 
-        # 白名單查詢
-        cursor.execute("SELECT charge_point_id FROM charge_points")
-        all_ids = [row[0] for row in cursor.fetchall()]
-        print(f"👉 白名單清單 = {all_ids}")
+        # 擷取 IP 與時間
+        client_ip = websocket.client.host
+        now = datetime.utcnow().isoformat()
+        logger.info(f"✅ WebSocket connected: {charge_point_id} from {client_ip} at {now}")
 
-        cursor.execute("SELECT * FROM charge_points WHERE charge_point_id = ?", (charge_point_id,))
-        result = cursor.fetchone()
-        print(f"👉 單一查詢結果 = {result}")
+        # ✅ 寫入資料庫紀錄
+        cursor.execute(
+            "INSERT INTO connection_logs (charge_point_id, ip, time) VALUES (?, ?, ?)",
+            (charge_point_id, client_ip, now)
+        )
+        conn.commit()
 
-        if not result:
-            print(f"❌ {charge_point_id} 未通過白名單驗證")
-            await websocket.close()
-            return
-        else:
-            print(f"✅ {charge_point_id} 通過白名單驗證")
-
-        # OCPP handler
+        # 啟動 OCPP handler
         cp = ChargePoint(charge_point_id, websocket)
         await cp.start()
 
-    except Exception as e:
-        print(f"❌ WebSocket 發生例外：{e}")
-        await websocket.close()
-
-
-      # ✅ 寫入資料庫紀錄
-    cursor.execute(
-        "INSERT INTO connection_logs (charge_point_id, ip, time) VALUES (?, ?, ?)",
-        (charge_point_id, client_ip, now)
-    )
-    conn.commit()
-
-    logger.info(f"✅ WebSocket connected: {charge_point_id} from {client_ip} at {now}")
-
-    try:
+        # 其他後續處理（如有）
         await on_connect(websocket, charge_point_id)
+
     except WebSocketDisconnect:
         logger.warning(f"⚠️ Disconnected: {charge_point_id}")
-        connected_devices.pop(charge_point_id, None)
+        # connected_devices.pop(charge_point_id, None)  # 若有用，保留；沒用可移除
+
+    except Exception as e:
+        logger.error(f"❌ WebSocket error for {charge_point_id}: {e}")
+        await websocket.close()
 
 
 # 初始化狀態儲存
@@ -1474,7 +1470,11 @@ async def list_charge_points():
     rows = cursor.fetchall()
     return [
         {
-            "id": r[0], "chargePointId": r[1], "name": r[2], "status": r[3], "createdAt": r[4]
+            "id": r[0],
+            "chargePointId": r[1],  # 注意：這是駝峰命名，對應前端
+            "name": r[2],
+            "status": r[3],
+            "createdAt": r[4]
         } for r in rows
     ]
 
@@ -1486,9 +1486,10 @@ async def add_charge_point(data: dict = Body(...)):
     if not cp_id:
         raise HTTPException(status_code=400, detail="chargePointId is required")
     try:
+        created_at = datetime.utcnow().isoformat()
         cursor.execute(
-            "INSERT INTO charge_points (charge_point_id, name, status) VALUES (?, ?, ?)",
-            (cp_id, name, status)
+            "INSERT INTO charge_points (charge_point_id, name, status, created_at) VALUES (?, ?, ?, ?)",
+            (cp_id, name, status, created_at)
         )
         conn.commit()
         return {"message": "新增成功"}
@@ -1685,7 +1686,6 @@ async def get_daily_by_chargepoint_range(
     return list(result_map.values())
 
 
-from fastapi import Query
 
 
 
