@@ -304,7 +304,9 @@ class ChargePoint(OcppChargePoint):
 
     # ✅ 新增 StatusNotification handler
     @on(Action.StatusNotification)
-    async def on_status_notification(self, connector_id, error_code, status, timestamp, **kwargs):
+    async def on_status_notification(self, connector_id, error_code, status, timestamp=None, **kwargs):
+    if not timestamp:
+        timestamp = datetime.utcnow().isoformat()
         cursor.execute('''
             INSERT INTO status_logs (charge_point_id, connector_id, status, timestamp)
             VALUES (?, ?, ?, ?)
