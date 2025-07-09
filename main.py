@@ -69,9 +69,13 @@ app.add_middleware(
 )
 
 
-
 @app.websocket("/ws/{charge_point_id}")
 async def websocket_endpoint(websocket: WebSocket, charge_point_id: str):
+    cursor.execute("SELECT status FROM charge_points WHERE charge_point_id = ?", (charge_point_id,))
+    row = cursor.fetchone()
+    if not row or row[0] != "enabled":
+        await websocket.close(code=4001)
+        return
     await websocket.accept(subprotocol="ocpp1.6")
 
     client_ip = websocket.client.host
@@ -125,6 +129,19 @@ CREATE TABLE IF NOT EXISTS connection_logs (
     time TEXT
 )
 """)
+conn.commit()
+
+
+# === 新增 charge_points 白名單資料表 ===
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS charge_points (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    charge_point_id TEXT UNIQUE NOT NULL,
+    name TEXT,
+    status TEXT DEFAULT 'enabled',  -- enabled/disabled
+    created_at TEXT DEFAULT (datetime('now'))
+)
+''')
 conn.commit()
 
 
@@ -1427,6 +1444,62 @@ async def delete_id_tag(id_tag: str = Path(...)):
     cursor.execute("DELETE FROM cards WHERE card_id = ?", (id_tag,))
     conn.commit()
     return {"message": "Deleted successfully"}
+
+@app.get("/api/charge-points")
+async def list_charge_points():
+    cursor.execute("SELECT id, charge_point_id, name, status, created_at FROM charge_points")
+    rows = cursor.fetchall()
+    return [
+        {
+            "id": r[0], "chargePointId": r[1], "name": r[2], "status": r[3], "createdAt": r[4]
+        } for r in rows
+    ]
+
+@app.post("/api/charge-points")
+async def add_charge_point(data: dict = Body(...)):
+    cp_id = data.get("chargePointId")
+    name = data.get("name", "")
+    status = data.get("status", "enabled")
+    if not cp_id:
+        raise HTTPException(status_code=400, detail="chargePointId is required")
+    try:
+        cursor.execute(
+            "INSERT INTO charge_points (charge_point_id, name, status) VALUES (?, ?, ?)",
+            (cp_id, name, status)
+        )
+        conn.commit()
+        return {"message": "新增成功"}
+    except sqlite3.IntegrityError:
+        raise HTTPException(status_code=409, detail="充電樁已存在")
+
+@app.put("/api/charge-points/{cp_id}")
+async def update_charge_point(cp_id: str = Path(...), data: dict = Body(...)):
+    name = data.get("name")
+    status = data.get("status")
+    update_fields = []
+    params = []
+    if name is not None:
+        update_fields.append("name = ?")
+        params.append(name)
+    if status is not None:
+        update_fields.append("status = ?")
+        params.append(status)
+    if not update_fields:
+        raise HTTPException(status_code=400, detail="無可更新欄位")
+    params.append(cp_id)
+    cursor.execute(f"UPDATE charge_points SET {', '.join(update_fields)} WHERE charge_point_id = ?", params)
+    conn.commit()
+    return {"message": "已更新"}
+
+@app.delete("/api/charge-points/{cp_id}")
+async def delete_charge_point(cp_id: str = Path(...)):
+    cursor.execute("DELETE FROM charge_points WHERE charge_point_id = ?", (cp_id,))
+    conn.commit()
+    return {"message": "已刪除"}
+
+
+
+
 
 @app.delete("/api/cards/{card_id}")
 async def delete_card(card_id: str):
