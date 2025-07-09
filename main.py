@@ -9,6 +9,9 @@ import logging
 import sqlite3
 import uvicorn
 
+logger = logging.getLogger(__name__)
+
+
 from datetime import datetime, timedelta, timezone
 from fastapi import FastAPI, Request, Query, Body, Path, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, StreamingResponse
