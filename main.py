@@ -142,6 +142,18 @@ DB_FILE = "ocpp_data.db"
 conn = sqlite3.connect(DB_FILE, check_same_thread=False)
 cursor = conn.cursor()
 
+# ✅ 確保資料表存在（若不存在則建立）
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS charge_points (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    charge_point_id TEXT UNIQUE NOT NULL,
+    name TEXT,
+    status TEXT,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+)
+""")
+conn.commit()
+
 # 初始化 connection_logs 表格（如不存在就建立）
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS connection_logs (
