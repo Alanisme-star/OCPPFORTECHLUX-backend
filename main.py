@@ -483,8 +483,11 @@ class ChargePoint(OcppChargePoint):
         return MeterValuesPayload()
 
 
-    @on(Action.StopTransaction)
-    async def on_stop_transaction(self, transaction_id, meter_stop, timestamp, id_tag, reason, **kwargs):
+from dateutil.parser import parse as parse_date
+
+@on(Action.StopTransaction)
+async def on_stop_transaction(self, transaction_id, meter_stop, timestamp, id_tag, reason, **kwargs):
+    try:
         # 更新交易紀錄
         cursor.execute('''
             UPDATE transactions
@@ -498,11 +501,17 @@ class ChargePoint(OcppChargePoint):
         row = cursor.fetchone()
         if not row:
             logging.warning("❌ StopTransaction | 查無交易記錄")
-            return StopTransaction(id_tag_info={"status": "Expired"})
+            return call_result.StopTransactionPayload(id_tag_info={"status": "Expired"})
 
         meter_start, start_time_str = row
-        start_time = datetime.fromisoformat(start_time_str)
-        stop_time = datetime.fromisoformat(timestamp)
+        # 用 dateutil.parser.parse 處理各種格式
+        try:
+            start_time = parse_date(start_time_str)
+            stop_time = parse_date(timestamp)
+        except Exception as e:
+            logging.warning(f"StopTransaction | 解析時間失敗: {e}")
+            return call_result.StopTransactionPayload(id_tag_info={"status": "Expired"})
+
         kwh = max((meter_stop - meter_start) / 1000, 0)
 
         # 計算時間點的電價
@@ -517,7 +526,7 @@ class ChargePoint(OcppChargePoint):
             day_type = "holiday" if is_holiday(dt) else "weekday"
             t = dt.time().strftime("%H:%M")
 
-        # 新增例外處理：00:00–00:00 表示全天
+            # 新增例外處理：00:00–00:00 表示全天
             cursor.execute('''
                 SELECT price FROM pricing_rules
                 WHERE season = ? AND day_type = ? AND start_time = '00:00' AND end_time = '00:00'
@@ -557,8 +566,11 @@ class ChargePoint(OcppChargePoint):
                 logging.info(f"⚠️ 卡片 {id_tag} 餘額僅剩 {new_balance} 元")
 
         logging.info(f"🛑 StopTransaction 成功 | CP={self.id} | idTag={id_tag} | transactionId={transaction_id}")
-        return StopTransactionPayload(id_tag_info={"status": "Accepted"})
+        return call_result.StopTransactionPayload(id_tag_info={"status": "Accepted"})
 
+    except Exception as e:
+        logging.error(f"StopTransaction | 處理發生例外: {e}", exc_info=True)
+        return call_result.StopTransactionPayload(id_tag_info={"status": "InternalError"})
 
 
 
