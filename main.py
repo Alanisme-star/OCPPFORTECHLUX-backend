@@ -362,7 +362,6 @@ class ChargePoint(OcppChargePoint):
             status_db, valid_until = row
             try:
                 valid_until_dt = datetime.fromisoformat(valid_until).replace(tzinfo=timezone.utc)
-
             except ValueError:
                 logging.warning(f"⚠️ 無法解析 valid_until 格式：{valid_until}")
                 valid_until_dt = datetime.min.replace(tzinfo=timezone.utc)
@@ -370,7 +369,7 @@ class ChargePoint(OcppChargePoint):
             logging.info(f"🔎 驗證有效期限valid_until={valid_until_dt.isoformat()} / now={now.isoformat()}")
             status = "Accepted" if status_db == "Accepted" and valid_until_dt > now else "Expired"
 
-        # 驗證是否有符合條件的有效預約
+        # 新邏輯：有預約則消耗預約，沒預約也允許直接充電
         now = datetime.utcnow().isoformat()
         cursor.execute('''
         SELECT id FROM reservations
@@ -379,15 +378,46 @@ class ChargePoint(OcppChargePoint):
         ''', (self.id, id_tag, now, now))
         res = cursor.fetchone()
 
-        if not res:
-            logging.warning(f"⛔ StartTransaction 拒絕 | 無有效預約")
-            return call_result.StartTransactionPayload(
-                transaction_id=0,
-                id_tag_info={"status": "Expired"}
-            )
-        else:
+        if res:
             cursor.execute("UPDATE reservations SET status = 'completed' WHERE id = ?", (res[0],))
             conn.commit()
+            logging.info(f"🟢 StartTransaction | 有有效預約，啟動充電（預約ID={res[0]}）")
+        else:
+            logging.info(f"🟢 StartTransaction | 無預約，允許自由充電（只檢查卡片授權與餘額）")
+
+        # ✅ 餘額檢查
+        cursor.execute("SELECT balance FROM cards WHERE card_id = ?", (id_tag,))
+        card = cursor.fetchone()
+        if not card:
+            logging.warning(f"⛔ 無此卡片帳戶資料，StartTransaction 拒絕")
+            return call_result.StartTransactionPayload(transaction_id=0, id_tag_info={"status": "Invalid"})
+
+        balance = card[0]
+        if balance < 10:
+            logging.warning(f"💳 餘額不足：{balance} 元，StartTransaction 拒絕")
+            return call_result.StartTransactionPayload(transaction_id=0, id_tag_info={"status": "Blocked"})
+
+        if status != "Accepted":
+            logging.warning(f"⛔ StartTransaction 拒絕 | idTag={id_tag} | status={status}")
+            return call_result.StartTransactionPayload(transaction_id=0, id_tag_info={"status": status})
+
+        transaction_id = int(datetime.utcnow().timestamp() * 1000)
+        cursor.execute('''
+            INSERT INTO transactions (
+                transaction_id, charge_point_id, connector_id, id_tag,
+                meter_start, start_timestamp, meter_stop, stop_timestamp, reason
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            transaction_id, self.id, connector_id, id_tag,
+            meter_start, timestamp, None, None, None
+        ))
+        conn.commit()
+        logging.info(f"🚗 StartTransaction 成功 | CP={self.id} | idTag={id_tag} | transactionId={transaction_id}")
+        return call_result.StartTransactionPayload(
+            transaction_id=transaction_id,
+            id_tag_info={"status": "Accepted"}
+        )
+
 
         # ✅ 新增：餘額檢查
         cursor.execute("SELECT balance FROM cards WHERE card_id = ?", (id_tag,))
