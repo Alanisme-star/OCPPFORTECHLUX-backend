@@ -483,94 +483,92 @@ class ChargePoint(OcppChargePoint):
         return MeterValuesPayload()
 
 
-from dateutil.parser import parse as parse_date
-
-@on(Action.StopTransaction)
-async def on_stop_transaction(self, transaction_id, meter_stop, timestamp, id_tag, reason, **kwargs):
-    try:
-        # 更新交易紀錄
-        cursor.execute('''
-            UPDATE transactions
-            SET meter_stop = ?, stop_timestamp = ?, reason = ?
-            WHERE transaction_id = ?
-        ''', (meter_stop, timestamp, reason, transaction_id))
-        conn.commit()
-
-        # 查詢啟始資料
-        cursor.execute("SELECT meter_start, start_timestamp FROM transactions WHERE transaction_id = ?", (transaction_id,))
-        row = cursor.fetchone()
-        if not row:
-            logging.warning("❌ StopTransaction | 查無交易記錄")
-            return call_result.StopTransactionPayload(id_tag_info={"status": "Expired"})
-
-        meter_start, start_time_str = row
-        # 用 dateutil.parser.parse 處理各種格式
+    @on(Action.StopTransaction)
+    async def on_stop_transaction(self, transaction_id, meter_stop, timestamp, id_tag, reason, **kwargs):
         try:
-            start_time = parse_date(start_time_str)
-            stop_time = parse_date(timestamp)
-        except Exception as e:
-            logging.warning(f"StopTransaction | 解析時間失敗: {e}")
-            return call_result.StopTransactionPayload(id_tag_info={"status": "Expired"})
-
-        kwh = max((meter_stop - meter_start) / 1000, 0)
-
-        # 計算時間點的電價
-        def is_summer(dt):
-            return datetime(dt.year, 6, 1) <= dt <= datetime(dt.year, 9, 30)
-
-        def is_holiday(dt):
-            return dt.weekday() >= 5
-
-        def get_price(dt):
-            season = "summer" if is_summer(dt) else "non_summer"
-            day_type = "holiday" if is_holiday(dt) else "weekday"
-            t = dt.time().strftime("%H:%M")
-
-            # 新增例外處理：00:00–00:00 表示全天
+            # 更新交易紀錄
             cursor.execute('''
-                SELECT price FROM pricing_rules
-                WHERE season = ? AND day_type = ? AND start_time = '00:00' AND end_time = '00:00'
-                ORDER BY start_time DESC LIMIT 1
-            ''', (season, day_type))
-            full_day = cursor.fetchone()
-            if full_day:
-                return full_day[0]
-
-            cursor.execute('''
-                SELECT price FROM pricing_rules
-                WHERE season = ? AND day_type = ? AND (
-                    (start_time <= end_time AND start_time <= ? AND end_time > ?) OR
-                    (start_time > end_time AND (? >= start_time OR ? < end_time))
-                )
-                ORDER BY start_time DESC LIMIT 1
-            ''', (season, day_type, t, t, t, t))
-            row = cursor.fetchone()
-            return row[0] if row else 0
-
-        price = get_price(start_time)
-        cost = round(kwh * price, 2)
-
-        # 扣除卡片餘額
-        cursor.execute("SELECT balance FROM cards WHERE card_id = ?", (id_tag,))
-        card = cursor.fetchone()
-        if card:
-            new_balance = round(card[0] - cost, 2)
-            if new_balance < 0:
-                new_balance = 0
-            cursor.execute("UPDATE cards SET balance = ? WHERE card_id = ?", (new_balance, id_tag))
+                UPDATE transactions
+                SET meter_stop = ?, stop_timestamp = ?, reason = ?
+                WHERE transaction_id = ?
+            ''', (meter_stop, timestamp, reason, transaction_id))
             conn.commit()
-            logging.info(f"💳 扣款完成 | 卡片={id_tag} | 原餘額={card[0]} | 扣款={cost} 元 | 剩餘={new_balance} 元")
 
-            # 若餘額過低，自動通知
-            if new_balance < 100:
-                logging.info(f"⚠️ 卡片 {id_tag} 餘額僅剩 {new_balance} 元")
+            # 查詢啟始資料
+            cursor.execute("SELECT meter_start, start_timestamp FROM transactions WHERE transaction_id = ?", (transaction_id,))
+            row = cursor.fetchone()
+            if not row:
+                logging.warning("❌ StopTransaction | 查無交易記錄")
+                return call_result.StopTransactionPayload(id_tag_info={"status": "Expired"})
 
-        logging.info(f"🛑 StopTransaction 成功 | CP={self.id} | idTag={id_tag} | transactionId={transaction_id}")
-        return call_result.StopTransactionPayload(id_tag_info={"status": "Accepted"})
+            meter_start, start_time_str = row
+            # 用 dateutil.parser.parse 處理各種格式
+            try:
+                start_time = parse_date(start_time_str)
+                stop_time = parse_date(timestamp)
+            except Exception as e:
+                logging.warning(f"StopTransaction | 解析時間失敗: {e}")
+                return call_result.StopTransactionPayload(id_tag_info={"status": "Expired"})
 
-    except Exception as e:
-        logging.error(f"StopTransaction | 處理發生例外: {e}", exc_info=True)
-        return call_result.StopTransactionPayload(id_tag_info={"status": "InternalError"})
+            kwh = max((meter_stop - meter_start) / 1000, 0)
+
+            # 計算時間點的電價
+            def is_summer(dt):
+                return datetime(dt.year, 6, 1) <= dt <= datetime(dt.year, 9, 30)
+
+            def is_holiday(dt):
+                return dt.weekday() >= 5
+
+            def get_price(dt):
+                season = "summer" if is_summer(dt) else "non_summer"
+                day_type = "holiday" if is_holiday(dt) else "weekday"
+                t = dt.time().strftime("%H:%M")
+
+                # 新增例外處理：00:00–00:00 表示全天
+                cursor.execute('''
+                    SELECT price FROM pricing_rules
+                    WHERE season = ? AND day_type = ? AND start_time = '00:00' AND end_time = '00:00'
+                    ORDER BY start_time DESC LIMIT 1
+                ''', (season, day_type))
+                full_day = cursor.fetchone()
+                if full_day:
+                    return full_day[0]
+
+                cursor.execute('''
+                    SELECT price FROM pricing_rules
+                    WHERE season = ? AND day_type = ? AND (
+                        (start_time <= end_time AND start_time <= ? AND end_time > ?) OR
+                        (start_time > end_time AND (? >= start_time OR ? < end_time))
+                    )
+                    ORDER BY start_time DESC LIMIT 1
+                ''', (season, day_type, t, t, t, t))
+                row = cursor.fetchone()
+                return row[0] if row else 0
+
+            price = get_price(start_time)
+            cost = round(kwh * price, 2)
+
+            # 扣除卡片餘額
+            cursor.execute("SELECT balance FROM cards WHERE card_id = ?", (id_tag,))
+            card = cursor.fetchone()
+            if card:
+                new_balance = round(card[0] - cost, 2)
+                if new_balance < 0:
+                    new_balance = 0
+                cursor.execute("UPDATE cards SET balance = ? WHERE card_id = ?", (new_balance, id_tag))
+                conn.commit()
+                logging.info(f"💳 扣款完成 | 卡片={id_tag} | 原餘額={card[0]} | 扣款={cost} 元 | 剩餘={new_balance} 元")
+
+                # 若餘額過低，自動通知
+                if new_balance < 100:
+                    logging.info(f"⚠️ 卡片 {id_tag} 餘額僅剩 {new_balance} 元")
+
+            logging.info(f"🛑 StopTransaction 成功 | CP={self.id} | idTag={id_tag} | transactionId={transaction_id}")
+            return call_result.StopTransactionPayload(id_tag_info={"status": "Accepted"})
+
+        except Exception as e:
+            logging.error(f"StopTransaction | 處理發生例外: {e}", exc_info=True)
+            return call_result.StopTransactionPayload(id_tag_info={"status": "InternalError"})
 
 
 
