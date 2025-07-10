@@ -514,7 +514,9 @@ class ChargePoint(OcppChargePoint):
 
             # 計算時間點的電價
             def is_summer(dt):
-                return datetime(dt.year, 6, 1) <= dt <= datetime(dt.year, 9, 30)
+                summer_start = datetime(dt.year, 6, 1, tzinfo=dt.tzinfo)
+                summer_end = datetime(dt.year, 9, 30, tzinfo=dt.tzinfo)
+                return summer_start <= dt <= summer_end
 
             def is_holiday(dt):
                 return dt.weekday() >= 5
