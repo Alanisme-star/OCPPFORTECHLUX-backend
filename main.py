@@ -350,7 +350,7 @@ class ChargePoint(OcppChargePoint):
             logging.info(f"🔎 驗證有效期限valid_until={valid_until_dt.isoformat()} / now={now.isoformat()}")
             status = "Accepted" if status_db == "Accepted" and valid_until_dt > now else "Expired"
         logging.info(f"🆔 Authorize | idTag: {id_tag} | 查詢結果: {status}")
-        return call.AuthorizePayload(idTagInfo={"status": status})
+        return call_result.AuthorizePayload(id_tag_info={"status": status})
 
     @on(Action.StartTransaction)
     async def on_start_transaction(self, connector_id, id_tag, meter_start, timestamp, **kwargs):
