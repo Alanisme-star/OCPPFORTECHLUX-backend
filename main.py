@@ -519,7 +519,7 @@ class ChargePoint(OcppChargePoint):
 
                     # 📝 若餘額不足，發送 StopTransaction
                     if new_balance <= 0:
-                        logging.warning(f\"🔌 餘額為 0，自動停止充電 | 卡片={id_tag} | 已消耗={cost_so_far} 元\")
+                        logging.warning(f"⚠️ 餘額為 0，自動停止充電 | 卡片={id_tag} | 已消耗={cost_so_far} 元")
                         await self.send_call(
                             call.StopTransactionPayload(
                                 transaction_id=transaction_id,
