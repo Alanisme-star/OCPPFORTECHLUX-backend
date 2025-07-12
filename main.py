@@ -464,6 +464,8 @@ class ChargePoint(OcppChargePoint):
             id_tag_info={"status": "Accepted"}
         )
 
+
+
     @on(Action.MeterValues)
     async def on_meter_values(self, connector_id, meter_value, **kwargs):
         for entry in meter_value:
@@ -472,15 +474,81 @@ class ChargePoint(OcppChargePoint):
                 value = float(sampled_value.get("value"))
                 measurand = sampled_value.get("measurand", "Energy.Active.Import.Register")
                 unit = sampled_value.get("unit", "Wh")
+
+                # 儲存進 DB
                 cursor.execute('''
                     INSERT INTO meter_values (charge_point_id, connector_id, timestamp, measurand, value, unit)
                     VALUES (?, ?, ?, ?, ?, ?)
-                ''', (
-                    self.id, connector_id, timestamp, measurand, value, unit
-                ))
+                ''', (self.id, connector_id, timestamp, measurand, value, unit))
+
+                # 若是累積電能，額外儲存更新 kWh
+                if measurand == "Energy.Active.Import.Register":
+                    # 將 Wh 換算成 kWh（如原始單位為 Wh）
+                    energy_kwh = value / 1000 if unit.lower() == "wh" else value
+                    charging_point_status[self.id] = charging_point_status.get(self.id, {})
+                    charging_point_status[self.id]["total_kwh"] = round(energy_kwh, 3)
+
+                    # 🔄 查出該樁目前進行中交易
+                    cursor.execute('''
+                        SELECT transaction_id, id_tag, meter_start
+                        FROM transactions
+                        WHERE charge_point_id = ? AND meter_stop IS NULL
+                        ORDER BY start_timestamp DESC LIMIT 1
+                    ''', (self.id,))
+                    row = cursor.fetchone()
+                    if not row:
+                        return MeterValuesPayload()
+
+                    transaction_id, id_tag, meter_start = row
+                    kwh_delta = max(0, (energy_kwh * 1000 - meter_start) / 1000)
+
+                    # 🔢 取得即時電價
+                    price_per_kwh = 10  # 預設電價，或從 daily_pricing 查詢
+
+                    # 💰 計算消耗金額
+                    cost_so_far = round(kwh_delta * price_per_kwh, 2)
+
+                    # 查詢卡片餘額
+                    cursor.execute("SELECT balance FROM cards WHERE card_id = ?", (id_tag,))
+                    card = cursor.fetchone()
+                    if not card:
+                        return MeterValuesPayload()
+
+                    balance = card[0]
+                    new_balance = round(balance - cost_so_far, 2)
+
+                    # 📝 若餘額不足，發送 StopTransaction
+                    if new_balance <= 0:
+                        logging.warning(f\"🔌 餘額為 0，自動停止充電 | 卡片={id_tag} | 已消耗={cost_so_far} 元\")
+                        await self.send_call(
+                            call.StopTransactionPayload(
+                                transaction_id=transaction_id,
+                                meter_stop=int(energy_kwh * 1000),
+                                timestamp=datetime.utcnow().isoformat(),
+                                id_tag=id_tag,
+                                reason="LocalOutOfCredit"
+                            )
+                        )
+                    else:
+                        # 可選：更新卡片即時扣款（或等 StopTransaction 時再扣）
+                        pass
+
+
+                    # 如有欄位，可同步更新交易表
+                    cursor.execute("UPDATE transactions SET kwh = ? WHERE transaction_id = ?", (kwh_delta, transaction_id))
+
+
+                # 若是即時功率（單位通常為 W）
+                elif measurand == "Power.Active.Import":
+                    charging_point_status[self.id] = charging_point_status.get(self.id, {})
+                    charging_point_status[self.id]["power_w"] = round(value, 2)
+
         conn.commit()
         logging.info(f"📈 MeterValues | CP={self.id} | 筆數={len(meter_value)}")
         return MeterValuesPayload()
+
+...
+
 
 
     @on(Action.StopTransaction)
