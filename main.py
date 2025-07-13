@@ -948,38 +948,25 @@ async def get_status_logs(
 
 from datetime import datetime
 
-from datetime import datetime
+timestamp_raw = row[0]
+if isinstance(timestamp_raw, datetime):
+    timestamp_iso = timestamp_raw.isoformat()
+else:
+    try:
+        parsed_time = datetime.strptime(timestamp_raw, "%Y-%m-%d %H:%M:%S")
+        timestamp_iso = parsed_time.isoformat()
+    except Exception:
+        timestamp_iso = None
 
-@app.get("/api/charge-points/{charge_point_id}/latest-meter")
-def get_latest_meter_value(charge_point_id: str):
-    with sqlite3.connect("ocpp_data.db") as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT timestamp, value, unit
-            FROM meter_values
-            WHERE charge_point_id = ? AND measurand = 'Energy.Active.Import.Register'
-            ORDER BY timestamp DESC
-            LIMIT 1
-        """, (charge_point_id,))
-        row = cursor.fetchone()
+if not timestamp_iso:
+    return {}
 
-        if not row:
-            return {}
+return {
+    "timestamp": timestamp_iso,
+    "value": row[1],
+    "unit": row[2],
+}
 
-        timestamp_raw = row[0]
-        try:
-            # 假設資料為 "YYYY-MM-DD HH:MM:SS"，轉換為 ISO 格式 "YYYY-MM-DDTHH:MM:SS"
-            parsed_time = datetime.strptime(timestamp_raw, "%Y-%m-%d %H:%M:%S")
-            timestamp_iso = parsed_time.isoformat()
-        except Exception:
-            # 若格式本身已正確或轉換失敗，保留原值
-            timestamp_iso = timestamp_raw
-
-        return {
-            "timestamp": timestamp_iso,
-            "value": row[1],
-            "unit": row[2],
-        }
 
 
 @app.get("/api/id_tags")
