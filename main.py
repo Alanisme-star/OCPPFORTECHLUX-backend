@@ -978,7 +978,7 @@ def get_latest_meter_value(charge_point_id: str):
             return {}
 
         return {
-            "timestamp": timestamp_iso,
+ 
             "value": row[1],
             "unit": row[2],
         }
