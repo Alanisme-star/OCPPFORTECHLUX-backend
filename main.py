@@ -541,30 +541,44 @@ class ChargePoint(OcppChargePoint):
         row = cursor.fetchone()
         return {"power_w": row[0] if row else 0}
 
-    @app.get("/api/charge-points/{charge_point_id}/current-transaction")
-    def get_current_transaction(charge_point_id: str):
-        with sqlite3.connect("ocpp_data.db") as conn:
-            cursor = conn.cursor()
-        cursor.execute("""
-            SELECT kwh, start_time FROM transactions
-            WHERE charge_point_id = ? AND stop_time IS NULL
-            ORDER BY start_time DESC LIMIT 1
-        """, (charge_point_id,))
-        row = cursor.fetchone()
+   @app.get("/api/charge-points/{charge_point_id}/current-transaction")
+   def get_current_transaction(charge_point_id: str):
+       with sqlite3.connect("ocpp_data.db") as conn:
+           cursor = conn.cursor()
 
-        if row:
-            kwh, start_time = row
-            return {
-                "kwh": round(kwh, 3),
-                "start_time": start_time,
-                "active": True
-            }
-        else:
-            return {
-                "kwh": 0,
-                "start_time": None,
-                "active": False
-            }
+           # 取得尚未結束的交易紀錄
+           cursor.execute("""
+               SELECT transaction_id, meter_start, start_timestamp
+               FROM transactions
+               WHERE charge_point_id = ? AND stop_time IS NULL
+               ORDER BY start_timestamp DESC LIMIT 1
+           """, (charge_point_id,))
+           row = cursor.fetchone()
+
+           if not row:
+               return {"kwh": 0, "start_time": None, "active": False}
+
+           transaction_id, meter_start, start_time = row
+
+           # 抓最新一筆的 meter_value，作為現在讀數
+           cursor.execute("""
+               SELECT value FROM meter_values
+               WHERE charge_point_id = ? AND measurand = 'Energy.Active.Import.Register'
+               ORDER BY timestamp DESC LIMIT 1
+           """, (charge_point_id,))
+           value_row = cursor.fetchone()
+
+           if value_row:
+               current_meter = float(value_row[0])
+               kwh = max((current_meter - meter_start) / 1000.0, 0)
+           else:
+               kwh = 0
+
+           return {
+               "kwh": round(kwh, 3),
+               "start_time": start_time,
+               "active": True
+           }
 
     @on(Action.StopTransaction)
     async def on_stop_transaction(self, transaction_id, meter_stop, timestamp, id_tag, reason, **kwargs):
@@ -1186,7 +1200,8 @@ async def get_top_consumers(
 def weekly_notify_task():
     while True:
         now = datetime.now()
-        if now.weekday() == 0 and now.hour == 9 and now.minute == 0:
+        if now.weekday() ==
+ 0 and now.hour == 9 and now.minute == 0:
             try:
                 with sqlite3.connect("ocpp_data.db") as conn:
                     cursor = conn.cursor()
