@@ -515,7 +515,7 @@ class ChargePoint(OcppChargePoint):
 
         conn.commit()
         logging.info(f"📈 MeterValues | CP={self.id} | 筆數={len(meter_value)}")
-        return MeterValuesPayload()
+        return call_result.MeterValuesPayload()
 
 
 
