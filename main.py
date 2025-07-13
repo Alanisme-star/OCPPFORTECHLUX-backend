@@ -526,7 +526,7 @@ class ChargePoint(OcppChargePoint):
             cursor = conn.cursor()
         cursor.execute("""
             SELECT COUNT(*) FROM transactions
-            WHERE charge_point_id = ? AND stop_time IS NULL
+            WHERE charge_point_id = ? AND stop_timestamp IS NULL
         """, (charge_point_id,))
         active = cursor.fetchone()[0] > 0
 
@@ -550,7 +550,7 @@ class ChargePoint(OcppChargePoint):
            cursor.execute("""
                SELECT transaction_id, meter_start, start_timestamp
                FROM transactions
-               WHERE charge_point_id = ? AND stop_time IS NULL
+               WHERE charge_point_id = ? AND stop_timestamp IS NULL
                ORDER BY start_timestamp DESC LIMIT 1
            """, (charge_point_id,))
            row = cursor.fetchone()
@@ -602,7 +602,7 @@ class ChargePoint(OcppChargePoint):
             # 用 dateutil.parser.parse 處理各種格式
             try:
                 start_time = parse_date(start_time_str)
-                stop_time = parse_date(timestamp)
+                stop_timestamp = parse_date(timestamp)
             except Exception as e:
                 logging.warning(f"StopTransaction | 解析時間失敗: {e}")
                 return call_result.StopTransactionPayload(id_tag_info={"status": "Expired"})
