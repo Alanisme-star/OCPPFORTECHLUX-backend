@@ -522,6 +522,8 @@ class ChargePoint(OcppChargePoint):
     @app.get("/api/charge-points/{charge_point_id}/realtime-status")
     def get_realtime_status(charge_point_id: str):
         # 檢查是否仍在充電中
+    with sqlite3.connect("ocpp.db") as conn:
+        cursor = conn.cursor()
         cursor.execute("""
             SELECT COUNT(*) FROM transactions
             WHERE charge_point_id = ? AND stop_time IS NULL
@@ -541,6 +543,8 @@ class ChargePoint(OcppChargePoint):
 
     @app.get("/api/charge-points/{charge_point_id}/current-transaction")
     def get_current_transaction(charge_point_id: str):
+    with sqlite3.connect("ocpp.db") as conn:
+        cursor = conn.cursor()
         cursor.execute("""
             SELECT kwh, start_time FROM transactions
             WHERE charge_point_id = ? AND stop_time IS NULL
@@ -832,6 +836,8 @@ async def calculate_transaction_cost(transaction_id: int):
 
 @app.get("/api/transactions/cost-summary")
 async def transaction_cost_summary():
+with sqlite3.connect("ocpp.db") as conn:
+    cursor = conn.cursor()
     query = """
         SELECT t.transaction_id, (t.meter_stop - t.meter_start)/1000.0 as kWh,
                p.base_fee, p.energy_fee, p.overuse_fee, p.total_amount
@@ -1765,6 +1771,9 @@ async def dashboard_trend(group_by: str = Query("day")):
         else:
             raise HTTPException(status_code=400, detail="group_by must be 'day' or 'week'")
 
+    with sqlite3.connect("ocpp.db") as conn:
+        cursor = conn.cursor()
+
         cursor.execute(f"""
             SELECT {date_expr} as period,
                    SUM(meter_stop - meter_start) / 1000.0 as total_kwh
@@ -1793,6 +1802,8 @@ async def get_daily_by_chargepoint_range(
     start: str = Query(...),
     end: str = Query(...)
 ):
+with sqlite3.connect("ocpp.db") as conn:
+    cursor = conn.cursor()
     cursor.execute("""
         SELECT strftime('%Y-%m-%d', start_timestamp) as day,
                charge_point_id,
