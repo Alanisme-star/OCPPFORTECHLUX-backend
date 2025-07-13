@@ -539,8 +539,6 @@ class ChargePoint(OcppChargePoint):
         row = cursor.fetchone()
         return {"power_w": row[0] if row else 0}
 
-
-
     @app.get("/api/charge-points/{charge_point_id}/current-transaction")
     def get_current_transaction(charge_point_id: str):
         cursor.execute("""
@@ -549,17 +547,20 @@ class ChargePoint(OcppChargePoint):
             ORDER BY start_time DESC LIMIT 1
         """, (charge_point_id,))
         row = cursor.fetchone()
+
         if row:
-            return {"kwh": row[0], "start_time": row[1], "active": True}
+            kwh, start_time = row
+            return {
+                "kwh": round(kwh, 3),
+                "start_time": start_time,
+                "active": True
+            }
         else:
-            return {"kwh": 0, "start_time": None, "active": False}
-
-
-        meter_start, current = row
-        kwh = max((current - meter_start) / 1000, 0)
-        return {"kwh": round(kwh, 3)}
-
-
+            return {
+                "kwh": 0,
+                "start_time": None,
+                "active": False
+            }
 
     @on(Action.StopTransaction)
     async def on_stop_transaction(self, transaction_id, meter_stop, timestamp, id_tag, reason, **kwargs):
