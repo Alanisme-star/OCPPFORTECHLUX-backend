@@ -1,44 +1,67 @@
 import asyncio
 import websockets
 import json
-import uuid
+import time
 
-# === 請根據你的實際狀況修改以下 ===
-CHARGE_POINT_ID = "TW*MSI*AE000100"   # 模擬的充電樁 ID（應與白名單相符）
-ENDPOINT_URL = f"wss://ocppfortechlux-backend.onrender.com/{CHARGE_POINT_ID}"
-OCPP_SUBPROTOCOL = "ocpp1.6"
+async def simulate_charge():
+    uri = "wss://ocppfortechlux-backend.onrender.com/TW*MSI*E000100"  # 換成你的雲端 ws 路徑
+    async with websockets.connect(uri, subprotocols=["ocpp1.6"]) as ws:
+        # 1. BootNotification
+        boot = [2, "msgid-boot", "BootNotification", {"chargePointModel": "Sim", "chargePointVendor": "Sim"}]
+        await ws.send(json.dumps(boot))
+        print(await ws.recv())
 
-# === 建立 BootNotification 封包 ===
-def make_boot_notification():
-    unique_id = str(uuid.uuid4())
-    message = [
-        2,  # MessageTypeId: CALL
-        unique_id,
-        "BootNotification",
-        {
-            "chargePointModel": "SimulatedCP",
-            "chargePointVendor": "SimulatedVendor"
-        }
-    ]
-    return json.dumps(message)
+        # 2. Authorize
+        auth = [2, "msgid-auth", "Authorize", {"idTag": "6678B3EB"}]
+        await ws.send(json.dumps(auth))
+        print(await ws.recv())
 
-# === 模擬程式主流程 ===
-async def simulate_ocpp_connection():
-    try:
-        print(f"🔌 Connecting to {ENDPOINT_URL} ...")
-        async with websockets.connect(ENDPOINT_URL, subprotocols=[OCPP_SUBPROTOCOL]) as ws:
-            print("✅ WebSocket connected")
+        # 3. StartTransaction
+        start = [2, "msgid-start", "StartTransaction", {
+            "connectorId": 1,
+            "idTag": "6678B3EB",
+            "meterStart": 10000,
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        }]
+        await ws.send(json.dumps(start))
+        res_start = await ws.recv()
+        print(res_start)
+        # 取得回應內的 transactionId
+        transaction_id = None
+        try:
+            obj = json.loads(res_start)
+            if isinstance(obj, list) and len(obj) >= 3 and isinstance(obj[2], dict):
+                transaction_id = obj[2].get("transactionId") or obj[2].get("transaction_id") or obj[2].get("transaction_id")
+            if not transaction_id:
+                transaction_id = 12345678  # fallback
+        except Exception as e:
+            transaction_id = 12345678
 
-            msg = make_boot_notification()
-            print(f"📤 Sending BootNotification: {msg}")
-            await ws.send(msg)
+        # 4. MeterValues
+        mv = [2, "msgid-mv", "MeterValues", {
+            "connectorId": 1,
+            "transactionId": transaction_id,
+            "meterValue": [{
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "sampledValue": [{
+                    "value": "10800",
+                    "measurand": "Energy.Active.Import.Register",
+                    "unit": "Wh"
+                }]
+            }]
+        }]
+        await ws.send(json.dumps(mv))
+        print(await ws.recv())
 
-            reply = await ws.recv()
-            print(f"📥 Received response: {reply}")
+        # 5. StopTransaction
+        stop = [2, "msgid-stop", "StopTransaction", {
+            "transactionId": transaction_id,
+            "meterStop": 10800,
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "idTag": "6678B3EB",
+            "reason": "Local"
+        }]
+        await ws.send(json.dumps(stop))
+        print(await ws.recv())
 
-    except Exception as e:
-        print(f"❌ Connection failed: {e}")
-
-# === 執行 ===
-if __name__ == "__main__":
-    asyncio.run(simulate_ocpp_connection())
+asyncio.run(simulate_charge())
