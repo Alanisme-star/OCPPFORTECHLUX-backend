@@ -549,7 +549,7 @@ class ChargePoint(OcppChargePoint):
 
             # 取得尚未結束的交易紀錄
             cursor.execute("""
-                SELECT transaction_id, meter_start, start_timestamp
+                SELECT transaction_id, start_timestamp
                 FROM transactions
                 WHERE charge_point_id = ? AND stop_timestamp IS NULL
                 ORDER BY start_timestamp DESC LIMIT 1
@@ -557,26 +557,10 @@ class ChargePoint(OcppChargePoint):
             row = cursor.fetchone()
 
             if not row:
-                return {"kwh": 0, "start_time": None, "active": False}
+                return {"start_time": None, "active": False}
 
-            transaction_id, meter_start, start_time = row
-
-            # 抓最新一筆的 meter_value 作為現在讀數
-            cursor.execute("""
-                SELECT value FROM meter_values
-                WHERE charge_point_id = ? AND measurand = 'Energy.Active.Import.Register'
-                ORDER BY timestamp DESC LIMIT 1
-            """, (charge_point_id,))
-            value_row = cursor.fetchone()
-
-            if value_row:
-                current_meter = float(value_row[0])
-                kwh = max((current_meter - meter_start) / 1000.0, 0)
-            else:
-                kwh = 0
-
+            transaction_id, start_time = row
             return {
-                "kwh": round(kwh, 3),
                 "start_time": start_time,
                 "active": True
             }
