@@ -543,6 +543,40 @@ class ChargePoint(OcppChargePoint):
 
 
 
+    @app.get("/api/charge-points/{charge_point_id}/realtime-status")
+    async def get_realtime_status(charge_point_id: str):
+        status = charging_point_status.get(charge_point_id)
+        if not status:
+            return {"message": "No data available for this charge point"}
+
+        return {
+            "charge_point_id": charge_point_id,
+            "power_w": status.get("power_w"),
+            "total_kwh": status.get("total_kwh")
+        }
+
+
+
+    @app.get("/api/charge-points/{charge_point_id}/current-transaction")
+    async def get_current_transaction_kwh(charge_point_id: str):
+        cursor.execute('''
+            SELECT t.meter_start, mv.value
+            FROM transactions t
+            JOIN meter_values mv ON mv.charge_point_id = t.charge_point_id
+            WHERE t.charge_point_id = ?
+              AND t.meter_stop IS NULL
+              AND mv.measurand = "Energy.Active.Import.Register"
+            ORDER BY mv.timestamp DESC LIMIT 1
+        ''', (charge_point_id,))
+        row = cursor.fetchone()
+        if not row:
+            return {"kwh": 0.0}
+
+        meter_start, current = row
+        kwh = max((current - meter_start) / 1000, 0)
+        return {"kwh": round(kwh, 3)}
+
+
 
     @on(Action.StopTransaction)
     async def on_stop_transaction(self, transaction_id, meter_stop, timestamp, id_tag, reason, **kwargs):
