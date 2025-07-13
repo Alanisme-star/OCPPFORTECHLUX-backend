@@ -3,6 +3,8 @@ sys.path.insert(0, "./")
 
 import json
 import os
+import io
+import csv
 import uuid
 import asyncio
 import logging
@@ -10,7 +12,6 @@ import sqlite3
 import uvicorn
 
 logger = logging.getLogger(__name__)
-
 
 from datetime import datetime, timedelta, timezone
 from fastapi import FastAPI, Request, Query, Body, Path, HTTPException, WebSocket, WebSocketDisconnect
@@ -31,6 +32,7 @@ from ocpp.v16.call_result import (
 from ocpp.v16.enums import Action, RegistrationStatus
 from ocpp.routing import on
 from urllib.parse import urlparse, parse_qs
+from reportlab.pdfgen import canvas
 
 app = FastAPI()
 
@@ -164,19 +166,6 @@ CREATE TABLE IF NOT EXISTS connection_logs (
     time TEXT
 )
 """)
-conn.commit()
-
-
-# === 新增 charge_points 白名單資料表 ===
-cursor.execute('''
-CREATE TABLE IF NOT EXISTS charge_points (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    charge_point_id TEXT UNIQUE NOT NULL,
-    name TEXT,
-    status TEXT DEFAULT 'enabled',  -- enabled/disabled
-    created_at TEXT DEFAULT (datetime('now'))
-)
-''')
 conn.commit()
 
 
@@ -417,19 +406,6 @@ class ChargePoint(OcppChargePoint):
             transaction_id=transaction_id,
             id_tag_info={"status": "Accepted"}
         )
-
-
-        # ✅ 新增：餘額檢查
-        cursor.execute("SELECT balance FROM cards WHERE card_id = ?", (id_tag,))
-        card = cursor.fetchone()
-        if not card:
-            logging.warning(f"⛔ 無此卡片帳戶資料，StartTransaction 拒絕")
-            return StartTransaction(transaction_id=0, id_tag_info={"status": "Invalid"})
-
-        balance = card[0]
-        if balance < 10:
-            logging.warning(f"💳 餘額不足：{balance} 元，StartTransaction 拒絕")
-            return StartTransaction(transaction_id=0, id_tag_info={"status": "Blocked"})
 
         # 🟢 原本的交易建立邏輯繼續執行
         transaction_id = int(datetime.utcnow().timestamp() * 1000)
@@ -918,13 +894,6 @@ async def get_transaction_detail(transaction_id: int):
     return JSONResponse(content=result)
 
 
-
-
-
-from fastapi.responses import StreamingResponse
-import io
-import csv
-
 @app.get("/api/transactions/export")
 async def export_transactions_csv(
     idTag: str = Query(None),
@@ -1106,11 +1075,14 @@ async def update_id_tag(
 
 @app.delete("/api/id_tags/{id_tag}")
 async def delete_id_tag(id_tag: str = Path(...)):
+    cursor.execute("SELECT 1 FROM id_tags WHERE id_tag = ?", (id_tag,))
+    if not cursor.fetchone():
+        raise HTTPException(status_code=404, detail="id_tag not found")
+    
     cursor.execute("DELETE FROM id_tags WHERE id_tag = ?", (id_tag,))
+    cursor.execute("DELETE FROM cards WHERE card_id = ?", (id_tag,))
     conn.commit()
     return {"message": "Deleted successfully"}
-
-
 
 
 @app.get("/api/summary")
@@ -1475,10 +1447,6 @@ async def get_daily_by_chargepoint():
     return list(result_map.values())
 
 
-from fastapi.responses import StreamingResponse
-import io
-import csv
-
 @app.get("/api/users/export")
 async def export_users_csv():
     cursor.execute("SELECT id_tag, name, department, card_number FROM users")
@@ -1496,10 +1464,6 @@ async def export_users_csv():
     })
 
 
-from fastapi.responses import StreamingResponse
-import io
-import csv
-
 @app.get("/api/reservations/export")
 async def export_reservations_csv():
     cursor.execute("SELECT id, charge_point_id, id_tag, start_time, end_time, status FROM reservations")
@@ -1515,11 +1479,6 @@ async def export_reservations_csv():
     return StreamingResponse(output, media_type="text/csv", headers={
         "Content-Disposition": "attachment; filename=reservations.csv"
     })
-
-
-from fastapi.responses import StreamingResponse
-import io
-from reportlab.pdfgen import canvas
 
 @app.get("/api/report/monthly")
 async def generate_monthly_pdf(month: str):
@@ -1616,13 +1575,6 @@ async def get_cards():
     cursor.execute("SELECT card_id, balance FROM cards")
     rows = cursor.fetchall()
     return [{"id": row[0], "card_id": row[0], "balance": row[1]} for row in rows]
-
-@app.delete("/api/id_tags/{id_tag}")
-async def delete_id_tag(id_tag: str = Path(...)):
-    cursor.execute("DELETE FROM id_tags WHERE id_tag = ?", (id_tag,))
-    cursor.execute("DELETE FROM cards WHERE card_id = ?", (id_tag,))
-    conn.commit()
-    return {"message": "Deleted successfully"}
 
 @app.get("/api/charge-points")
 async def list_charge_points():
