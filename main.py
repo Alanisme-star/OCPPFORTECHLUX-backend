@@ -441,82 +441,31 @@ class ChargePoint(OcppChargePoint):
         )
 
 
+
     @on(Action.MeterValues)
     async def on_meter_values(self, connector_id, meter_value, **kwargs):
-        for entry in meter_value:
-            timestamp = entry.get("timestamp")
-            for sampled_value in entry.get("sampled_value", []):
-                try:
-                    value = float(sampled_value.get("value"))
-                except (TypeError, ValueError):
-                    continue  # 略過異常數值
+        with sqlite3.connect("ocpp_data.db") as conn:
+            cursor = conn.cursor()
 
-                measurand = sampled_value.get("measurand", "Energy.Active.Import.Register")
-                unit = sampled_value.get("unit", "Wh")
+            for entry in meter_value:
+                timestamp = entry.get("timestamp")
+                for sampled_value in entry.get("sampled_value", []):
+                    try:
+                        value = float(sampled_value.get("value"))
+                    except (TypeError, ValueError):
+                        continue
 
-                # 儲存進 DB
-                cursor.execute('''
-                    INSERT INTO meter_values (charge_point_id, connector_id, timestamp, measurand, value, unit)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                ''', (self.id, connector_id, timestamp, measurand, value, unit))
+                    measurand = sampled_value.get("measurand", "Energy.Active.Import.Register")
+                    unit = sampled_value.get("unit", "Wh")
 
-                if measurand == "Energy.Active.Import.Register":
-                    energy_kwh = value / 1000 if unit.lower() == "wh" else value
-                    charging_point_status[self.id] = charging_point_status.get(self.id, {})
-                    charging_point_status[self.id]["total_kwh"] = round(energy_kwh, 3)
-
-                    # 查找該樁進行中交易
                     cursor.execute('''
-                        SELECT transaction_id, id_tag, meter_start
-                        FROM transactions
-                        WHERE charge_point_id = ? AND meter_stop IS NULL
-                        ORDER BY start_timestamp DESC LIMIT 1
-                    ''', (self.id,))
-                    row = cursor.fetchone()
-                    if not row:
-                        continue
+                        INSERT INTO meter_values (charge_point_id, connector_id, timestamp, measurand, value, unit)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                    ''', (self.id, connector_id, timestamp, measurand, value, unit))
 
-                    transaction_id, id_tag, meter_start = row
-                    kwh_delta = max(0, (energy_kwh * 1000 - meter_start) / 1000)
-
-                    # 電價設定
-                    price_per_kwh = 10  # 可日後改為查 daily_pricing
-                    cost_so_far = round(kwh_delta * price_per_kwh, 2)
-
-                    # 查詢卡片餘額
-                    cursor.execute("SELECT balance FROM cards WHERE card_id = ?", (id_tag,))
-                    card = cursor.fetchone()
-                    if not card:
-                        continue
-                    balance = card[0]
-                    new_balance = round(balance - cost_so_far, 2)
-
-                    if new_balance <= 0:
-                        logging.warning(f"⚠️ 餘額為 0，自動停止充電 | 卡片={id_tag} | 已消耗={cost_so_far} 元")
-                        await self.send_call(
-                            call.StopTransactionPayload(
-                                transaction_id=transaction_id,
-                                meter_stop=int(energy_kwh * 1000),
-                                timestamp=datetime.utcnow().isoformat(),
-                                id_tag=id_tag,
-                                reason="LocalOutOfCredit"
-                            )
-                        )
-
-                    # 寫入目前累積度數
-                    cursor.execute(
-                        "UPDATE transactions SET kwh = ? WHERE transaction_id = ?",
-                        (kwh_delta, transaction_id)
-                    )
-
-                elif measurand == "Power.Active.Import":
-                    charging_point_status[self.id] = charging_point_status.get(self.id, {})
-                    charging_point_status[self.id]["power_w"] = round(value, 2)
-
-        conn.commit()
-        logging.info(f"📈 MeterValues | CP={self.id} | 筆數={len(meter_value)}")
-        return call_result.MeterValuesPayload()
-
+                    # ✅ 即時功率資料更新
+                    if measurand == "Power.Active.Import":
+                        charging_point_status[self.id] = {"power_w": value}
 
 
     @app.get("/api/charge-points/{charge_point_id}/realtime-status")
@@ -997,32 +946,26 @@ async def get_status_logs(
     ])
 
 
-# ✅ 新增：即時電量查詢 API
 @app.get("/api/charge-points/{charge_point_id}/latest-meter")
-async def get_latest_meter_value(charge_point_id: str):
-    query = '''
-        SELECT connector_id, timestamp, measurand, value, unit
-        FROM meter_values
-        WHERE charge_point_id = ?
-        ORDER BY datetime(timestamp) DESC
-        LIMIT 1
-    '''
+def get_latest_meter_value(charge_point_id: str):
     with sqlite3.connect("ocpp_data.db") as conn:
         cursor = conn.cursor()
-        cursor.execute(query, (charge_point_id,))
+        cursor.execute("""
+            SELECT timestamp, value, unit
+            FROM meter_values
+            WHERE charge_point_id = ? AND measurand = 'Energy.Active.Import.Register'
+            ORDER BY timestamp DESC
+            LIMIT 1
+        """, (charge_point_id,))
         row = cursor.fetchone()
 
-    if row:
+        if not row:
+            return {}
         return {
-            "chargePointId": charge_point_id,
-            "connectorId": row[0],
-            "timestamp": row[1],
-            "measurand": row[2],
-            "value": float(row[3]),
-            "unit": row[4]
+            "timestamp": row[0],
+            "value": row[1],
+            "unit": row[2],
         }
-    else:
-        raise HTTPException(status_code=404, detail="No meter values found.")
 
 
 
