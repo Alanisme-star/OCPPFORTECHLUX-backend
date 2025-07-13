@@ -541,6 +541,7 @@ class ChargePoint(OcppChargePoint):
         row = cursor.fetchone()
         return {"power_w": row[0] if row else 0}
 
+
     @app.get("/api/charge-points/{charge_point_id}/current-transaction")
     def get_current_transaction(charge_point_id: str):
         with sqlite3.connect("ocpp_data.db") as conn:
@@ -579,6 +580,8 @@ class ChargePoint(OcppChargePoint):
                 "start_time": start_time,
                 "active": True
             }
+
+
 
     @on(Action.StopTransaction)
     async def on_stop_transaction(self, transaction_id, meter_stop, timestamp, id_tag, reason, **kwargs):
@@ -1019,8 +1022,10 @@ async def get_latest_meter_value(charge_point_id: str):
         ORDER BY datetime(timestamp) DESC
         LIMIT 1
     '''
-    cursor.execute(query, (charge_point_id,))
-    row = cursor.fetchone()
+    with sqlite3.connect("ocpp_data.db") as conn:
+        cursor = conn.cursor()
+        cursor.execute(query, (charge_point_id,))
+        row = cursor.fetchone()
 
     if row:
         return {
@@ -1033,6 +1038,8 @@ async def get_latest_meter_value(charge_point_id: str):
         }
     else:
         raise HTTPException(status_code=404, detail="No meter values found.")
+
+
 
 
 @app.get("/api/id_tags")
