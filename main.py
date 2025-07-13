@@ -1772,18 +1772,17 @@ async def dashboard_trend(group_by: str = Query("day")):
         else:
             raise HTTPException(status_code=400, detail="group_by must be 'day' or 'week'")
 
-    with sqlite3.connect("ocpp.db") as conn:
-        cursor = conn.cursor()
-
-        cursor.execute(f"""
-            SELECT {date_expr} as period,
-                   SUM(meter_stop - meter_start) / 1000.0 as total_kwh
-            FROM transactions
-            WHERE meter_stop IS NOT NULL
-            GROUP BY period
-            ORDER BY period ASC
-        """)
-        rows = cursor.fetchall()
+        with sqlite3.connect("ocpp.db") as conn:
+            cursor = conn.cursor()
+            cursor.execute(f"""
+                SELECT {date_expr} as period,
+                       SUM(meter_stop - meter_start) / 1000.0 as total_kwh
+                FROM transactions
+                WHERE meter_stop IS NOT NULL
+                GROUP BY period
+                ORDER BY period ASC
+            """)
+            rows = cursor.fetchall()
 
         return [
             {
@@ -1791,10 +1790,12 @@ async def dashboard_trend(group_by: str = Query("day")):
                 "kWh": round(row[1] or 0, 2)
             } for row in rows
         ]
+        
     except Exception as e:
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"伺服器錯誤：{str(e)}")
+
 
 
 
