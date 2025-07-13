@@ -520,33 +520,40 @@ class ChargePoint(OcppChargePoint):
 
 
     @app.get("/api/charge-points/{charge_point_id}/realtime-status")
-    async def get_realtime_status(charge_point_id: str):
-        status = charging_point_status.get(charge_point_id)
-        if not status:
-            return {"message": "No data available for this charge point"}
+    def get_realtime_status(charge_point_id: str):
+        # 檢查是否仍在充電中
+        cursor.execute("""
+            SELECT COUNT(*) FROM transactions
+            WHERE charge_point_id = ? AND stop_time IS NULL
+        """, (charge_point_id,))
+        active = cursor.fetchone()[0] > 0
 
-        return {
-            "charge_point_id": charge_point_id,
-            "power_w": status.get("power_w"),
-            "total_kwh": status.get("total_kwh")
-        }
+        if not active:
+            return {"power_w": 0}
+
+        cursor.execute("""
+            SELECT power_w FROM charging_status
+            WHERE charge_point_id = ?
+            ORDER BY timestamp DESC LIMIT 1
+        """, (charge_point_id,))
+        row = cursor.fetchone()
+        return {"power_w": row[0] if row else 0}
 
 
 
     @app.get("/api/charge-points/{charge_point_id}/current-transaction")
-    async def get_current_transaction_kwh(charge_point_id: str):
-        cursor.execute('''
-            SELECT t.meter_start, mv.value
-            FROM transactions t
-            JOIN meter_values mv ON mv.charge_point_id = t.charge_point_id
-            WHERE t.charge_point_id = ?
-              AND t.meter_stop IS NULL
-              AND mv.measurand = "Energy.Active.Import.Register"
-            ORDER BY mv.timestamp DESC LIMIT 1
-        ''', (charge_point_id,))
+    def get_current_transaction(charge_point_id: str):
+        cursor.execute("""
+            SELECT kwh, start_time FROM transactions
+            WHERE charge_point_id = ? AND stop_time IS NULL
+            ORDER BY start_time DESC LIMIT 1
+        """, (charge_point_id,))
         row = cursor.fetchone()
-        if not row:
-            return {"kwh": 0.0}
+        if row:
+            return {"kwh": row[0], "start_time": row[1], "active": True}
+        else:
+            return {"kwh": 0, "start_time": None, "active": False}
+
 
         meter_start, current = row
         kwh = max((current - meter_start) / 1000, 0)
