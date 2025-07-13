@@ -1134,6 +1134,14 @@ async def get_summary(group_by: str = Query("day")):
 
 
 
+from fastapi.responses import JSONResponse
+from fastapi import Query
+from datetime import datetime
+import sqlite3
+import logging
+import threading
+import time
+
 @app.get("/api/summary/top")
 async def get_top_consumers(
     group_by: str = Query("idTag"),
@@ -1146,53 +1154,60 @@ async def get_top_consumers(
     else:
         return JSONResponse(status_code=400, content={"error": "Invalid group_by. Use 'idTag' or 'chargePointId'."})
 
-    cursor.execute(f"""
-        SELECT {group_field} as key,
-               COUNT(*) as transaction_count,
-               SUM(meter_stop - meter_start) as total_energy
-        FROM transactions
-        WHERE meter_stop IS NOT NULL
-        GROUP BY {group_field}
-        ORDER BY total_energy DESC
-        LIMIT ?
-    """, (limit,))
-    rows = cursor.fetchall()
+    try:
+        with sqlite3.connect("ocpp_data.db") as conn:
+            cursor = conn.cursor()
+            cursor.execute(f"""
+                SELECT {group_field} as key,
+                       COUNT(*) as transaction_count,
+                       SUM((meter_stop - meter_start) / 1000.0) as total_energy
+                FROM transactions
+                WHERE meter_stop IS NOT NULL
+                GROUP BY {group_field}
+                ORDER BY total_energy DESC
+                LIMIT ?
+            """, (limit,))
+            rows = cursor.fetchall()
 
-    result = []
-    for row in rows:
-        result.append({
-            "group": row[0],
-            "transactionCount": row[1],
-            "totalEnergy": row[2] or 0
-        })
+        result = []
+        for row in rows:
+            result.append({
+                "group": row[0],
+                "transactionCount": row[1],
+                "totalEnergy": round(row[2] or 0, 2)
+            })
+        return JSONResponse(content=result)
 
-    return JSONResponse(content=result)  
-
-import threading
+    except Exception as e:
+        logging.error(f"🚨 get_top_consumers error: {e}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
 # 每週定時通知任務
 def weekly_notify_task():
-    import time
     while True:
         now = datetime.now()
-        # 只在每週一上午 9:00 傳送
         if now.weekday() == 0 and now.hour == 9 and now.minute == 0:
             try:
-                cursor.execute("""
-                    SELECT id_tag, SUM(meter_stop - meter_start) as total_energy
-                    FROM transactions
-                    WHERE meter_stop IS NOT NULL
-                    AND start_timestamp >= datetime('now', '-7 days')
-                    GROUP BY id_tag
-                    ORDER BY total_energy DESC
-                    LIMIT 5
-                """)
-                rows = cursor.fetchall()
+                with sqlite3.connect("ocpp_data.db") as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("""
+                        SELECT id_tag,
+                               SUM((meter_stop - meter_start) / 1000.0) as total_energy
+                        FROM transactions
+                        WHERE meter_stop IS NOT NULL
+                        AND start_timestamp >= datetime('now', '-7 days')
+                        GROUP BY id_tag
+                        ORDER BY total_energy DESC
+                        LIMIT 5
+                    """)
+                    rows = cursor.fetchall()
+
                 if rows:
                     message = "📊 一週用電排行（依 idTag）:\n"
                     for idx, (id_tag, energy) in enumerate(rows, start=1):
-                        message += f"{idx}. {id_tag}：{round(energy/1000, 2)} kWh\n"
+                        message += f"{idx}. {id_tag}：{round(energy or 0, 2)} kWh\n"
                     logging.info(f"📊 用電排行通知（模擬）：\n{message}")
+
             except Exception as e:
                 logging.error(f"📉 用電排行通知錯誤：{e}")
         time.sleep(60)  # 每分鐘檢查一次是否符合發送條件
