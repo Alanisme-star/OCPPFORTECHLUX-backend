@@ -838,28 +838,29 @@ async def calculate_transaction_cost(transaction_id: int):
 async def transaction_cost_summary():
     with sqlite3.connect("ocpp.db") as conn:
         cursor = conn.cursor()
-    query = """
-        SELECT t.transaction_id, (t.meter_stop - t.meter_start)/1000.0 as kWh,
-               p.base_fee, p.energy_fee, p.overuse_fee, p.total_amount
-        FROM transactions t
-        JOIN payments p ON t.transaction_id = p.transaction_id
-        WHERE t.meter_stop IS NOT NULL
-    """
-    cursor.execute(query)
-    rows = cursor.fetchall()
+        query = """
+            SELECT t.transaction_id, (t.meter_stop - t.meter_start)/1000.0 as kWh,
+                   p.base_fee, p.energy_fee, p.overuse_fee, p.total_amount
+            FROM transactions t
+            JOIN payments p ON t.transaction_id = p.transaction_id
+            WHERE t.meter_stop IS NOT NULL
+        """
+        cursor.execute(query)
+        rows = cursor.fetchall()
 
-    result = []
-    for row in rows:
-        result.append({
-            "transactionId": row[0],
-            "totalKWh": round(row[1], 3),
-            "basicFee": row[2],
-            "energyCost": row[3],
-            "overuseFee": row[4],
-            "totalCost": row[5]
-        })
+        result = []
+        for row in rows:
+            result.append({
+                "transactionId": row[0],
+                "totalKWh": round(row[1], 3),
+                "basicFee": row[2],
+                "energyCost": row[3],
+                "overuseFee": row[4],
+                "totalCost": row[5]
+            })
 
     return result
+
 
 
 
