@@ -1208,8 +1208,7 @@ async def get_top_consumers(
 def weekly_notify_task():
     while True:
         now = datetime.now()
-        if now.weekday() ==
- 0 and now.hour == 9 and now.minute == 0:
+        if now.weekday() == 0 and now.hour == 9 and now.minute == 0:
             try:
                 with sqlite3.connect("ocpp_data.db") as conn:
                     cursor = conn.cursor()
