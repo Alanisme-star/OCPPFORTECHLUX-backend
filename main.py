@@ -948,6 +948,8 @@ async def get_status_logs(
 
 from datetime import datetime
 
+from datetime import datetime
+
 @app.get("/api/charge-points/{charge_point_id}/latest-meter")
 def get_latest_meter_value(charge_point_id: str):
     with sqlite3.connect("ocpp_data.db") as conn:
@@ -964,19 +966,17 @@ def get_latest_meter_value(charge_point_id: str):
         if not row:
             return {}
 
-        raw_timestamp = row[0]
+        timestamp_raw = row[0]
         try:
-            # 嘗試直接轉為 datetime
-            parsed_time = datetime.fromisoformat(raw_timestamp)
-        except ValueError:
-            try:
-                # 如果是舊式格式（如 "2025-07-13 19:20:00"）則進行轉換
-                parsed_time = datetime.strptime(raw_timestamp, "%Y-%m-%d %H:%M:%S")
-            except ValueError:
-                return {}
+            # 假設資料為 "YYYY-MM-DD HH:MM:SS"，轉換為 ISO 格式 "YYYY-MM-DDTHH:MM:SS"
+            parsed_time = datetime.strptime(timestamp_raw, "%Y-%m-%d %H:%M:%S")
+            timestamp_iso = parsed_time.isoformat()
+        except Exception:
+            # 若格式本身已正確或轉換失敗，保留原值
+            timestamp_iso = timestamp_raw
 
         return {
-            "timestamp": parsed_time.isoformat(),  # ✅ 確保回傳為瀏覽器可解析格式
+            "timestamp": timestamp_iso,
             "value": row[1],
             "unit": row[2],
         }
