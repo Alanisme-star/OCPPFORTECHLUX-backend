@@ -561,7 +561,7 @@ class ChargePoint(OcppChargePoint):
 
             transaction_id, meter_start, start_time = row
 
-            # 抓最新一筆的 meter_value，作為現在讀數
+            # 抓最新一筆的 meter_value 作為現在讀數
             cursor.execute("""
                 SELECT value FROM meter_values
                 WHERE charge_point_id = ? AND measurand = 'Energy.Active.Import.Register'
@@ -580,6 +580,7 @@ class ChargePoint(OcppChargePoint):
                 "start_time": start_time,
                 "active": True
             }
+
 
 
 
