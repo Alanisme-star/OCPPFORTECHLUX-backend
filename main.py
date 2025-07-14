@@ -341,6 +341,9 @@ class ChargePoint(OcppChargePoint):
         logging.info(f"🆔 Authorize | idTag: {id_tag} | 查詢結果: {status}")
         return call_result.AuthorizePayload(id_tag_info={"status": status})
 
+
+    logger = logging.getLogger("ocpp_logger")
+
     @on(Action.StartTransaction)
     async def on_start_transaction(self, connector_id, id_tag, meter_start, timestamp, **kwargs):
         cursor.execute("SELECT status, valid_until FROM id_tags WHERE id_tag = ?", (id_tag,))
@@ -390,6 +393,7 @@ class ChargePoint(OcppChargePoint):
             logging.warning(f"⛔ StartTransaction 拒絕 | idTag={id_tag} | status={status}")
             return call_result.StartTransactionPayload(transaction_id=0, id_tag_info={"status": status})
 
+        # 建立交易記錄
         transaction_id = int(datetime.utcnow().timestamp() * 1000)
         cursor.execute('''
             INSERT INTO transactions (
@@ -406,45 +410,6 @@ class ChargePoint(OcppChargePoint):
             transaction_id=transaction_id,
             id_tag_info={"status": "Accepted"}
         )
-
-        # 🟢 原本的交易建立邏輯繼續執行
-        transaction_id = int(datetime.utcnow().timestamp() * 1000)
-        ...
-
-        if status != "Accepted":
-            logging.warning(f"⛔ StartTransaction 拒絕 | idTag={id_tag} | status={status}")
-            return StartTransaction(transaction_id=0, id_tag_info={"status": status})
-
-        # ✅ 新增：確認卡片餘額是否足夠（預設最低 10 元才能啟動）
-        cursor.execute("SELECT balance FROM cards WHERE card_id = ?", (id_tag,))
-        balance_row = cursor.fetchone()
-        if not balance_row or balance_row[0] < 10:
-            logging.warning(f"⛔ StartTransaction 拒絕 | idTag={id_tag} | 餘額不足 {balance_row[0] if balance_row else '無資料'} 元")
-            return StartTransaction(transaction_id=0, id_tag_info={"status": "Blocked"})
-
-
-        transaction_id = int(datetime.utcnow().timestamp() * 1000)
-        cursor.execute('''
-            INSERT INTO transactions (
-                transaction_id, charge_point_id, connector_id, id_tag,
-                meter_start, start_timestamp, meter_stop, stop_timestamp, reason
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (
-            transaction_id, self.id, connector_id, id_tag,
-            meter_start, timestamp, None, None, None
-        ))
-        conn.commit()
-        logging.info(f"🚗 StartTransaction 成功 | CP={self.id} | idTag={id_tag} | transactionId={transaction_id}")
-        return StartTransactionPayload(
-            transaction_id=transaction_id,
-            id_tag_info={"status": "Accepted"}
-        )
-
-
-
-
-    logger = logging.getLogger("ocpp_logger")
-
 
     @on(Action.MeterValues)
     async def on_meter_values(self, connector_id, meter_value, **kwargs):
@@ -477,6 +442,8 @@ class ChargePoint(OcppChargePoint):
                         INSERT INTO meter_values (charge_point_id, connector_id, timestamp, measurand, value, unit)
                         VALUES (?, ?, ?, ?, ?, ?)
                     ''', (self.id, connector_id, timestamp, measurand, value, unit))
+                    return call_result.MeterValuesPayload()
+
 
 
     @app.get("/api/charge-points/{charge_point_id}/current-transaction")
