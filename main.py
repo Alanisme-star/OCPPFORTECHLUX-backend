@@ -463,34 +463,6 @@ class ChargePoint(OcppChargePoint):
                         VALUES (?, ?, ?, ?, ?, ?)
                     ''', (self.id, connector_id, timestamp, measurand, value, unit))
 
-                    # ✅ 即時功率資料更新
-                    if measurand == "Power.Active.Import":
-                        charging_point_status[self.id] = {"power_w": value}
-
-
-    @app.get("/api/charge-points/{charge_point_id}/realtime-status")
-    def get_realtime_status(charge_point_id: str):
-        # 檢查是否仍在充電中
-        with sqlite3.connect("ocpp_data.db") as conn:
-            cursor = conn.cursor()
-        cursor.execute("""
-            SELECT COUNT(*) FROM transactions
-            WHERE charge_point_id = ? AND stop_timestamp IS NULL
-        """, (charge_point_id,))
-        active = cursor.fetchone()[0] > 0
-
-        if not active:
-            return {"power_w": 0}
-
-        cursor.execute("""
-            SELECT power_w FROM charging_status
-            WHERE charge_point_id = ?
-            ORDER BY timestamp DESC LIMIT 1
-        """, (charge_point_id,))
-        row = cursor.fetchone()
-        return {"power_w": row[0] if row else 0}
-
-
     @app.get("/api/charge-points/{charge_point_id}/current-transaction")
     def get_current_transaction(charge_point_id: str):
         with sqlite3.connect("ocpp_data.db") as conn:
@@ -1670,23 +1642,9 @@ async def topup_card(card_id: str = Path(...), data: dict = Body(...)):
         conn.commit()
         return {"status": "success", "card_id": card_id, "new_balance": round(new_balance, 2)}
 
-
-
-@app.get("/api/cards/{card_id}")
-async def get_card_balance(card_id: str):
-    cursor.execute("SELECT balance FROM cards WHERE card_id = ?", (card_id,))
-    row = cursor.fetchone()
-    if not row:
-        raise HTTPException(status_code=404, detail="卡片不存在")
-    return {"cardId": card_id, "balance": round(row[0], 2)}
-
-
-
 @app.get("/api/version-check")
 def version_check():
     return {"version": "✅ 偵錯用 main.py v1.0 已啟動成功"}
-
-
 
 ...
 
