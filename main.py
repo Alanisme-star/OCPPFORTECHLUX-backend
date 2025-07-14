@@ -460,28 +460,33 @@ class ChargePoint(OcppChargePoint):
             return {"active": active}
 
 
+
     @app.get("/api/charge-points/{charge_point_id}/latest-power")
     def get_latest_power(charge_point_id: str):
-        with sqlite3.connect("ocpp_data.db") as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT timestamp, value, unit
-                FROM meter_values
-                WHERE charge_point_id = ? AND measurand = 'Power.Active.Import'
-            ORDER BY timestamp DESC
-                LIMIT 1
-            """, (charge_point_id,))
-            row = cursor.fetchone()
+        try:
+            with sqlite3.connect("ocpp_data.db") as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT timestamp, value, unit
+                    FROM meter_values
+                    WHERE charge_point_id = ? AND measurand = 'Power.Active.Import'
+                    ORDER BY timestamp DESC
+                    LIMIT 1
+                """, (charge_point_id,))
+                row = cursor.fetchone()
 
-            if not row:
-                return {}
+                if not row or row[1] is None:
+                    return {}
 
-            return {
-                "timestamp": row[0],
-                "value": round(row[1], 2),
-                "unit": row[2]
-            }
-
+                return {
+                    "timestamp": row[0],
+                    "value": round(float(row[1]), 2),
+                    "unit": row[2]
+                }
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            return {"error": f"發生例外：{str(e)}"}
 
 
 
