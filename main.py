@@ -496,25 +496,13 @@ class ChargePoint(OcppChargePoint):
         with sqlite3.connect("ocpp_data.db") as conn:
             cursor = conn.cursor()
 
-            # 取得尚未結束的交易紀錄
             cursor.execute("""
-                SELECT transaction_id, start_timestamp
-                FROM transactions
+                SELECT COUNT(*) FROM transactions
                 WHERE charge_point_id = ? AND stop_timestamp IS NULL
-                ORDER BY start_timestamp DESC LIMIT 1
             """, (charge_point_id,))
-            row = cursor.fetchone()
+            active = cursor.fetchone()[0] > 0
 
-            if not row:
-                return {"start_time": None, "active": False}
-
-            transaction_id, start_time = row
-            return {
-                "start_time": start_time,
-                "active": True
-            }
-
-
+            return {"active": active}
 
 
     @on(Action.StopTransaction)
