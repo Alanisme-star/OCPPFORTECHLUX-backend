@@ -477,6 +477,32 @@ class ChargePoint(OcppChargePoint):
             return {"active": active}
 
 
+    @app.get("/api/charge-points/{charge_point_id}/latest-power")
+    def get_latest_power(charge_point_id: str):
+        with sqlite3.connect("ocpp_data.db") as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT timestamp, value, unit
+                FROM meter_values
+                WHERE charge_point_id = ? AND measurand = 'Power.Active.Import'
+            ORDER BY timestamp DESC
+                LIMIT 1
+            """, (charge_point_id,))
+            row = cursor.fetchone()
+
+            if not row:
+                return {}
+
+            return {
+                "timestamp": row[0],
+                "value": round(row[1], 2),
+                "unit": row[2]
+            }
+
+
+
+
+
     @on(Action.StopTransaction)
     async def on_stop_transaction(self, transaction_id, meter_stop, timestamp, id_tag, reason, **kwargs):
         try:
