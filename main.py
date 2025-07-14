@@ -1104,7 +1104,6 @@ async def get_summary(group_by: str = Query("day")):
 
 
 from fastapi.responses import JSONResponse
-from fastapi import Query
 from datetime import datetime
 import sqlite3
 import logging
@@ -1937,8 +1936,18 @@ async def delete_weekly_pricing(id: int = Path(...)):
     conn.commit()
     return {"message": "刪除成功"}
 
+
 @app.post("/api/internal/meter_values")
 async def add_meter_values(data: dict = Body(...)):
+    required_fields = ["transaction_id", "charge_point_id", "connector_id", "timestamp", "value"]
+    missing_fields = [field for field in required_fields if field not in data]
+
+    if missing_fields:
+        raise HTTPException(
+            status_code=422,
+            detail=f"❌ 缺少欄位: {', '.join(missing_fields)}"
+        )
+
     try:
         cursor.execute('''
             INSERT INTO meter_values (
@@ -1956,9 +1965,10 @@ async def add_meter_values(data: dict = Body(...)):
             data.get("format", "Raw")
         ))
         conn.commit()
-        return {"message": "Meter value added successfully"}
+        return {"message": "✅ Meter value added successfully"}
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail=f"❗資料庫寫入失敗: {str(e)}")
+
 
 
 @app.post("/api/internal/mock-daily-pricing")
