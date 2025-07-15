@@ -412,56 +412,34 @@ class ChargePoint(OcppChargePoint):
 
     @on(Action.MeterValues)
     async def on_meter_values(self, connector_id, meter_value, **kwargs):
-        transaction_id = kwargs.get("transactionId")
+        with sqlite3.connect("ocpp_data.db") as conn:
+            cursor = conn.cursor()
 
-        # 👉 強化記錄：Log 進入資料
-        logging.info(f"📥 MeterValues 進入 | CP={self.id} | connector={connector_id} | transaction_id={transaction_id} | meter_value={json.dumps(meter_value)}")
+            for entry in meter_value:
+                timestamp = entry.get("timestamp")
+                for sampled_value in entry.get("sampled_value", []):
+                    try:
+                        value = float(sampled_value.get("value"))
+                    except (TypeError, ValueError):
+                        continue  # 略過格式錯誤的數值
 
-        if not transaction_id:
-            logging.warning(f"⚠️ MeterValues 忽略：未提供 transaction_id，無法紀錄電錶數值")
-            return call_result.MeterValuesPayload()
+                    # ➕ 插入檢查 measurand 是否存在
+                    if "measurand" not in sampled_value:
+                        logger.warning(f"[警告] 樣本中缺少 measurand: {sampled_value}")
 
-        try:
-            with sqlite3.connect("ocpp_data.db") as conn:
-                cursor = conn.cursor()
+                    # 安全取得 measurand，若未提供則使用預設值
+                    measurand = sampled_value.get("measurand", "Energy.Active.Import.Register")
 
-                for entry in meter_value:
-                    timestamp = entry.get("timestamp")
-                    for sampled_value in entry.get("sampledValue", []):
-                        try:
-                            value = float(sampled_value.get("value"))
-                        except (TypeError, ValueError):
-                            logging.warning(f"⚠️ 無效數值：{sampled_value.get('value')}")
-                            continue
+                    # 同樣處理 unit，若未提供則預設為 Wh
+                    unit = sampled_value.get("unit", "Wh")
 
-                        measurand = sampled_value.get("measurand", "Energy.Active.Import.Register")
-                        unit = sampled_value.get("unit", "Wh")
-                        context = sampled_value.get("context", "Sample.Periodic")
-                        fmt = sampled_value.get("format", "Raw")
+                    # 寫入資料庫
+                    cursor.execute('''
+                        INSERT INTO meter_values (charge_point_id, connector_id, timestamp, measurand, value, unit)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                    ''', (self.id, connector_id, timestamp, measurand, value, unit))
 
-                        cursor.execute('''
-                            INSERT INTO meter_values (
-                                transaction_id, charge_point_id, connector_id,
-                                timestamp, value, measurand, unit, context, format
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        ''', (
-                            transaction_id,
-                            self.id,
-                            connector_id,
-                            timestamp,
-                            value,
-                            measurand,
-                            unit,
-                            context,
-                            fmt
-                        ))
-
-                conn.commit()
-                logging.info(f"✅ MeterValues 寫入完成 | CP={self.id} | transaction_id={transaction_id}")
-
-        except Exception as e:
-            logging.error(f"❌ MeterValues 寫入發生錯誤：{e}", exc_info=True)
-
+            conn.commit()
         return call_result.MeterValuesPayload()
 
 
