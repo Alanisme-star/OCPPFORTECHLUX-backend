@@ -251,9 +251,6 @@ CREATE TABLE IF NOT EXISTS weekly_pricing (
 conn.commit()
 
 
-# ⚠️ 請注意：這會清空原本 meter_values 資料
-cursor.execute('DROP TABLE IF EXISTS meter_values')
-
 cursor.execute('''
 CREATE TABLE meter_values (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
