@@ -491,6 +491,51 @@ class ChargePoint(OcppChargePoint):
 
 
 
+    @app.get("/api/charge-points/{charge_point_id}/current-kwh")
+    def get_current_kwh(charge_point_id: str):
+        with sqlite3.connect("ocpp_data.db") as conn:
+            cursor = conn.cursor()
+
+            # 查找該充電樁尚未結束的交易
+            cursor.execute("""
+                SELECT transaction_id, meter_start
+                FROM transactions
+                WHERE charge_point_id = ? AND stop_timestamp IS NULL
+                ORDER BY start_timestamp DESC LIMIT 1
+            """, (charge_point_id,))
+            row = cursor.fetchone()
+
+            if not row:
+                return {"kwh": 0, "active": False}
+
+            transaction_id, meter_start = row
+
+            # 查找最新的電錶數值（Wh）
+            cursor.execute("""
+                SELECT value
+                FROM meter_values
+                WHERE charge_point_id = ?
+                  AND transaction_id = ?
+                  AND measurand = 'Energy.Active.Import.Register'
+                ORDER BY timestamp DESC LIMIT 1
+            """, (charge_point_id, transaction_id))
+            mv_row = cursor.fetchone()
+
+            if not mv_row:
+                return {"kwh": 0, "active": True}
+
+            latest_value = mv_row[0]
+            delta = max((latest_value - meter_start) / 1000.0, 0)  # 單位轉換為 kWh
+
+            return {
+                "kwh": round(delta, 3),
+                "start_meter": meter_start,
+                "latest_meter": latest_value,
+                "active": True
+            }
+
+
+
     @on(Action.StopTransaction)
     async def on_stop_transaction(self, transaction_id, meter_stop, timestamp, id_tag, reason, **kwargs):
         try:
