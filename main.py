@@ -420,7 +420,7 @@ class ChargePoint(OcppChargePoint):
                 cursor.execute("""
                     SELECT transaction_id
                     FROM transactions
-                    WHERE charge_point_id = ? AND stop_timestamp IS NULL
+                    WHERE charge_point_id = ? #AND stop_timestamp IS NULL
                     ORDER BY start_timestamp DESC
                     LIMIT 1
                 """, (self.id,))
@@ -434,37 +434,30 @@ class ChargePoint(OcppChargePoint):
 
             for entry in meter_value:
                 timestamp = entry.get("timestamp")
-                logger.info(f"🕒 接收到 meterValue，timestamp={timestamp}")
-
-                for sampled_value in entry.get("sampledValue", []):
+                for sampled_value in entry.get("sampled_value", []):
                     try:
                         value = float(sampled_value.get("value"))
                     except (TypeError, ValueError):
-                        logger.warning(f"⚠️ 數值解析錯誤：{sampled_value.get('value')}")
-                        continue
+                        continue  # 略過格式錯誤的數值
 
+                    # ➕ 插入檢查 measurand 是否存在
+                    if "measurand" not in sampled_value:
+                        logger.warning(f"[警告] 樣本中缺少 measurand: {sampled_value}")
+
+                    # 安全取得 measurand，若未提供則使用預設值
                     measurand = sampled_value.get("measurand", "Energy.Active.Import.Register")
+
+                    # 同樣處理 unit，若未提供則預設為 Wh
                     unit = sampled_value.get("unit", "Wh")
 
-                    if "measurand" not in sampled_value:
-                        logger.warning(f"⚠️ 缺少 measurand：{sampled_value}")
-
-                    try:
-                        cursor.execute('''
-                            INSERT INTO meter_values (charge_point_id, connector_id, timestamp, measurand, value, unit, transaction_id)
-                            VALUES (?, ?, ?, ?, ?, ?, ?)
-                        ''', (self.id, connector_id, timestamp, measurand, value, unit, current_transaction_id))
-
-                        logger.info(f"✅ 已寫入：{measurand} = {value}{unit}, transaction_id={current_transaction_id}")
-
-                    except Exception as e:
-                        logger.error(f"❌ 寫入資料庫失敗：{e}")
+                    # 寫入資料庫
+                    cursor.execute('''
+                        INSERT INTO meter_values (charge_point_id, connector_id, timestamp, measurand, value, unit)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                    ''', (self.id, connector_id, timestamp, measurand, value, unit))
 
             conn.commit()
-            logger.info("🧾 所有 meterValues 寫入完畢")
-    
         return call_result.MeterValuesPayload()
-
 
 
 
