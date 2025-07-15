@@ -411,8 +411,12 @@ class ChargePoint(OcppChargePoint):
             id_tag_info={"status": "Accepted"}
         )
 
+
+
     @on(Action.MeterValues)
     async def on_meter_values(self, connector_id, meter_value, **kwargs):
+        transaction_id = kwargs.get("transactionId")  # ✅ 取得傳入的 transactionId（可為 None）
+
         with sqlite3.connect("ocpp_data.db") as conn:
             cursor = conn.cursor()
 
@@ -428,20 +432,30 @@ class ChargePoint(OcppChargePoint):
                     if "measurand" not in sampled_value:
                         logger.warning(f"[警告] 樣本中缺少 measurand: {sampled_value}")
 
-                    # 安全取得 measurand，若未提供則使用預設值
                     measurand = sampled_value.get("measurand", "Energy.Active.Import.Register")
-
-                    # 同樣處理 unit，若未提供則預設為 Wh
                     unit = sampled_value.get("unit", "Wh")
 
-                    # 寫入資料庫
+                    # ✅ 寫入資料庫，包含 transaction_id 欄位
                     cursor.execute('''
-                        INSERT INTO meter_values (charge_point_id, connector_id, timestamp, measurand, value, unit)
-                        VALUES (?, ?, ?, ?, ?, ?)
-                    ''', (self.id, connector_id, timestamp, measurand, value, unit))
+                        INSERT INTO meter_values (
+                            transaction_id, charge_point_id, connector_id,
+                            timestamp, measurand, value, unit
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ''', (
+                        transaction_id,
+                        self.id,
+                        connector_id,
+                        timestamp,
+                        measurand,
+                        value,
+                        unit
+                    ))
 
             conn.commit()
+
         return call_result.MeterValuesPayload()
+
 
 
 
