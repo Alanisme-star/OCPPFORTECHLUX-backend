@@ -415,46 +415,46 @@ class ChargePoint(OcppChargePoint):
 
     @on(Action.MeterValues)
     async def on_meter_values(self, connector_id, meter_value, **kwargs):
-        transaction_id = kwargs.get("transactionId")  # ✅ 取得傳入的 transactionId（可為 None）
+        transaction_id = kwargs.get("transactionId")
 
         with sqlite3.connect("ocpp_data.db") as conn:
             cursor = conn.cursor()
 
             for entry in meter_value:
                 timestamp = entry.get("timestamp")
-                for sampled_value in entry.get("sampledValue", []):  # 這裡改正
+                for sampled_value in entry.get("sampledValue", []):
                     try:
                         value = float(sampled_value.get("value"))
                     except (TypeError, ValueError):
-                        continue  # 略過格式錯誤的數值
-
-                    # ➕ 插入檢查 measurand 是否存在
-                    if "measurand" not in sampled_value:
-                        logger.warning(f"[警告] 樣本中缺少 measurand: {sampled_value}")
+                        continue
 
                     measurand = sampled_value.get("measurand", "Energy.Active.Import.Register")
                     unit = sampled_value.get("unit", "Wh")
+                    context = sampled_value.get("context", "Sample.Periodic")
+                    fmt = sampled_value.get("format", "Raw")
 
-                    # ✅ 寫入資料庫，包含 transaction_id 欄位
                     cursor.execute('''
                         INSERT INTO meter_values (
                             transaction_id, charge_point_id, connector_id,
-                            timestamp, measurand, value, unit
+                            timestamp, value, measurand, unit, context, format
                         )
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ''', (
                         transaction_id,
                         self.id,
                         connector_id,
                         timestamp,
-                        measurand,
                         value,
-                        unit
+                        measurand,
+                        unit,
+                        context,
+                        fmt
                     ))
 
             conn.commit()
 
         return call_result.MeterValuesPayload()
+
 
 
 
