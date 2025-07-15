@@ -438,7 +438,7 @@ class ChargePoint(OcppChargePoint):
             timestamp = entry.get("timestamp")
             logger.info(f"🕒 接收到 meterValue，timestamp={timestamp}")
 
-            for sampled_value in entry.get("sampled_value", []):
+            for sampled_value in entry.get("sampledValue", []):
                 try:
                     value = float(sampled_value.get("value"))
                 except (TypeError, ValueError):
