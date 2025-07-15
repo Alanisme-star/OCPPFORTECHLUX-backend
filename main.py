@@ -434,34 +434,34 @@ class ChargePoint(OcppChargePoint):
 
 
 
-            for entry in meter_value:
-                timestamp = entry.get("timestamp")
-                logger.info(f"🕒 接收到 meterValue，timestamp={timestamp}")
-                for sampled_value in entry.get("sampled_value", []):
-                    try:
-                        value = float(sampled_value.get("value"))
-                    except (TypeError, ValueError):
-                        continue  # 略過格式錯誤的數值
+        for entry in meter_value:
+            timestamp = entry.get("timestamp")
+            logger.info(f"🕒 接收到 meterValue，timestamp={timestamp}")
 
-                    # ➕ 插入檢查 measurand 是否存在
-                    if "measurand" not in sampled_value:
-                        logger.warning(f"[警告] 樣本中缺少 measurand: {sampled_value}")
+            for sampled_value in entry.get("sampled_value", []):
+                try:
+                    value = float(sampled_value.get("value"))
+                except (TypeError, ValueError):
+                    continue  # 略過格式錯誤的數值
 
-                    # 安全取得 measurand，若未提供則使用預設值
-                    measurand = sampled_value.get("measurand", "Energy.Active.Import.Register")
+                # ➕ 插入檢查 measurand 是否存在
+                if "measurand" not in sampled_value:
+                    logger.warning(f"[警告] 樣本中缺少 measurand: {sampled_value}")
 
-                    # 同樣處理 unit，若未提供則預設為 Wh
-                    unit = sampled_value.get("unit", "Wh")
-                    context = sampled_value.get("context", "Sample.Periodic")
-                    format_ = sampled_value.get("format", "Raw")
+                # 安全取得 measurand，若未提供則使用預設值
+                measurand = sampled_value.get("measurand", "Energy.Active.Import.Register")
 
-                    # 寫入資料庫
-                    cursor.execute('''
-                        INSERT INTO meter_values (transaction_id, context, format, charge_point_id, connector_id, timestamp, measurand, value, unit)
-                        VALUES (?, ?, ?, ?, ?, ?)
-                    ''', (transaction_id, context, format, self.id, connector_id, timestamp, measurand, value, unit))
+                # 同樣處理 unit，若未提供則預設為 Wh
+                unit = sampled_value.get("unit", "Wh")
+                context = sampled_value.get("context", "Sample.Periodic")
+                format_ = sampled_value.get("format", "Raw")
 
-                ))
+                # 寫入資料庫
+                cursor.execute('''
+                    INSERT INTO meter_values (transaction_id, context, format, charge_point_id, connector_id, timestamp, measurand, value, unit)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (current_transaction_id, context, format, self.id, connector_id, timestamp, measurand, value, unit))
+
             conn.commit()
         return call_result.MeterValuesPayload()
 
