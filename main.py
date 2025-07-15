@@ -422,7 +422,7 @@ class ChargePoint(OcppChargePoint):
 
             for entry in meter_value:
                 timestamp = entry.get("timestamp")
-                for sampled_value in entry.get("sampled_value", []):
+                for sampled_value in entry.get("sampledValue", []):  # 這裡改正
                     try:
                         value = float(sampled_value.get("value"))
                     except (TypeError, ValueError):
@@ -503,19 +503,18 @@ class ChargePoint(OcppChargePoint):
             return {"error": f"發生例外：{str(e)}"}
 
 
-
-
     @app.get("/api/charge-points/{charge_point_id}/current-kwh")
     def get_current_kwh(charge_point_id: str):
         with sqlite3.connect("ocpp_data.db") as conn:
             cursor = conn.cursor()
 
-            # 查找該充電樁尚未結束的交易
+            # ✅ 改為：不管是否結束，都抓最新一筆交易
             cursor.execute("""
                 SELECT transaction_id, meter_start
                 FROM transactions
-                WHERE charge_point_id = ? AND stop_timestamp IS NULL
-                ORDER BY start_timestamp DESC LIMIT 1
+                WHERE charge_point_id = ?
+                ORDER BY start_timestamp DESC
+                LIMIT 1
             """, (charge_point_id,))
             row = cursor.fetchone()
 
@@ -524,7 +523,7 @@ class ChargePoint(OcppChargePoint):
 
             transaction_id, meter_start = row
 
-            # 查找最新的電錶數值（Wh）
+            # ✅ 查最新的度數（Wh）
             cursor.execute("""
                 SELECT value
                 FROM meter_values
@@ -539,7 +538,7 @@ class ChargePoint(OcppChargePoint):
                 return {"kwh": 0, "active": True}
 
             latest_value = mv_row[0]
-            delta = max((latest_value - meter_start) / 1000.0, 0)  # 單位轉換為 kWh
+            delta = max((latest_value - meter_start) / 1000.0, 0)  # Wh ➜ kWh
 
             return {
                 "kwh": round(delta, 3),
@@ -547,7 +546,6 @@ class ChargePoint(OcppChargePoint):
                 "latest_meter": latest_value,
                 "active": True
             }
-
 
 
     @on(Action.StopTransaction)
