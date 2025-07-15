@@ -411,7 +411,7 @@ class ChargePoint(OcppChargePoint):
 
 
     @on(Action.MeterValues)
-    async def on_meter_values(self, connector_id, meter_value, **kwargs):
+    async def on_meter_values(self, connector_id: int, meter_value: list, **kwargs):
         with sqlite3.connect("ocpp_data.db") as conn:
             cursor = conn.cursor()
 
