@@ -252,7 +252,7 @@ conn.commit()
 
 
 cursor.execute('''
-CREATE TABLE meter_values (
+CREATE TABLE IF NOT EXISTS meter_values (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     transaction_id INTEGER,
     charge_point_id TEXT,
