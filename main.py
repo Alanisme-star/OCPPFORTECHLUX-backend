@@ -415,8 +415,28 @@ class ChargePoint(OcppChargePoint):
         with sqlite3.connect("ocpp_data.db") as conn:
             cursor = conn.cursor()
 
+
+        # ✅ 查詢目前進行中的交易
+        try:
+            cursor.execute("""
+                SELECT transaction_id
+                FROM transactions
+                WHERE charge_point_id = ? AND stop_timestamp IS NULL
+                ORDER BY start_timestamp DESC
+                LIMIT 1
+            """, (self.id,))
+            row = cursor.fetchone()
+            current_transaction_id = row[0] if row else None
+            logger.info(f"🔎 當前交易 ID：{current_transaction_id}")
+        except Exception as e:
+            logger.error(f"❌ 查詢交易 ID 失敗：{e}")
+            current_transaction_id = None
+
+
+
             for entry in meter_value:
                 timestamp = entry.get("timestamp")
+                logger.info(f"🕒 接收到 meterValue，timestamp={timestamp}")
                 for sampled_value in entry.get("sampled_value", []):
                     try:
                         value = float(sampled_value.get("value"))
@@ -432,13 +452,16 @@ class ChargePoint(OcppChargePoint):
 
                     # 同樣處理 unit，若未提供則預設為 Wh
                     unit = sampled_value.get("unit", "Wh")
+                    context = sampled_value.get("context", "Sample.Periodic")
+                    format_ = sampled_value.get("format", "Raw")
 
                     # 寫入資料庫
                     cursor.execute('''
-                        INSERT INTO meter_values (charge_point_id, connector_id, timestamp, measurand, value, unit)
+                        INSERT INTO meter_values (transaction_id, context, format, charge_point_id, connector_id, timestamp, measurand, value, unit)
                         VALUES (?, ?, ?, ?, ?, ?)
-                    ''', (self.id, connector_id, timestamp, measurand, value, unit))
+                    ''', (transaction_id, context, format, self.id, connector_id, timestamp, measurand, value, unit))
 
+                ))
             conn.commit()
         return call_result.MeterValuesPayload()
 
