@@ -471,6 +471,80 @@ class ChargePoint(OcppChargePoint):
 
 
 
+    @app.get("/api/charge-points/{charge_point_id}/current-cost")
+    def get_current_cost(charge_point_id: str):
+        with sqlite3.connect("ocpp_data.db") as conn:
+            cursor = conn.cursor()
+
+            # 找出目前進行中的交易
+            cursor.execute("""
+                SELECT transaction_id, meter_start, start_timestamp
+                FROM transactions
+                WHERE charge_point_id = ? AND stop_timestamp IS NULL
+                ORDER BY start_timestamp DESC LIMIT 1
+            """, (charge_point_id,))
+            row = cursor.fetchone()
+
+            if not row:
+                return {"cost": 0, "active": False}
+
+            transaction_id, meter_start, start_time_str = row
+  
+            # 查詢最新度數（Wh）
+            cursor.execute("""
+                SELECT value, timestamp
+                FROM meter_values
+                WHERE charge_point_id = ? AND transaction_id = ? AND measurand = 'Energy.Active.Import.Register'
+                ORDER BY timestamp DESC LIMIT 1
+            """, (charge_point_id, transaction_id))
+            mv_row = cursor.fetchone()
+
+            if not mv_row:
+                return {"cost": 0, "active": True}
+
+            meter_now = mv_row[0]
+            timestamp = mv_row[1]
+            kwh = max((meter_now - meter_start) / 1000.0, 0)
+
+            # 計算時間點電價
+            def is_summer(dt):
+                summer_start = datetime(dt.year, 6, 1, tzinfo=dt.tzinfo)
+                summer_end = datetime(dt.year, 9, 30, tzinfo=dt.tzinfo)
+                return summer_start <= dt <= summer_end
+
+            def is_holiday(dt):
+                return dt.weekday() >= 5
+
+            def get_price(dt):
+                season = "summer" if is_summer(dt) else "non_summer"
+                day_type = "holiday" if is_holiday(dt) else "weekday"
+                t = dt.time().strftime("%H:%M")
+
+                cursor.execute('''
+                    SELECT price FROM pricing_rules
+                    WHERE season = ? AND day_type = ? AND (
+                        (start_time <= end_time AND start_time <= ? AND end_time > ?) OR
+                        (start_time > end_time AND (? >= start_time OR ? < end_time))
+                    )
+                    ORDER BY start_time DESC LIMIT 1
+                ''', (season, day_type, t, t, t, t))
+                row = cursor.fetchone()
+                return row[0] if row else 0
+
+            try:
+                dt = parse_date(timestamp)
+            except Exception:
+                dt = datetime.utcnow()
+
+            price_per_kwh = get_price(dt)
+            cost = round(kwh * price_per_kwh, 2)
+            return {
+                "kwh": round(kwh, 3),
+                "pricePerKWh": price_per_kwh,
+                "cost": cost,
+                "active": True
+            }
+
 
 
     @app.get("/api/charge-points/{charge_point_id}/current-transaction")
