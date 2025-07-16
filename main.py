@@ -424,29 +424,45 @@ class ChargePoint(OcppChargePoint):
         with sqlite3.connect("ocpp_data.db") as conn:
             cursor = conn.cursor()
 
+            # 🔍 查詢當前進行中的交易（尚未 StopTransaction）
+            cursor.execute("""
+                SELECT transaction_id
+                FROM transactions
+                WHERE charge_point_id = ? AND stop_timestamp IS NULL
+                ORDER BY start_timestamp DESC
+                LIMIT 1
+            """, (self.id,))
+            row = cursor.fetchone()
+            current_transaction_id = row[0] if row else None
+
+            if current_transaction_id is None:
+                logger.warning(f"⚠️ 無法找到 {self.id} 的進行中交易，將不紀錄 transaction_id")
+
             for entry in meter_value:
                 timestamp = entry.get("timestamp")
+                logger.info(f"🕒 接收到 meterValue，timestamp={timestamp}")
+   
                 for sampled_value in entry.get("sampled_value", []):
                     try:
                         value = float(sampled_value.get("value"))
                     except (TypeError, ValueError):
-                        continue  # 略過格式錯誤的數值
+                        logger.warning(f"❌ 無效的 value：{sampled_value.get('value')}")
+                        continue
 
-                    # ➕ 插入檢查 measurand 是否存在
-                    if "measurand" not in sampled_value:
-                        logger.warning(f"[警告] 樣本中缺少 measurand: {sampled_value}")
-
-                    # 安全取得 measurand，若未提供則使用預設值
+                    # ➕ 安全取得其他欄位
                     measurand = sampled_value.get("measurand", "Energy.Active.Import.Register")
-
-                    # 同樣處理 unit，若未提供則預設為 Wh
                     unit = sampled_value.get("unit", "Wh")
 
-                    # 寫入資料庫
+                    # ✅ 寫入 DB，包含 transaction_id（若有）
                     cursor.execute('''
-                        INSERT INTO meter_values (charge_point_id, connector_id, timestamp, measurand, value, unit)
-                        VALUES (?, ?, ?, ?, ?, ?)
-                    ''', (self.id, connector_id, timestamp, measurand, value, unit))
+                        INSERT INTO meter_values (
+                            transaction_id, charge_point_id, connector_id,
+                            timestamp, measurand, value, unit
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ''', (
+                        current_transaction_id, self.id, connector_id,
+                        timestamp, measurand, value, unit
+                    ))
 
             conn.commit()
         return call_result.MeterValuesPayload()
