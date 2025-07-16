@@ -491,12 +491,13 @@ class ChargePoint(OcppChargePoint):
             return {"error": f"發生例外：{str(e)}"}
 
 
+
     @app.get("/api/charge-points/{charge_point_id}/current-kwh")
     def get_current_kwh(charge_point_id: str):
         with sqlite3.connect("ocpp_data.db") as conn:
             cursor = conn.cursor()
 
-            # ✅ 改為：不管是否結束，都抓最新一筆交易
+            # ✅ 抓最新一筆交易（不論是否結束）
             cursor.execute("""
                 SELECT transaction_id, meter_start
                 FROM transactions
@@ -511,29 +512,29 @@ class ChargePoint(OcppChargePoint):
 
             transaction_id, meter_start = row
 
-            # ✅ 查最新的度數（Wh）
+            # ✅ 查詢本次交易的最大值與最小值（僅限 Energy.Active.Import.Register）
             cursor.execute("""
-                SELECT value
+                SELECT MIN(value), MAX(value)
                 FROM meter_values
                 WHERE charge_point_id = ?
                   AND transaction_id = ?
                   AND measurand = 'Energy.Active.Import.Register'
-                ORDER BY timestamp DESC LIMIT 1
             """, (charge_point_id, transaction_id))
             mv_row = cursor.fetchone()
 
-            if not mv_row:
+            if not mv_row or mv_row[0] is None or mv_row[1] is None:
                 return {"kwh": 0, "active": True}
 
-            latest_value = mv_row[0]
-            delta = max((latest_value - meter_start) / 1000.0, 0)  # Wh ➜ kWh
+            min_value, max_value = mv_row
+            delta = max((max_value - min_value) / 1000.0, 0)  # Wh ➜ kWh
 
             return {
                 "kwh": round(delta, 3),
-                "start_meter": meter_start,
-                "latest_meter": latest_value,
+                "start_meter": min_value,
+                "latest_meter": max_value,
                 "active": True
             }
+
 
 
     @on(Action.StopTransaction)
