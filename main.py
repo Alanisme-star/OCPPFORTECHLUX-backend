@@ -551,7 +551,6 @@ class ChargePoint(OcppChargePoint):
     def get_current_transaction(charge_point_id: str):
         with sqlite3.connect("ocpp_data.db") as conn:
             cursor = conn.cursor()
-
             cursor.execute("""
                 SELECT transaction_id, start_timestamp
                 FROM transactions
@@ -560,6 +559,8 @@ class ChargePoint(OcppChargePoint):
             """, (charge_point_id,))
             row = cursor.fetchone()
 
+            print(f"🔍 查詢結果 row: {row}")  # ⬅️ 加這一行
+    
             if not row:
                 return {"active": False}
 
