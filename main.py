@@ -553,12 +553,20 @@ class ChargePoint(OcppChargePoint):
             cursor = conn.cursor()
 
             cursor.execute("""
-                SELECT COUNT(*) FROM transactions
+                SELECT transaction_id, start_timestamp
+                FROM transactions
                 WHERE charge_point_id = ? AND stop_timestamp IS NULL
+                ORDER BY start_timestamp DESC LIMIT 1
             """, (charge_point_id,))
-            active = cursor.fetchone()[0] > 0
+            row = cursor.fetchone()
 
-            return {"active": active}
+            if not row:
+                return {"active": False}
+
+            return {
+                "active": True,
+                "start_time": row[1]
+            }
 
 
 
