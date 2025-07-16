@@ -554,7 +554,7 @@ class ChargePoint(OcppChargePoint):
         with sqlite3.connect("ocpp_data.db") as conn:
             cursor = conn.cursor()
 
-            # 查找最新一筆交易（不論是否結束）
+            # ✅ 查找最新一筆交易，不論是否 stop
             cursor.execute("""
                 SELECT transaction_id, start_timestamp, stop_timestamp
                 FROM transactions
@@ -576,6 +576,7 @@ class ChargePoint(OcppChargePoint):
                 "stop_time": stop_time,
                 "active": active
             }
+
 
 
 
