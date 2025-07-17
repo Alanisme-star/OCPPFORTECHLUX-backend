@@ -474,6 +474,7 @@ class ChargePoint(OcppChargePoint):
         with sqlite3.connect("ocpp_data.db") as conn:
             cursor = conn.cursor()
 
+            # ✅ 查找最新一筆交易（不論是否結束）
             cursor.execute("""
                 SELECT transaction_id, meter_start, meter_stop, start_timestamp, stop_timestamp
                 FROM transactions
@@ -486,37 +487,41 @@ class ChargePoint(OcppChargePoint):
                 return {"cost": 0, "active": False}
 
             transaction_id, meter_start, meter_stop, start_time_str, stop_time_str = row
+            active = stop_time_str is None
 
-            if stop_time_str is not None:
-                # ⛔ 若已結束 → 回傳歸零資料
-                return {
-                    "kwh": 0,
-                    "pricePerKWh": 0,
-                    "cost": 0,
-                    "active": False
-                }
-
-            # ✅ 還在充電中 → 計算即時電費
-            cursor.execute("""
-                SELECT value, timestamp
-                FROM meter_values
-                WHERE charge_point_id = ? AND transaction_id = ? AND measurand = 'Energy.Active.Import.Register'
-                ORDER BY timestamp DESC LIMIT 1
-            """, (charge_point_id, transaction_id))
-            mv_row = cursor.fetchone()
-            if not mv_row:
-                return {"cost": 0, "active": True}
-            meter_now, timestamp = mv_row
+            # ✅ 若交易已結束，直接使用 stop 值
+            if meter_stop is not None:
+                meter_now = meter_stop
+                timestamp = stop_time_str
+            else:
+                # ✅ 若仍在進行中，查詢最新度數（Wh）
+                cursor.execute("""
+                    SELECT value, timestamp
+                    FROM meter_values
+                    WHERE charge_point_id = ? AND transaction_id = ? AND measurand = 'Energy.Active.Import.Register'
+                    ORDER BY timestamp DESC LIMIT 1
+                """, (charge_point_id, transaction_id))
+                mv_row = cursor.fetchone()
+                if not mv_row:
+                    return {"cost": 0, "active": True}
+                meter_now, timestamp = mv_row
 
             kwh = max((meter_now - meter_start) / 1000.0, 0)
 
-            # 取得電價
-            def is_summer(dt): return datetime(dt.year, 6, 1) <= dt <= datetime(dt.year, 9, 30)
-            def is_holiday(dt): return dt.weekday() >= 5
+            # ✅ 計算時間點電價
+            def is_summer(dt):
+                summer_start = datetime(dt.year, 6, 1, tzinfo=dt.tzinfo)
+                summer_end = datetime(dt.year, 9, 30, tzinfo=dt.tzinfo)
+                return summer_start <= dt <= summer_end
+
+            def is_holiday(dt):
+                return dt.weekday() >= 5
+
             def get_price(dt):
                 season = "summer" if is_summer(dt) else "non_summer"
                 day_type = "holiday" if is_holiday(dt) else "weekday"
                 t = dt.time().strftime("%H:%M")
+
                 cursor.execute('''
                     SELECT price FROM pricing_rules
                     WHERE season = ? AND day_type = ? AND (
@@ -528,7 +533,6 @@ class ChargePoint(OcppChargePoint):
                 row = cursor.fetchone()
                 return row[0] if row else 0
 
-            from dateutil.parser import parse as parse_date
             try:
                 dt = parse_date(timestamp)
             except Exception:
@@ -541,8 +545,9 @@ class ChargePoint(OcppChargePoint):
                 "kwh": round(kwh, 3),
                 "pricePerKWh": price_per_kwh,
                 "cost": cost,
-                "active": True
+                "active": active
             }
+
 
 
     
@@ -575,38 +580,35 @@ class ChargePoint(OcppChargePoint):
             }
 
 
+
+
+
     @app.get("/api/charge-points/{charge_point_id}/latest-power")
     def get_latest_power(charge_point_id: str):
-        with sqlite3.connect("ocpp_data.db") as conn:
-            cursor = conn.cursor()
+        try:
+            with sqlite3.connect("ocpp_data.db") as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT timestamp, value, unit
+                    FROM meter_values
+                    WHERE charge_point_id = ? AND measurand = 'Power.Active.Import'
+                    ORDER BY timestamp DESC
+                    LIMIT 1
+                """, (charge_point_id,))
+                row = cursor.fetchone()
 
-            # 🔍 查詢最新交易是否已結束
-            cursor.execute("""
-                SELECT stop_timestamp FROM transactions
-                WHERE charge_point_id = ?
-                ORDER BY start_timestamp DESC LIMIT 1
-            """, (charge_point_id,))
-            txn = cursor.fetchone()
-            if txn and txn[0] is not None:
-                return {}  # ⚠️ 已結束 → 不顯示功率
+                if not row or row[1] is None:
+                    return {}
 
-            cursor.execute("""
-                SELECT timestamp, value, unit
-                FROM meter_values
-                WHERE charge_point_id = ? AND measurand = 'Power.Active.Import'
-                ORDER BY timestamp DESC
-                LIMIT 1
-            """, (charge_point_id,))
-            row = cursor.fetchone()
-
-            if not row or row[1] is None:
-                 return {}
-
-            return {
-                "timestamp": row[0],
-                "value": round(float(row[1]), 2),
-                "unit": row[2]
-            }
+                return {
+                    "timestamp": row[0],
+                    "value": round(float(row[1]), 2),
+                    "unit": row[2]
+                }
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            return {"error": f"發生例外：{str(e)}"}
 
 
 
@@ -614,41 +616,42 @@ class ChargePoint(OcppChargePoint):
 
 
 
-
-    @app.get("/api/charge-points/{charge_point_id}/current-kwh")
+        @app.get("/api/charge-points/{charge_point_id}/current-kwh")
     def get_current_kwh(charge_point_id: str):
         with sqlite3.connect("ocpp_data.db") as conn:
             cursor = conn.cursor()
 
+            # ✅ 改為：不管是否結束，都抓最新一筆交易
             cursor.execute("""
-                SELECT transaction_id, meter_start, stop_timestamp
+                SELECT transaction_id, meter_start
                 FROM transactions
                 WHERE charge_point_id = ?
-                ORDER BY start_timestamp DESC LIMIT 1
+                ORDER BY start_timestamp DESC
+                LIMIT 1
             """, (charge_point_id,))
             row = cursor.fetchone()
 
             if not row:
-                return {"kwh": 0, "start_meter": 0, "latest_meter": 0, "active": False}
+                return {"kwh": 0, "active": False}
 
-            transaction_id, meter_start, stop_time = row
+            transaction_id, meter_start = row
 
-            if stop_time is not None:
-                return {"kwh": 0, "start_meter": 0, "latest_meter": 0, "active": False}
-
+            # ✅ 查最新的度數（Wh）
             cursor.execute("""
                 SELECT value
                 FROM meter_values
-                WHERE charge_point_id = ? AND transaction_id = ? AND measurand = 'Energy.Active.Import.Register'
+                WHERE charge_point_id = ?
+                  AND transaction_id = ?
+                  AND measurand = 'Energy.Active.Import.Register'
                 ORDER BY timestamp DESC LIMIT 1
             """, (charge_point_id, transaction_id))
             mv_row = cursor.fetchone()
 
             if not mv_row:
-                return {"kwh": 0, "start_meter": meter_start, "latest_meter": 0, "active": True}
+                return {"kwh": 0, "active": True}
 
             latest_value = mv_row[0]
-            delta = max((latest_value - meter_start) / 1000.0, 0)
+            delta = max((latest_value - meter_start) / 1000.0, 0)  # Wh ➜ kWh
 
             return {
                 "kwh": round(delta, 3),
@@ -656,7 +659,6 @@ class ChargePoint(OcppChargePoint):
                 "latest_meter": latest_value,
                 "active": True
             }
-
 
 
 
