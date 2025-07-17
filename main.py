@@ -457,7 +457,8 @@ class ChargePoint(OcppChargePoint):
             conn.commit()
 
 
-
+        # ✅ 加上這行才能避免 WebSocket 關閉
+        return call_result.MeterValuesPayload()
 
 
 
