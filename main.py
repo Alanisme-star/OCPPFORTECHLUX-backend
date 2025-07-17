@@ -613,6 +613,31 @@ class ChargePoint(OcppChargePoint):
 
 
 
+    @app.get("/api/charge-points/{charge_point_id}/latest-current")
+    def get_latest_current(charge_point_id: str):
+        with sqlite3.connect("ocpp_data.db") as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT timestamp, value, unit
+                FROM meter_values
+                WHERE charge_point_id = ? AND measurand = 'Current.Import'
+                ORDER BY timestamp DESC
+                LIMIT 1
+            """, (charge_point_id,))
+            row = cursor.fetchone()
+
+            if not row:
+                return {}
+
+            return {
+                "timestamp": row[0],
+                "value": round(row[1], 2),
+                "unit": row[2]
+            }
+
+
+
+
 
 
 
