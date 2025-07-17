@@ -469,6 +469,7 @@ class ChargePoint(OcppChargePoint):
 
 
 
+
     @app.get("/api/charge-points/{charge_point_id}/current-cost")
     def get_current_cost(charge_point_id: str):
         with sqlite3.connect("ocpp_data.db") as conn:
@@ -516,7 +517,7 @@ class ChargePoint(OcppChargePoint):
 
             def is_holiday(dt):
                 return dt.weekday() >= 5
-
+ 
             def get_price(dt):
                 season = "summer" if is_summer(dt) else "non_summer"
                 day_type = "holiday" if is_holiday(dt) else "weekday"
@@ -533,7 +534,10 @@ class ChargePoint(OcppChargePoint):
                 row = cursor.fetchone()
                 return row[0] if row else 0
 
+            # ✅ 防呆：timestamp 為空或格式錯誤 → fallback 為現在時間
             try:
+                if not timestamp:
+                    raise ValueError("Empty timestamp")
                 dt = parse_date(timestamp)
             except Exception:
                 dt = datetime.utcnow()
@@ -547,6 +551,11 @@ class ChargePoint(OcppChargePoint):
                 "cost": cost,
                 "active": active
             }
+
+
+
+
+
 
 
 
