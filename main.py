@@ -625,7 +625,7 @@ class ChargePoint(OcppChargePoint):
 
 
 
-        @app.get("/api/charge-points/{charge_point_id}/current-kwh")
+    @app.get("/api/charge-points/{charge_point_id}/current-kwh")
     def get_current_kwh(charge_point_id: str):
         with sqlite3.connect("ocpp_data.db") as conn:
             cursor = conn.cursor()
