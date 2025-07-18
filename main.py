@@ -464,72 +464,69 @@ class ChargePoint(OcppChargePoint):
                         value = float(sampled_value.get("value"))
                         unit = sampled_value.get("unit", "Wh")
 
+                        # 寫入 meter_values 資料表
                         cursor.execute("""
                             INSERT INTO meter_values (charge_point_id, transaction_id, timestamp, measurand, value, unit)
                             VALUES (?, ?, ?, ?, ?, ?)
                         """, (self.id, transaction_id, timestamp, measurand, value, unit))
                         logger.info(f"✅ 已寫入 meter_values：{measurand}={value}{unit}")
+                        conn.commit()
+
+                        # ✅ 一旦為累積度數資料，立刻檢查餘額
+                        if measurand == "Energy.Active.Import.Register":
+                            # 讀取卡片餘額
+                            cursor.execute("SELECT balance FROM cards WHERE card_id = ?", (id_tag,))
+                            card = cursor.fetchone()
+                            balance = card[0] if card else 0
+
+                            # 計算目前累積度數
+                            cursor.execute("""
+                                SELECT MAX(value) - MIN(value)
+                                FROM meter_values
+                                WHERE transaction_id = ? AND measurand = 'Energy.Active.Import.Register'
+                            """, (transaction_id,))
+                            kwh_row = cursor.fetchone()
+                            kwh_used = float(kwh_row[0]) if kwh_row and kwh_row[0] else 0
+
+                            # 計算金額
+                            now = datetime.utcnow()
+                            price = get_price(now)
+                            cost_so_far = round(kwh_used * price, 2)
+
+                            # 判斷是否餘額不足
+                            available = balance - cost_so_far
+                            logger.info(f"💡 當前度數={kwh_used:.2f} kWh，金額={cost_so_far:.2f} 元，餘額={balance:.2f} 元")
+
+                            if available <= 0:
+                                logger.warning("⛔ 餘額不足，準備停止交易")
+
+                                stop_timestamp = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
+                                meter_stop = int(value)
+
+                                # 更新交易紀錄
+                                cursor.execute("""
+                                    UPDATE transactions
+                                    SET meter_stop = ?, stop_timestamp = ?, reason = ?
+                                    WHERE transaction_id = ?
+                                """, (meter_stop, stop_timestamp, "InsufficientBalance", transaction_id))
+                                conn.commit()
+
+                                # 發送 StopTransaction
+                                request = call.StopTransactionPayload(
+                                    transaction_id=transaction_id,
+                                    id_tag=id_tag,
+                                    meter_stop=meter_stop,
+                                    timestamp=stop_timestamp,
+                                    reason="InsufficientBalance"
+                                )
+                                response = await self.call(request)
+                                logger.info(f"✅ StopTransaction 已送出 | 回應：{response}")
 
                     except Exception as e:
                         logger.warning(f"⚠️ 儲存 meterValue 時出錯：{e}")
 
-            conn.commit()
-
-            # 查原始卡片餘額
-            cursor.execute("SELECT balance FROM cards WHERE card_id = ?", (id_tag,))
-            card = cursor.fetchone()
-            balance = card[0] if card else 0
-
-            # 計算目前這筆交易累積度數
-            cursor.execute("""
-                SELECT MAX(value) - MIN(value) FROM meter_values
-                WHERE transaction_id = ? AND measurand = 'Energy.Active.Import.Register'
-            """, (transaction_id,))
-            kwh_row = cursor.fetchone()
-            kwh_used = float(kwh_row[0]) if kwh_row and kwh_row[0] else 0
-
-            # 根據目前時間計算單價
-            now = datetime.utcnow()
-            price = get_price(now)
-            cost_so_far = round(kwh_used * price, 2)
-
-            # 計算實際可用餘額
-            available = balance - cost_so_far
-
-            if available <= 0:
-                logging.warning(f"💥 餘額不足，停止交易：度數 {kwh_used:.2f} kWh，金額 {cost_so_far:.2f} 元，餘額 {balance:.2f} 元")
-
-                stop_timestamp = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
-  
-                # 查最新度數作為 meter_stop
-                cursor.execute("""
-                    SELECT value FROM meter_values
-                    WHERE transaction_id = ? AND measurand = 'Energy.Active.Import.Register'
-                    ORDER BY timestamp DESC LIMIT 1
-                """, (transaction_id,))
-                mv = cursor.fetchone()
-                meter_stop = int(mv[0]) if mv else 0
-
-                # 更新交易紀錄
-                cursor.execute('''
-                    UPDATE transactions
-                    SET meter_stop = ?, stop_timestamp = ?, reason = ?
-                    WHERE transaction_id = ?
-                ''', (meter_stop, stop_timestamp, "InsufficientBalance", transaction_id))
-                conn.commit()
-
-                # 傳送 StopTransaction 給充電樁（✅ 正確方式）
-                request = call.StopTransactionPayload(
-                    transaction_id=transaction_id,
-                    id_tag=id_tag,
-                    meter_stop=meter_stop,
-                    timestamp=stop_timestamp,
-                    reason="InsufficientBalance"
-                )
-                response = await self.call(request)
-                logging.info(f"✅ StopTransaction 已送出 | 回應：{response}")
-
         return call_result.MeterValuesPayload()
+
 
 
 
