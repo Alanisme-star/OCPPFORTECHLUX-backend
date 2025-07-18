@@ -521,7 +521,7 @@ class ChargePoint(OcppChargePoint):
                 ''', (meter_stop, stop_timestamp, "InsufficientBalance", transaction_id))
                 conn.commit()
 
-                # 傳送 StopTransaction 訊息給充電樁
+                # 傳送 StopTransaction 訊息給充電樁（正確寫法）
                 request = call.StopTransactionPayload(
                     transaction_id=transaction_id,
                     id_tag=id_tag,
@@ -529,7 +529,9 @@ class ChargePoint(OcppChargePoint):
                     timestamp=stop_timestamp,
                     reason="InsufficientBalance"
                 )
-                await self.send(request)
+                response = await self.call(request)
+                logging.info(f"✅ StopTransaction 已送出 | 回應：{response}")
+
 
         return call_result.MeterValuesPayload()
 
