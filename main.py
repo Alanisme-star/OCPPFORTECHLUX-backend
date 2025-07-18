@@ -294,19 +294,18 @@ class ChargePoint(OcppChargePoint):
         if not timestamp:
             timestamp = datetime.utcnow().isoformat()
 
-        try:
-            with sqlite3.connect("ocpp_data.db") as conn:
-                cursor = conn.cursor()
-                cursor.execute('''
-                    INSERT INTO status_logs (charge_point_id, connector_id, status, timestamp)
-                    VALUES (?, ?, ?, ?)
-                ''', (self.id, connector_id, status, timestamp))
-                conn.commit()
-            logging.info(f"📡 StatusNotification | CP={self.id} | connector={connector_id} | errorCode={error_code} | status={status}")
-        except Exception as e:
-            logging.error(f"❌ StatusNotification 寫入資料庫失敗：{e}")
+        with sqlite3.connect("ocpp_data.db") as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO status_logs (charge_point_id, connector_id, status, timestamp)
+                VALUES (?, ?, ?, ?)
+            ''', (self.id, connector_id, status, timestamp))
+            conn.commit()
 
+        logging.info(f"📡 StatusNotification | CP={self.id} | connector={connector_id} | errorCode={error_code} | status={status}")
         return StatusNotificationPayload()
+
+
 
 
 
