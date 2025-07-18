@@ -60,15 +60,13 @@ connected_devices = {}
 def get_active_connections():
     return [{"charge_point_id": cp_id, "connected_at": data["time"], "ip": data["ip"]} for cp_id, data in connected_devices.items()]
 
-
-
-
 logging.basicConfig(level=logging.INFO)
 
 # 允許跨域（若前端使用）
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["https://ocppfortechlux-frontend.onrender.com"]
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -637,6 +635,15 @@ class ChargePoint(OcppChargePoint):
 
 
 
+    @app.get("/api/cards/{id_tag}/balance")
+    def get_card_balance(id_tag: str):
+        with sqlite3.connect("ocpp_data.db") as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT balance FROM cards WHERE card_id = ?", (id_tag,))
+            row = cursor.fetchone()
+            if not row:
+                return {"balance": 0, "found": False}
+            return {"balance": row[0], "found": True}
 
 
 
