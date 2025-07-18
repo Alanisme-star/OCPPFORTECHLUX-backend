@@ -809,20 +809,11 @@ class ChargePoint(OcppChargePoint):
 
     @app.get("/api/charge-points/{charge_point_id}/status")
     def get_charge_point_status(charge_point_id: str):
-        with sqlite3.connect("ocpp_data.db") as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT status
-                FROM charge_point_status
-                WHERE charge_point_id = ?
-                ORDER BY timestamp DESC
-                LIMIT 1
-            """, (charge_point_id,))
-            row = cursor.fetchone()
-            if row:
-                return {"status": row[0]}
-            else:
-                return {"status": "未知"}
+        status = charging_point_status.get(charge_point_id)
+        if status:
+            return status
+        else:
+            return {"status": "未知"}
 
 
 
