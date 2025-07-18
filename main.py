@@ -441,15 +441,18 @@ class ChargePoint(OcppChargePoint):
 
             # 查詢目前進行中的交易
             cursor.execute("""
-                SELECT transaction_id
+                SELECT transaction_id, id_tag
                 FROM transactions
                 WHERE charge_point_id = ? AND stop_timestamp IS NULL
                 ORDER BY start_timestamp DESC
                 LIMIT 1
             """, (self.id,))
             row = cursor.fetchone()
-            current_transaction_id = row[0] if row else None
-            logger.info(f"🔎 當前交易 ID：{current_transaction_id}")
+            if not row:
+                return call_result.MeterValuesPayload()
+
+            transaction_id, id_tag = row  # ✅ 取得 id_tag
+            logger.info(f"🔎 當前交易 ID：{transaction_id} | id_tag={id_tag}")
 
             for entry in meter_value:
                 timestamp = entry.get("timestamp")
@@ -464,7 +467,7 @@ class ChargePoint(OcppChargePoint):
                         cursor.execute("""
                             INSERT INTO meter_values (charge_point_id, transaction_id, timestamp, measurand, value, unit)
                             VALUES (?, ?, ?, ?, ?, ?)
-                        """, (self.id, current_transaction_id, timestamp, measurand, value, unit))
+                        """, (self.id, transaction_id, timestamp, measurand, value, unit))
                         logger.info(f"✅ 已寫入 meter_values：{measurand}={value}{unit}")
 
                     except Exception as e:
@@ -472,9 +475,42 @@ class ChargePoint(OcppChargePoint):
 
             conn.commit()
 
+            # ✅ 立即檢查卡片餘額
+            cursor.execute("SELECT balance FROM cards WHERE card_id = ?", (id_tag,))
+            card = cursor.fetchone()
+            if card and card[0] <= 0:
+                logging.warning(f"💳 餘額為 0，強制停止交易 | id_tag={id_tag}")
 
-        # ✅ 加上這行才能避免 WebSocket 關閉
+                stop_timestamp = datetime.utcnow().isoformat()
+                # 查目前最新度數
+                cursor.execute("""
+                    SELECT value FROM meter_values
+                    WHERE transaction_id = ? AND measurand = 'Energy.Active.Import.Register'
+                    ORDER BY timestamp DESC LIMIT 1
+                """, (transaction_id,))
+                mv = cursor.fetchone()
+                meter_stop = int(mv[0]) if mv else 0
+
+                # 寫入停止紀錄
+                cursor.execute('''
+                    UPDATE transactions
+                    SET meter_stop = ?, stop_timestamp = ?, reason = ?
+                    WHERE transaction_id = ?
+                ''', (meter_stop, stop_timestamp, "InsufficientBalance", transaction_id))
+                conn.commit()
+
+                # 傳送 StopTransaction 訊息給充電樁
+                request = call.StopTransactionPayload(
+                    transaction_id=transaction_id,
+                    id_tag=id_tag,
+                    meter_stop=meter_stop,
+                    timestamp=stop_timestamp,
+                    reason="InsufficientBalance"
+                )
+                await self.send(request)
+
         return call_result.MeterValuesPayload()
+
 
 
 
