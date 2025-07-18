@@ -439,12 +439,13 @@ class ChargePoint(OcppChargePoint):
         with sqlite3.connect("ocpp_data.db") as conn:
             cursor = conn.cursor()
 
-            # 查進行中交易
+            # 查詢目前進行中的交易
             cursor.execute("""
                 SELECT transaction_id, id_tag
                 FROM transactions
                 WHERE charge_point_id = ? AND stop_timestamp IS NULL
-                ORDER BY start_timestamp DESC LIMIT 1
+                ORDER BY start_timestamp DESC
+                LIMIT 1
             """, (self.id,))
             row = cursor.fetchone()
             if not row:
@@ -461,7 +462,7 @@ class ChargePoint(OcppChargePoint):
                         measurand = sampled_value.get("measurand", "Energy.Active.Import.Register")
                         value = float(sampled_value.get("value"))
                         unit = sampled_value.get("unit", "Wh")
-  
+
                         # 儲存資料
                         cursor.execute("""
                             INSERT INTO meter_values (charge_point_id, transaction_id, timestamp, measurand, value, unit)
@@ -486,18 +487,19 @@ class ChargePoint(OcppChargePoint):
                             kwh_row = cursor.fetchone()
                             kwh_used = float(kwh_row[0]) if kwh_row and kwh_row[0] else 0
 
+                            # 計算費用與餘額
                             price = get_price(datetime.utcnow())
                             cost_so_far = round(kwh_used * price, 2)
                             available = balance - cost_so_far
 
-                            logger.info(f"💡 用電 {kwh_used:.2f}kWh, 價格 {price:.2f}, 累計 {cost_so_far:.2f}, 餘額 {balance:.2f}")
+                            logger.info(f"💡 用電 {kwh_used:.2f}kWh, 單價 {price:.2f}, 累計 {cost_so_far:.2f}, 餘額 {balance:.2f}")
 
                             if available <= 0:
                                 logger.warning("⛔ 餘額不足，立即停止充電")
 
                                 stop_timestamp = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
                                 meter_stop = int(value)
- 
+
                                 # 更新交易紀錄
                                 cursor.execute("""
                                     UPDATE transactions
@@ -506,7 +508,7 @@ class ChargePoint(OcppChargePoint):
                                 """, (meter_stop, stop_timestamp, "InsufficientBalance", transaction_id))
                                 conn.commit()
 
-                                # 傳送 StopTransaction
+                                # 發送 StopTransaction
                                 request = call.StopTransactionPayload(
                                     transaction_id=transaction_id,
                                     id_tag=id_tag,
@@ -517,10 +519,14 @@ class ChargePoint(OcppChargePoint):
                                 response = await self.call(request)
                                 logger.info(f"✅ StopTransaction 已送出 | 回應：{response}")
 
+                                # ✅ 關鍵：立刻結束處理，避免持續處理其他資料
+                                return call_result.MeterValuesPayload()
+
                     except Exception as e:
                         logger.warning(f"⚠️ 處理 sampled_value 出錯：{e}")
 
         return call_result.MeterValuesPayload()
+
 
 
 
