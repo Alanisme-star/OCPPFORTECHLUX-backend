@@ -475,11 +475,33 @@ class ChargePoint(OcppChargePoint):
 
             conn.commit()
 
-            # ✅ 立即檢查卡片餘額
+
+            # 查原始卡片餘額
             cursor.execute("SELECT balance FROM cards WHERE card_id = ?", (id_tag,))
             card = cursor.fetchone()
-            if card and card[0] <= 0:
-                logging.warning(f"💳 餘額為 0，強制停止交易 | id_tag={id_tag}")
+            balance = card[0] if card else 0
+
+            # 計算目前這筆交易累積度數
+            cursor.execute("""
+                SELECT MAX(value) - MIN(value) FROM meter_values
+                WHERE transaction_id = ? AND measurand = 'Energy.Active.Import.Register'
+            """, (transaction_id,))
+            kwh_row = cursor.fetchone()
+            kwh_used = float(kwh_row[0]) if kwh_row and kwh_row[0] else 0
+
+            # 根據目前時間計算單價
+            now = datetime.utcnow()
+            price = get_price(now)
+            cost_so_far = kwh_used * price
+
+            # 計算實際可用餘額
+            available = balance - cost_so_far
+
+            if available <= 0:
+                logging.warning(f"💥 餘額不足，停止交易：目前度數 {kwh_used:.2f} kWh，金額 {cost_so_far:.2f} 元，餘額 {balance:.2f} 元")
+                ...
+                # 發 StopTransaction
+
 
                 stop_timestamp = datetime.utcnow().isoformat()
                 # 查目前最新度數
