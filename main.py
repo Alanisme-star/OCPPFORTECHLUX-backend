@@ -405,7 +405,7 @@ class ChargePoint(OcppChargePoint):
                 return call_result.StartTransactionPayload(transaction_id=0, id_tag_info={"status": "Invalid"})
 
             balance = card[0]
-            if balance < 10:
+            if balance < 0:
                 logging.warning(f"💳 餘額不足：{balance} 元，StartTransaction 拒絕")
                 return call_result.StartTransactionPayload(transaction_id=0, id_tag_info={"status": "Blocked"})
 
