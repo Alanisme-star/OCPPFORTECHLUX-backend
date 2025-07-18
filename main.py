@@ -302,8 +302,17 @@ class ChargePoint(OcppChargePoint):
             ''', (self.id, connector_id, status, timestamp))
             conn.commit()
 
+        # ✅ 即時更新充電樁狀態（存在記憶體字典中）
+        charging_point_status[self.id] = {
+            "connector_id": connector_id,
+            "status": status,
+            "timestamp": timestamp,
+            "error_code": error_code
+        }
+
         logging.info(f"📡 StatusNotification | CP={self.id} | connector={connector_id} | errorCode={error_code} | status={status}")
         return StatusNotificationPayload()
+
 
 
 
