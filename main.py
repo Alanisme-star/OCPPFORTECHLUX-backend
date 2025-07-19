@@ -37,6 +37,45 @@ from reportlab.pdfgen import canvas
 app = FastAPI()
 
 
+from typing import Optional
+
+@app.get("/api/status-logs")
+def get_status_logs(charge_point_id: Optional[str] = Query(None)):
+    with sqlite3.connect("ocpp_data.db") as conn:
+        cursor = conn.cursor()
+
+        if charge_point_id:
+            cursor.execute("""
+                SELECT charge_point_id, connector_id, status, error_code, timestamp
+                FROM status_logs
+                WHERE charge_point_id = ?
+                ORDER BY timestamp DESC
+                LIMIT 100
+            """, (charge_point_id,))
+        else:
+            cursor.execute("""
+                SELECT charge_point_id, connector_id, status, error_code, timestamp
+                FROM status_logs
+                ORDER BY timestamp DESC
+                LIMIT 100
+            """)
+        
+        rows = cursor.fetchall()
+
+    # 格式化成 dict 給前端使用
+    return [
+        {
+            "charge_point_id": row[0],
+            "connector_id": row[1],
+            "status": row[2],
+            "error_code": row[3],
+            "timestamp": row[4]
+        }
+        for row in rows
+    ]
+
+
+
 class FastAPIWebSocketAdapter:
     def __init__(self, websocket):
         self.websocket = websocket
@@ -872,6 +911,29 @@ class ChargePoint(OcppChargePoint):
 
 
 
+    @on(Action.StatusNotification)
+    async def on_status_notification(self, connector_id, error_code, status, **kwargs):
+        logger.info(f"📥 StatusNotification - Connector: {connector_id}, Status: {status}, Error: {error_code}")
+
+        try:
+            with sqlite3.connect("ocpp_data.db") as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    INSERT INTO status_logs (charge_point_id, connector_id, status, error_code, timestamp)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (
+                    self.id,
+                    connector_id,
+                    status,
+                    error_code,
+                    datetime.utcnow().isoformat()
+                ))
+                conn.commit()
+        except Exception as e:
+            logger.error(f"❌ 儲存 StatusNotification 時出錯：{e}")
+
+
+
 
 # ✅ 時段電價設定管理：新增與刪除
 @app.post("/api/pricing-rules")
@@ -1344,11 +1406,6 @@ async def get_summary(group_by: str = Query("day")):
     return JSONResponse(content=result)
 
 
-
-from fastapi.responses import JSONResponse
-
-import sqlite3
-import logging
 import threading
 import time
 
