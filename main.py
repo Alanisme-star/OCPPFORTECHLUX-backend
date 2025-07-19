@@ -917,28 +917,10 @@ class ChargePoint(OcppChargePoint):
             return {"status": "未知"}
 
 
-
     @on(Action.StatusNotification)
     async def on_status_notification(self, connector_id, error_code, status, **kwargs):
         logger.info(f"📥 StatusNotification - Connector: {connector_id}, Status: {status}, Error: {error_code}")
-
-        try:
-            with sqlite3.connect("ocpp_data.db") as conn:
-                cursor = conn.cursor()
-                cursor.execute("""
-                    INSERT INTO status_logs (charge_point_id, connector_id, status, error_code, timestamp)
-                    VALUES (?, ?, ?, ?, ?)
-                """, (
-                    self.id,
-                    connector_id,
-                    status,
-                    error_code,
-                    datetime.utcnow().isoformat()
-                ))
-                conn.commit()
-        except Exception as e:
-            logger.error(f"❌ 儲存 StatusNotification 時出錯：{e}")
-
+        charge_point_status[self.id] = status
 
 
 
