@@ -2536,6 +2536,21 @@ async def debug_ids():
     cursor.execute("SELECT charge_point_id FROM charge_points")
     return [row[0] for row in cursor.fetchall()]
 
+@app.get("/api/charge-points/{charge_point_id}/status")
+def get_charge_point_status(charge_point_id: str):
+    with sqlite3.connect("ocpp_data.db") as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT status FROM status_logs
+            WHERE charge_point_id = ?
+            ORDER BY timestamp DESC
+            LIMIT 1
+        """, (charge_point_id,))
+        row = cursor.fetchone()
+        status = row[0] if row else "未知"
+        return {"status": status}
+
+
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=10000, reload=True)
