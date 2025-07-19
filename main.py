@@ -321,38 +321,45 @@ CREATE TABLE IF NOT EXISTS status_logs (
 conn.commit()
 
 
-
-
-
-
 class ChargePoint(OcppChargePoint):
 
 
+    # 加在檔案上方
+    charge_point_status = {}  # 全域變數，記錄目前各充電樁狀態
+
     @on(Action.StatusNotification)
-    async def on_status_notification(self, connector_id, error_code, status, timestamp=None, **kwargs):
-        if not timestamp:
-            timestamp = datetime.utcnow().isoformat()
+    async def on_status_notification(self, connector_id, error_code, status, **kwargs):
+        logger.info(f"📥 StatusNotification - Connector: {connector_id}, Status: {status}, Error: {error_code}")
 
-        with sqlite3.connect("ocpp_data.db") as conn:
-            cursor = conn.cursor()
-            cursor.execute('''
-                INSERT INTO status_logs (charge_point_id, connector_id, status, timestamp)
-                VALUES (?, ?, ?, ?)
-            ''', (self.id, connector_id, status, timestamp))
-            conn.commit()
+        try:
+            with sqlite3.connect("ocpp_data.db") as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    INSERT INTO status_logs (charge_point_id, connector_id, status, error_code, timestamp)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (
+                    self.id,
+                    connector_id,
+                    status,
+                    error_code,
+                    datetime.utcnow().isoformat()
+                ))
+                conn.commit()
 
-        # ✅ 即時更新充電樁狀態（存在記憶體字典中）
-        charging_point_status[self.id] = {
-            "connector_id": connector_id,
-            "status": status,
-            "timestamp": timestamp,
-            "error_code": error_code
-        }
+            # ✅ 新增：即時更新記憶體狀態
+            charge_point_status[self.id] = status
+            logger.info(f"⚡ 即時狀態已更新：{self.id} => {status}")
 
-        logging.info(f"📡 StatusNotification | CP={self.id} | connector={connector_id} | errorCode={error_code} | status={status}")
-        return StatusNotificationPayload()
+        except Exception as e:
+            logger.error(f"❌ 儲存 StatusNotification 時出錯：{e}")
 
 
+
+    @app.get("/api/status/{charge_point_id}")
+    def get_charge_point_status(charge_point_id: str):
+        # 從記憶體中讀取（可設定預設為 Unknown）
+        status = charge_point_status.get(charge_point_id, "未知")
+        return {"charge_point_id": charge_point_id, "status": status}
 
 
 
