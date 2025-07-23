@@ -488,17 +488,26 @@ class ChargePoint(OcppChargePoint):
                     logging.info(f"⏱️ timestamp={timestamp}, sampledValue 數量={len(sampled_values)}")
 
                     for sv in sampled_values:
-                        measurand = sv.get("measurand", "Energy.Active.Import.Register")
                         value = sv.get("value")
+                        measurand = sv.get("measurand", "")
                         unit = sv.get("unit", "")
-  
-                        logging.info(f"✅ 測量值 | measurand={measurand}, value={value} {unit}")
- 
-                        cursor.execute('''
-                            INSERT INTO meter_values (charge_point_id, transaction_id, connector_id, measurand, value, unit, timestamp)
-                            VALUES (?, ?, ?, ?, ?, ?, ?)
-                        ''', (cp_id, transaction_id, connector_id, measurand, value, unit, timestamp))
-                        insert_count += 1
+
+                        logging.info(f"📦 sampled_value = {sv}")  # ✅ 顯示完整資料
+
+                        if not value or not measurand:
+                            logging.warning(f"⚠️ 忽略無效測量資料：value={value}, measurand={measurand}")
+                            continue
+
+                        cursor.execute("""
+                            INSERT INTO meter_values (
+                                charge_point_id, connector_id, transaction_id,
+                                value, measurand, unit, timestamp
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """, (
+                            cp_id, connector_id, transaction_id,
+                            value, measurand, unit, timestamp
+                        ))
+                        count += 1
 
                 conn.commit()
 
