@@ -1,0 +1,476 @@
+{
+  "days": {
+    "2025-01-01": {
+      "isHoliday": true,
+      "description": "元旦"
+    },
+    "2025-01-04": {
+      "isHoliday": true,
+      "description": "週六"
+    },
+    "2025-01-05": {
+      "isHoliday": true,
+      "description": "週日"
+    },
+    "2025-01-11": {
+      "isHoliday": true,
+      "description": "週六"
+    },
+    "2025-01-12": {
+      "isHoliday": true,
+      "description": "週日"
+    },
+    "2025-01-18": {
+      "isHoliday": true,
+      "description": "週六"
+    },
+    "2025-01-19": {
+      "isHoliday": true,
+      "description": "週日"
+    },
+    "2025-01-25": {
+      "isHoliday": false,
+      "description": "補班"
+    },
+    "2025-01-26": {
+      "isHoliday": true,
+      "description": "週日"
+    },
+    "2025-01-27": {
+      "isHoliday": true,
+      "description": "春節假期"
+    },
+    "2025-01-28": {
+      "isHoliday": true,
+      "description": "春節假期"
+    },
+    "2025-01-29": {
+      "isHoliday": true,
+      "description": "春節假期"
+    },
+    "2025-01-30": {
+      "isHoliday": true,
+      "description": "春節假期"
+    },
+    "2025-01-31": {
+      "isHoliday": true,
+      "description": "春節假期"
+    },
+    "2025-02-01": {
+      "isHoliday": true,
+      "description": "春節假期"
+    },
+    "2025-02-02": {
+      "isHoliday": true,
+      "description": "週日"
+    },
+    "2025-02-03": {
+      "isHoliday": true,
+      "description": "春節假期"
+    },
+    "2025-02-08": {
+      "isHoliday": true,
+      "description": "週六"
+    },
+    "2025-02-09": {
+      "isHoliday": true,
+      "description": "週日"
+    },
+    "2025-02-15": {
+      "isHoliday": false,
+      "description": "補班"
+    },
+    "2025-02-16": {
+      "isHoliday": true,
+      "description": "週日"
+    },
+    "2025-02-22": {
+      "isHoliday": true,
+      "description": "週六"
+    },
+    "2025-02-23": {
+      "isHoliday": true,
+      "description": "週日"
+    },
+    "2025-02-28": {
+      "isHoliday": true,
+      "description": "和平紀念日"
+    },
+    "2025-03-01": {
+      "isHoliday": true,
+      "description": "週六"
+    },
+    "2025-03-02": {
+      "isHoliday": true,
+      "description": "週日"
+    },
+    "2025-03-08": {
+      "isHoliday": true,
+      "description": "週六"
+    },
+    "2025-03-09": {
+      "isHoliday": true,
+      "description": "週日"
+    },
+    "2025-03-15": {
+      "isHoliday": true,
+      "description": "週六"
+    },
+    "2025-03-16": {
+      "isHoliday": true,
+      "description": "週日"
+    },
+    "2025-03-22": {
+      "isHoliday": true,
+      "description": "週六"
+    },
+    "2025-03-23": {
+      "isHoliday": true,
+      "description": "週日"
+    },
+    "2025-03-29": {
+      "isHoliday": true,
+      "description": "週六"
+    },
+    "2025-03-30": {
+      "isHoliday": true,
+      "description": "週日"
+    },
+    "2025-04-03": {
+      "isHoliday": true,
+      "description": "清明節前彈性放假"
+    },
+    "2025-04-04": {
+      "isHoliday": true,
+      "description": "兒童節"
+    },
+    "2025-04-05": {
+      "isHoliday": true,
+      "description": "清明節"
+    },
+    "2025-04-06": {
+      "isHoliday": true,
+      "description": "週日"
+    },
+    "2025-04-12": {
+      "isHoliday": false,
+      "description": "補班"
+    },
+    "2025-04-13": {
+      "isHoliday": true,
+      "description": "週日"
+    },
+    "2025-04-19": {
+      "isHoliday": true,
+      "description": "週六"
+    },
+    "2025-04-20": {
+      "isHoliday": true,
+      "description": "週日"
+    },
+    "2025-04-26": {
+      "isHoliday": true,
+      "description": "週六"
+    },
+    "2025-04-27": {
+      "isHoliday": true,
+      "description": "週日"
+    },
+    "2025-05-03": {
+      "isHoliday": true,
+      "description": "週六"
+    },
+    "2025-05-04": {
+      "isHoliday": true,
+      "description": "週日"
+    },
+    "2025-05-10": {
+      "isHoliday": true,
+      "description": "週六"
+    },
+    "2025-05-11": {
+      "isHoliday": true,
+      "description": "週日"
+    },
+    "2025-05-17": {
+      "isHoliday": true,
+      "description": "週六"
+    },
+    "2025-05-18": {
+      "isHoliday": true,
+      "description": "週日"
+    },
+    "2025-05-24": {
+      "isHoliday": true,
+      "description": "週六"
+    },
+    "2025-05-25": {
+      "isHoliday": true,
+      "description": "週日"
+    },
+    "2025-05-31": {
+      "isHoliday": false,
+      "description": "補班"
+    },
+    "2025-06-01": {
+      "isHoliday": true,
+      "description": "週日"
+    },
+    "2025-06-06": {
+      "isHoliday": true,
+      "description": "端午節"
+    },
+    "2025-06-07": {
+      "isHoliday": true,
+      "description": "週六"
+    },
+    "2025-06-08": {
+      "isHoliday": true,
+      "description": "週日"
+    },
+    "2025-06-14": {
+      "isHoliday": true,
+      "description": "週六"
+    },
+    "2025-06-15": {
+      "isHoliday": true,
+      "description": "週日"
+    },
+    "2025-06-21": {
+      "isHoliday": true,
+      "description": "週六"
+    },
+    "2025-06-22": {
+      "isHoliday": true,
+      "description": "週日"
+    },
+    "2025-06-28": {
+      "isHoliday": true,
+      "description": "週六"
+    },
+    "2025-06-29": {
+      "isHoliday": true,
+      "description": "週日"
+    },
+    "2025-07-05": {
+      "isHoliday": true,
+      "description": "週六"
+    },
+    "2025-07-06": {
+      "isHoliday": true,
+      "description": "週日"
+    },
+    "2025-07-12": {
+      "isHoliday": true,
+      "description": "週六"
+    },
+    "2025-07-13": {
+      "isHoliday": true,
+      "description": "週日"
+    },
+    "2025-07-19": {
+      "isHoliday": true,
+      "description": "週六"
+    },
+    "2025-07-20": {
+      "isHoliday": true,
+      "description": "週日"
+    },
+    "2025-07-26": {
+      "isHoliday": true,
+      "description": "週六"
+    },
+    "2025-07-27": {
+      "isHoliday": true,
+      "description": "週日"
+    },
+    "2025-08-02": {
+      "isHoliday": true,
+      "description": "週六"
+    },
+    "2025-08-03": {
+      "isHoliday": true,
+      "description": "週日"
+    },
+    "2025-08-09": {
+      "isHoliday": true,
+      "description": "週六"
+    },
+    "2025-08-10": {
+      "isHoliday": true,
+      "description": "週日"
+    },
+    "2025-08-16": {
+      "isHoliday": true,
+      "description": "週六"
+    },
+    "2025-08-17": {
+      "isHoliday": true,
+      "description": "週日"
+    },
+    "2025-08-23": {
+      "isHoliday": true,
+      "description": "週六"
+    },
+    "2025-08-24": {
+      "isHoliday": true,
+      "description": "週日"
+    },
+    "2025-08-30": {
+      "isHoliday": true,
+      "description": "週六"
+    },
+    "2025-08-31": {
+      "isHoliday": true,
+      "description": "週日"
+    },
+    "2025-09-06": {
+      "isHoliday": true,
+      "description": "週六"
+    },
+    "2025-09-07": {
+      "isHoliday": true,
+      "description": "週日"
+    },
+    "2025-09-13": {
+      "isHoliday": true,
+      "description": "週六"
+    },
+    "2025-09-14": {
+      "isHoliday": true,
+      "description": "週日"
+    },
+    "2025-09-20": {
+      "isHoliday": true,
+      "description": "週六"
+    },
+    "2025-09-21": {
+      "isHoliday": true,
+      "description": "週日"
+    },
+    "2025-09-27": {
+      "isHoliday": true,
+      "description": "週六"
+    },
+    "2025-09-28": {
+      "isHoliday": true,
+      "description": "週日"
+    },
+    "2025-09-29": {
+      "isHoliday": true,
+      "description": "中秋節"
+    },
+    "2025-10-04": {
+      "isHoliday": true,
+      "description": "週六"
+    },
+    "2025-10-05": {
+      "isHoliday": true,
+      "description": "週日"
+    },
+    "2025-10-10": {
+      "isHoliday": true,
+      "description": "國慶日"
+    },
+    "2025-10-11": {
+      "isHoliday": true,
+      "description": "國慶連假"
+    },
+    "2025-10-12": {
+      "isHoliday": true,
+      "description": "週日"
+    },
+    "2025-10-13": {
+      "isHoliday": true,
+      "description": "國慶彈性放假"
+    },
+    "2025-10-18": {
+      "isHoliday": true,
+      "description": "週六"
+    },
+    "2025-10-19": {
+      "isHoliday": true,
+      "description": "週日"
+    },
+    "2025-10-25": {
+      "isHoliday": false,
+      "description": "補班"
+    },
+    "2025-10-26": {
+      "isHoliday": true,
+      "description": "週日"
+    },
+    "2025-11-01": {
+      "isHoliday": true,
+      "description": "週六"
+    },
+    "2025-11-02": {
+      "isHoliday": true,
+      "description": "週日"
+    },
+    "2025-11-08": {
+      "isHoliday": true,
+      "description": "週六"
+    },
+    "2025-11-09": {
+      "isHoliday": true,
+      "description": "週日"
+    },
+    "2025-11-15": {
+      "isHoliday": true,
+      "description": "週六"
+    },
+    "2025-11-16": {
+      "isHoliday": true,
+      "description": "週日"
+    },
+    "2025-11-22": {
+      "isHoliday": true,
+      "description": "週六"
+    },
+    "2025-11-23": {
+      "isHoliday": true,
+      "description": "週日"
+    },
+    "2025-11-29": {
+      "isHoliday": true,
+      "description": "週六"
+    },
+    "2025-11-30": {
+      "isHoliday": true,
+      "description": "週日"
+    },
+    "2025-12-06": {
+      "isHoliday": true,
+      "description": "週六"
+    },
+    "2025-12-07": {
+      "isHoliday": true,
+      "description": "週日"
+    },
+    "2025-12-13": {
+      "isHoliday": true,
+      "description": "週六"
+    },
+    "2025-12-14": {
+      "isHoliday": true,
+      "description": "週日"
+    },
+    "2025-12-20": {
+      "isHoliday": true,
+      "description": "週六"
+    },
+    "2025-12-21": {
+      "isHoliday": true,
+      "description": "週日"
+    },
+    "2025-12-27": {
+      "isHoliday": true,
+      "description": "週六"
+    },
+    "2025-12-28": {
+      "isHoliday": true,
+      "description": "週日"
+    }
+  }
+}

@@ -1,0 +1,16 @@
+# Python 編譯產物
+__pycache__/
+*.pyc
+*.pyo
+
+# 虛擬環境與環境變數
+venv/
+.env
+
+# 系統暫存檔
+.DS_Store
+Thumbs.db
+
+# 測試日誌或其他暫存檔
+*.log
+*.bak
