@@ -490,9 +490,9 @@ class ChargePoint(OcppChargePoint):
                     for sv in sampled_values:
 
 
-                       if "value" not in sampled_value:
-                           print(f"⚠️ 遺失 value 欄位：{sv}")
-                           continue
+                        if "value" not in sampled_value:
+                            print(f"⚠️ 遺失 value 欄位：{sv}")
+                            continue
 
                         value = sv.get("value")
                         measurand = sv.get("measurand", "")
