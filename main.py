@@ -81,7 +81,6 @@ app.add_middleware(
 @app.websocket("/{charge_point_id}")
 async def websocket_endpoint(websocket: WebSocket, charge_point_id: str):
     from ocpp.routing import on
-    from your_adapter_module import FastAPIWebSocketAdapter  # 依你實際命名
     charge_point_id = charge_point_id.lstrip("/")
     print(f"🚨 WebSocket 連線請求進入")
     print(f"👉 解析後 charge_point_id = {charge_point_id}")
