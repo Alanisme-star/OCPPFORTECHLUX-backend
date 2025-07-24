@@ -2289,20 +2289,23 @@ from ocpp.v16 import call
 
 @app.post("/api/charge-points/{charge_point_id}/stop")
 async def stop_transaction_by_charge_point(charge_point_id: str):
+    print(f"⏹️ 收到停止充電請求, charge_point_id={charge_point_id}")
     cp = connected_charge_points.get(charge_point_id)
     if not cp:
+        print(f"❌ 找不到連線中的充電樁：{charge_point_id}")
         raise HTTPException(status_code=404, detail=f"⚠️ 找不到連線中的充電樁：{charge_point_id}")
 
     # 查詢進行中的交易 ID
     with sqlite3.connect("ocpp_data.db") as conn:
         cursor = conn.cursor()
         cursor.execute("""
-            SELECT transaction_id FROM transactions
-            WHERE charge_point_id = ? AND stop_timestamp IS NULL
-            ORDER BY start_timestamp DESC LIMIT 1
+            SELECT id FROM transactions
+            WHERE charge_point_id = ? AND status = 'active'
+            ORDER BY start_time DESC LIMIT 1
         """, (charge_point_id,))
         row = cursor.fetchone()
         if not row:
+            print(f"⚠️ 查無進行中的交易紀錄")
             raise HTTPException(status_code=404, detail="⚠️ 查無進行中的交易紀錄")
         transaction_id = row[0]
 
@@ -2321,7 +2324,8 @@ async def stop_transaction_by_charge_point(charge_point_id: str):
         else:
             meter_stop = 99999  # fallback 預設值
 
-    now = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
+    now = datetime.utcnow().isoformat()
+    print(f"⏹️ 發送 StopTransaction 指令: tx={transaction_id}, meter_stop={meter_stop}")
 
     # 發送 StopTransaction 指令
     request = call.StopTransactionPayload(
@@ -2329,9 +2333,11 @@ async def stop_transaction_by_charge_point(charge_point_id: str):
         meter_stop=meter_stop,
         timestamp=now
     )
-    await cp.send_call(request)
-    return {"message": f"✅ 已發送停止指令給 {charge_point_id}", "transaction_id": transaction_id}
 
+    await cp.send_call(request)
+    print(f"⏹️ StopTransaction 指令已送出給 {charge_point_id}")
+
+    return {"message": f"✅ 已發送停止指令給 {charge_point_id}", "transaction_id": transaction_id}
 
 
 
