@@ -113,6 +113,23 @@ async def websocket_endpoint(websocket: WebSocket, charge_point_id: str):
         )
         conn.commit()
 
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS payments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                transaction_id INTEGER,
+                charge_point_id TEXT,
+                amount REAL,
+                paid_at TEXT
+            )
+        """)
+        conn.commit()
+
+
+
+
+
+
         # ✅ 啟動 OCPP handler
         cp = ChargePoint(charge_point_id, FastAPIWebSocketAdapter(websocket))  # ⚡ 不要傳 protocols
         connected_charge_points[charge_point_id] = cp
