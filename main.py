@@ -1,3 +1,4 @@
+live_status_cache = {}
 import sys
 sys.path.insert(0, "./")
 
@@ -477,8 +478,8 @@ class ChargePoint(OcppChargePoint):
             logging.info(f"📥 收到 MeterValues | cp_id={cp_id} | connector_id={connector_id} | tx_id={transaction_id}")
             logging.info(f"📦 meterValue 原始內容：{meter_value_list}")
 
-            insert_count += 1
-  
+            insert_count = 0  # ✅ 正確初始化
+ 
             with sqlite3.connect("ocpp_data.db") as conn:
                 cursor = conn.cursor()
 
@@ -489,8 +490,7 @@ class ChargePoint(OcppChargePoint):
 
                     for sv in sampled_values:
 
-
-                        if "value" not in sampled_value:
+                        if "value" not in sv:  # ✅ 正確名稱
                             print(f"⚠️ 遺失 value 欄位：{sv}")
                             continue
 
@@ -498,8 +498,8 @@ class ChargePoint(OcppChargePoint):
                         measurand = sv.get("measurand", "")
                         unit = sv.get("unit", "")
 
-                        logging.info(f"📦 sampled_value = {sv}")  # ✅ 顯示完整資料
-
+                        logging.info(f"📦 sampled_value = {sv}")
+ 
                         if not value or not measurand:
                             logging.warning(f"⚠️ 忽略無效測量資料：value={value}, measurand={measurand}")
                             continue
@@ -513,7 +513,7 @@ class ChargePoint(OcppChargePoint):
                             cp_id, connector_id, transaction_id,
                             value, measurand, unit, timestamp
                         ))
-                        count += 1
+                        insert_count += 1  # ✅ 每次成功插入就加一
 
                 conn.commit()
 
@@ -524,6 +524,21 @@ class ChargePoint(OcppChargePoint):
             return MeterValuesPayload()
 
         return MeterValuesPayload()
+
+
+@app.get("/api/charge-points/{charge_point_id}/live-status")
+def get_live_status(charge_point_id: str):
+    data = live_status_cache.get(charge_point_id)
+    if not data:
+        return {"message": "尚無資料", "active": False}
+
+    return {
+        "power": data.get("power", 0),
+        "current": data.get("current", 0),
+        "energy": data.get("energy", 0),
+        "timestamp": data.get("timestamp"),
+        "active": True
+    }
 
 
 
