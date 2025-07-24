@@ -306,6 +306,42 @@ conn.commit()
 class ChargePoint(OcppChargePoint):
 
 
+
+from ocpp.v16 import call
+
+class ChargePoint(OcppChargePoint):
+    # ...（你的其他方法，例如 on_status_notification, on_meter_values, ...）
+
+    async def send_stop_transaction(self, transaction_id):
+        import sqlite3
+        from datetime import datetime, timezone
+
+        # 讀取交易資訊
+        with sqlite3.connect("ocpp_data.db") as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT meter_stop, id_tag FROM transactions WHERE transaction_id = ?
+            ''', (transaction_id,))
+            row = cursor.fetchone()
+            if not row:
+                raise Exception(f"查無 transaction_id: {transaction_id}")
+            meter_stop, id_tag = row
+            # 補 timestamp
+            timestamp = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
+            reason = "Remote"
+
+        # 發送 OCPP StopTransaction
+        request = call.StopTransactionPayload(
+            transaction_id=transaction_id,
+            meter_stop=meter_stop or 0,
+            timestamp=timestamp,
+            id_tag=id_tag,
+            reason=reason
+        )
+        response = await self.call(request)
+        return response
+
+
     @on(Action.StatusNotification)
     async def on_status_notification(self, connector_id=None, status=None, error_code=None, timestamp=None, **kwargs):
         global charging_point_status
