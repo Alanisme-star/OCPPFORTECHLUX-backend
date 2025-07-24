@@ -2282,6 +2282,11 @@ async def duplicate_by_rule(data: dict = Body(...)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+from fastapi import HTTPException
+from ocpp.v16 import call
+import sqlite3
+from datetime import datetime
+
 @app.post("/api/charge-points/{charge_point_id}/stop")
 async def stop_transaction_by_charge_point(charge_point_id: str):
     cp = connected_charge_points.get(charge_point_id)
@@ -2334,6 +2339,7 @@ async def stop_transaction_by_charge_point(charge_point_id: str):
 
 
 
+
 # 新增：依據日期批次刪除 daily_pricing_rules
 @app.delete("/api/daily-pricing")
 async def delete_daily_pricing_by_date(date: str = Query(...)):
@@ -2346,6 +2352,8 @@ async def delete_daily_pricing_by_date(date: str = Query(...)):
 async def debug_ids():
     cursor.execute("SELECT charge_point_id FROM charge_points")
     return [row[0] for row in cursor.fetchall()]
+
+
 
 
 if __name__ == "__main__":
