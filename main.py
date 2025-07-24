@@ -832,39 +832,39 @@ async def calculate_transaction_cost(transaction_id: int):
         raise HTTPException(status_code=404, detail=str(e))
 
    
-
 @app.get("/api/transactions/cost-summary")
-async def transaction_cost_summary():
-    with sqlite3.connect("ocpp_data.db") as conn:
-        cursor = conn.cursor()
-        query = """
-            SELECT t.transaction_id, 
-                   (t.meter_stop - t.meter_start) / 1000.0 as kWh,
-                   p.base_fee, 
-                   p.energy_fee, 
-                   p.overuse_fee, 
-                   p.total_amount
-            FROM transactions t
-            JOIN payments p ON t.transaction_id = p.transaction_id
-            WHERE t.meter_stop IS NOT NULL
-        """
-        cursor.execute(query)
-        rows = cursor.fetchall()
+def get_cost_summary(start: str, end: str):
+    try:
+        with sqlite3.connect("ocpp_data.db") as conn:
+            cursor = conn.cursor()
 
-        result = []
-        for row in rows:
-            # 避免 row 是 None 或欄位為 None
-            if row and row[0] is not None:
-                result.append({
-                    "transactionId": row[0],
-                    "totalKWh": round(row[1], 3) if row[1] is not None else 0.0,
-                    "basicFee": row[2] if row[2] is not None else 0.0,
-                    "energyCost": row[3] if row[3] is not None else 0.0,
-                    "overuseFee": row[4] if row[4] is not None else 0.0,
-                    "totalCost": row[5] if row[5] is not None else 0.0
-                })
+            cursor.execute('''
+                SELECT SUM(amount) FROM payments
+                WHERE timestamp BETWEEN ? AND ?
+            ''', (start, end))
+            cost_row = cursor.fetchone()
+            total_cost = cost_row[0] if cost_row and cost_row[0] is not None else 0
 
-    return result
+            cursor.execute('''
+                SELECT charge_point_id, SUM(amount) FROM payments
+                WHERE timestamp BETWEEN ? AND ?
+                GROUP BY charge_point_id
+            ''', (start, end))
+            breakdown_rows = cursor.fetchall()
+            breakdown = [
+                {
+                    "charge_point_id": row[0],
+                    "cost": row[1] if row[1] is not None else 0
+                }
+                for row in breakdown_rows
+            ]
+
+        return {"total_cost": total_cost, "breakdown": breakdown}
+    except Exception as e:
+        logging.error(f"❌ cost-summary API 錯誤: {e}")
+        return JSONResponse(status_code=500, content={"error": "Internal server error"})
+
+
 
 
 
