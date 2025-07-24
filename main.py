@@ -338,47 +338,48 @@ class ChargePoint(OcppChargePoint):
         return response
 
     @on(Action.StopTransaction)
-async def on_stop_transaction(self, **kwargs):
-    try:
-        logging.warning(f"StopTransaction kwargs: {kwargs}")
-        cp_id = getattr(self, "id", None)
-        logging.warning(f"StopTransaction self.id: {cp_id}")
+    async def on_stop_transaction(self, **kwargs):
+        try:
+            logging.warning(f"StopTransaction kwargs: {kwargs}")
+            cp_id = getattr(self, "id", None)
+            logging.warning(f"StopTransaction self.id: {cp_id}")
 
-        # 同時支援駝峰與底線
-        transaction_id = kwargs.get("transactionId") or kwargs.get("transaction_id")
-        meter_stop = kwargs.get("meterStop") or kwargs.get("meter_stop")
-        timestamp = kwargs.get("timestamp") or datetime.utcnow().isoformat()
-        reason = kwargs.get("reason")
+            # 只用底線欄位名
+            transaction_id = kwargs.get("transaction_id")
+            meter_stop = kwargs.get("meter_stop")
+            timestamp = kwargs.get("timestamp") or datetime.utcnow().isoformat()
+            reason = kwargs.get("reason")
 
-        if cp_id is None or transaction_id is None:
-            logging.error(f"❌ StopTransaction 欄位缺失 | cp_id={cp_id} | transaction_id={transaction_id}")
-            return StopTransactionPayload()
+            if cp_id is None or transaction_id is None:
+                logging.error(f"❌ StopTransaction 欄位缺失 | cp_id={cp_id} | transaction_id={transaction_id}")
+                return StopTransactionPayload()
 
-        with sqlite3.connect("ocpp_data.db") as conn:
-            cursor = conn.cursor()
-            # 儲存停止交易資訊
-            cursor.execute('''
-                INSERT INTO stop_transactions (transaction_id, meter_stop, timestamp, reason)
-                VALUES (?, ?, ?, ?)
-            ''', (
-                transaction_id,
-                meter_stop,
-                timestamp,
-                reason
-            ))
+            with sqlite3.connect("ocpp_data.db") as conn:
+                cursor = conn.cursor()
+                # 儲存停止交易資訊
+                cursor.execute('''
+                    INSERT INTO stop_transactions (transaction_id, meter_stop, timestamp, reason)
+                    VALUES (?, ?, ?, ?)
+                ''', (
+                    transaction_id,
+                    meter_stop,
+                    timestamp,
+                    reason
+                ))
 
-            cursor.execute('''
-                UPDATE transactions
-                SET status = 'completed'
-                WHERE transaction_id = ?
-            ''', (transaction_id,))
+                cursor.execute('''
+                    UPDATE transactions
+                    SET status = 'completed'
+                    WHERE transaction_id = ?
+                ''', (transaction_id,))
 
-            conn.commit()
-  
-    except Exception as e:
-        logging.error(f"❌ StopTransaction 儲存失敗：{e}")
+                conn.commit()
 
-    return StopTransactionPayload()
+        except Exception as e:
+            logging.error(f"❌ StopTransaction 儲存失敗：{e}")
+
+        return StopTransactionPayload()
+
 
 
 
