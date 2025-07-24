@@ -2422,6 +2422,35 @@ async def stop_transaction_by_charge_point(charge_point_id: str):
     return {"message": "已發送停止充電指令", "ocpp_response": str(resp)}
 
 
+@app.get("/api/devtools/last-transactions")
+def last_transactions():
+    import sqlite3
+    with sqlite3.connect("ocpp_data.db") as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT transaction_id, charge_point_id, id_tag, start_timestamp, meter_start,
+                stop_timestamp, meter_stop, reason
+            FROM transactions
+            ORDER BY start_timestamp DESC
+            LIMIT 5
+        """)
+        rows = cursor.fetchall()
+        result = [
+            {
+                "transaction_id": row[0],
+                "charge_point_id": row[1],
+                "id_tag": row[2],
+                "start_time": row[3],
+                "meter_start": row[4],
+                "stop_time": row[5],
+                "meter_stop": row[6],
+                "reason": row[7]
+            }
+            for row in rows
+        ]
+        return {"last_transactions": result}
+
+
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=10000, reload=True)
