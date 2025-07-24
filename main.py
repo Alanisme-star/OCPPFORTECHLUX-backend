@@ -114,20 +114,6 @@ async def websocket_endpoint(websocket: WebSocket, charge_point_id: str):
         conn.commit()
 
 
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS payments (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                transaction_id INTEGER,
-                charge_point_id TEXT,
-                amount REAL,
-                paid_at TEXT
-            )
-        """)
-        conn.commit()
-
-
-
-
 
 
         # ✅ 啟動 OCPP handler
@@ -225,6 +211,18 @@ CREATE TABLE IF NOT EXISTS stop_transactions (
     reason TEXT
 )
 ''')
+
+
+# ✅ 加在這裡！
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS payments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        transaction_id INTEGER,
+        charge_point_id TEXT,
+        amount REAL,
+        paid_at TEXT
+    )
+""")
 
 conn.commit()
 
