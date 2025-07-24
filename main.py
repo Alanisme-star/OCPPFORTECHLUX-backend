@@ -2282,10 +2282,10 @@ async def duplicate_by_rule(data: dict = Body(...)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+
+
 from fastapi import HTTPException
 from ocpp.v16 import call
-import sqlite3
-from datetime import datetime
 
 @app.post("/api/charge-points/{charge_point_id}/stop")
 async def stop_transaction_by_charge_point(charge_point_id: str):
@@ -2297,9 +2297,9 @@ async def stop_transaction_by_charge_point(charge_point_id: str):
     with sqlite3.connect("ocpp_data.db") as conn:
         cursor = conn.cursor()
         cursor.execute("""
-            SELECT id FROM transactions
-            WHERE charge_point_id = ? AND status = 'active'
-            ORDER BY start_time DESC LIMIT 1
+            SELECT transaction_id FROM transactions
+            WHERE charge_point_id = ? AND stop_timestamp IS NULL
+            ORDER BY start_timestamp DESC LIMIT 1
         """, (charge_point_id,))
         row = cursor.fetchone()
         if not row:
@@ -2321,7 +2321,7 @@ async def stop_transaction_by_charge_point(charge_point_id: str):
         else:
             meter_stop = 99999  # fallback 預設值
 
-    now = datetime.utcnow().isoformat()
+    now = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
 
     # 發送 StopTransaction 指令
     request = call.StopTransactionPayload(
@@ -2329,9 +2329,7 @@ async def stop_transaction_by_charge_point(charge_point_id: str):
         meter_stop=meter_stop,
         timestamp=now
     )
-
     await cp.send_call(request)
-
     return {"message": f"✅ 已發送停止指令給 {charge_point_id}", "transaction_id": transaction_id}
 
 
