@@ -661,10 +661,7 @@ def get_latest_current(charge_point_id: str):
             return {"balance": row[0], "found": True}
 
 
-
-
-
-    
+   
 
 
     @on(Action.StopTransaction)
@@ -694,16 +691,12 @@ def get_latest_current(charge_point_id: str):
                     reason
                 ))
 
-                # ✅ 先取得 transaction_id 並轉成字串
-                transaction_id = str(kwargs.get("transactionId"))
-
-                # ✅ 然後再執行 SQL 更新語句
+                # 這裡 transaction_id 直接用原本的即可
                 cursor.execute('''
                     UPDATE transactions
                     SET status = 'completed'
                     WHERE transaction_id = ?
                 ''', (transaction_id,))
-
 
                 conn.commit()
   
@@ -712,6 +705,7 @@ def get_latest_current(charge_point_id: str):
 
         return StopTransactionPayload()
 
+   
 
 
  
