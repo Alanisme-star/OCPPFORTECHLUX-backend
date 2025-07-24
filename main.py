@@ -1,3 +1,4 @@
+connected_charge_points = {}
 live_status_cache = {}
 import sys
 sys.path.insert(0, "./")
@@ -79,6 +80,8 @@ app.add_middleware(
 
 @app.websocket("/{charge_point_id}")
 async def websocket_endpoint(websocket: WebSocket, charge_point_id: str):
+    from ocpp.routing import on
+    from your_adapter_module import FastAPIWebSocketAdapter  # 如果有自訂 Adapter
     charge_point_id = charge_point_id.lstrip("/")
     print(f"🚨 WebSocket 連線請求進入")
     print(f"👉 解析後 charge_point_id = {charge_point_id}")
@@ -112,6 +115,7 @@ async def websocket_endpoint(websocket: WebSocket, charge_point_id: str):
 
         # 啟動 OCPP handler
         cp = ChargePoint(charge_point_id, FastAPIWebSocketAdapter(websocket))
+        connected_charge_points[charge_point_id] = cp  # ✅ 新增這行！
         await cp.start()
 
         # 其他後續處理（如有）
