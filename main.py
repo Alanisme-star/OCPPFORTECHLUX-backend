@@ -939,7 +939,7 @@ def get_cost_summary(start: str, end: str):
 
             cursor.execute('''
                 SELECT SUM(amount) FROM payments
-                WHERE paid BETWEEN ? AND ?
+                WHERE paid_at BETWEEN ? AND ?
             ''', (start, end))
             cost_row = cursor.fetchone()
             total_cost = cost_row[0] if cost_row and cost_row[0] is not None else 0
