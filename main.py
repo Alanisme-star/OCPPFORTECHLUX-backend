@@ -342,6 +342,7 @@ class ChargePoint(OcppChargePoint):
     @on(Action.StopTransaction)
     async def on_stop_transaction(self, **kwargs):
         try:
+            logging.warning(f"StopTransaction kwargs: {kwargs}")  # 新增debug
             cp_id = getattr(self, "id", None)
             transaction_id = kwargs.get("transactionId")
             meter_stop = kwargs.get("meterStop")
