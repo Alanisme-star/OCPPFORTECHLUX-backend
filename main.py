@@ -939,14 +939,14 @@ def get_cost_summary(start: str, end: str):
 
             cursor.execute('''
                 SELECT SUM(amount) FROM payments
-                WHERE timestamp BETWEEN ? AND ?
+                WHERE paid BETWEEN ? AND ?
             ''', (start, end))
             cost_row = cursor.fetchone()
             total_cost = cost_row[0] if cost_row and cost_row[0] is not None else 0
 
             cursor.execute('''
                 SELECT charge_point_id, SUM(amount) FROM payments
-                WHERE timestamp BETWEEN ? AND ?
+                WHERE paid_at BETWEEN ? AND ?
                 GROUP BY charge_point_id
             ''', (start, end))
             breakdown_rows = cursor.fetchall()
