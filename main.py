@@ -1052,45 +1052,6 @@ async def get_status_logs(
     ])
 
 
-@app.get("/api/charge-points/{charge_point_id}/latest-meter")
-def get_latest_meter_value(charge_point_id: str):
-    with sqlite3.connect("ocpp_data.db") as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT timestamp, value, unit
-            FROM meter_values
-            WHERE charge_point_id = ? AND measurand = 'Energy.Active.Import.Register'
-            ORDER BY timestamp DESC
-            LIMIT 1
-        """, (charge_point_id,))
-        row = cursor.fetchone()
-
-        if not row:
-            return {}
-
-        timestamp_raw = row[0]
-        if isinstance(timestamp_raw, datetime):
-            timestamp_iso = timestamp_raw.isoformat()
-        else:
-            try:
-                parsed = datetime.strptime(timestamp_raw, "%Y-%m-%d %H:%M:%S")
-                timestamp_iso = parsed.isoformat()
-            except Exception:
-                timestamp_iso = None
-
-        if not timestamp_iso:
-            return {}
-
-        return {
- 
-            "value": row[1],
-            "unit": row[2],
-        }
-
-
-
-
-
 
 @app.get("/api/id_tags")
 async def list_id_tags():
