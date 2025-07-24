@@ -2298,81 +2298,66 @@ async def duplicate_by_rule(data: dict = Body(...)):
 
 
 from fastapi import HTTPException
-from ocpp.v16 import call
-
-from fastapi import HTTPException
-import sqlite3
 from datetime import datetime
-from ocpp.v16 import call
 
 @app.post("/api/charge-points/{charge_point_id}/stop")
 async def stop_transaction_by_charge_point(charge_point_id: str):
-    try:
-        # 1. 印出目前所有已連線的充電樁
-        print("連線中 charge_point_id 有：", list(connected_charge_points.keys()))
+    # 【印出目前已連線充電樁】方便 debug
+    print("連線中 charge_point_id 有：", list(connected_charge_points.keys()))
 
-        cp = connected_charge_points.get(charge_point_id)
-        if not cp:
-            # 2. 找不到時，把目前所有 key 一起回傳，方便 debug
-            raise HTTPException(
-                status_code=404,
-                detail=f"⚠️ 找不到連線中的充電樁：{charge_point_id}",
-                headers={"X-Connected-CPs": str(list(connected_charge_points.keys()))}
-            )
-
-        # 3. 查詢進行中的交易 ID
-        with sqlite3.connect("ocpp_data.db") as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT id FROM transactions
-                WHERE charge_point_id = ? AND status = 'active'
-                ORDER BY start_time DESC LIMIT 1
-            """, (charge_point_id,))
-            row = cursor.fetchone()
-            if not row:
-                raise HTTPException(status_code=404, detail="⚠️ 查無進行中的交易紀錄")
-            transaction_id = row[0]
-
-            # 4. 查詢最新度數（作為 meter_stop）
-            cursor.execute("""
-                SELECT value FROM meter_values
-                WHERE charge_point_id = ? AND measurand = 'Energy.Active.Import.Register'
-                ORDER BY timestamp DESC LIMIT 1
-            """, (charge_point_id,))
-            mv_row = cursor.fetchone()
-            if mv_row:
-                try:
-                    meter_stop = int(float(mv_row[0]))
-                except Exception as e:
-                    print("⚠️ 轉換 meter_stop 失敗", mv_row[0], e)
-                    meter_stop = 99999
-            else:
-                meter_stop = 99999  # fallback 預設值
-
-        now = datetime.utcnow().isoformat()
-
-        # 5. 發送 StopTransaction 指令
-        request = call.StopTransactionPayload(
-            transaction_id=int(transaction_id),
-            meter_stop=meter_stop,
-            timestamp=now
+    cp = connected_charge_points.get(charge_point_id)
+    if not cp:
+        # 【找不到連線中的充電樁，回傳目前所有 key】
+        raise HTTPException(
+            status_code=404,
+            detail=f"⚠️ 找不到連線中的充電樁：{charge_point_id}",
+            headers={"X-Connected-CPs": str(list(connected_charge_points.keys()))}
         )
 
-        await cp.send_call(request)
+    # 查詢進行中的交易 transaction_id
+    with sqlite3.connect("ocpp_data.db") as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT transaction_id FROM transactions
+            WHERE charge_point_id = ? AND stop_timestamp IS NULL
+            ORDER BY start_timestamp DESC LIMIT 1
+        """, (charge_point_id,))
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="⚠️ 查無進行中的交易紀錄")
+        transaction_id = row[0]
 
-        return {
-            "message": f"✅ 已發送停止指令給 {charge_point_id}",
-            "transaction_id": transaction_id,
-            "connected_now": list(connected_charge_points.keys())
-        }
-    except HTTPException as he:
-        raise he  # 保留原本的 HTTP 例外（如 404)
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        # 其他非預期錯誤全部回傳 500
-        raise HTTPException(status_code=500, detail=f"❌ 後端停止充電失敗: {str(e)}")
+        # 查詢最新度數（作為 meter_stop）
+        cursor.execute("""
+            SELECT value FROM meter_values
+            WHERE charge_point_id = ? AND measurand = 'Energy.Active.Import.Register'
+            ORDER BY timestamp DESC LIMIT 1
+        """, (charge_point_id,))
+        mv_row = cursor.fetchone()
+        if mv_row:
+            try:
+                meter_stop = int(float(mv_row[0]))
+            except ValueError:
+                meter_stop = 99999
+        else:
+            meter_stop = 99999  # fallback 預設值
 
+    now = datetime.utcnow().isoformat()
+
+    # 發送 StopTransaction 指令
+    request = call.StopTransactionPayload(
+        transaction_id=int(transaction_id),
+        meter_stop=meter_stop,
+        timestamp=now
+    )
+
+    await cp.send_call(request)
+
+    return {
+        "message": f"✅ 已發送停止指令給 {charge_point_id}",
+        "transaction_id": transaction_id,
+        "connected_now": list(connected_charge_points.keys())
+    }
 
 
 
