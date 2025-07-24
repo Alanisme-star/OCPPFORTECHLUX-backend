@@ -303,10 +303,6 @@ CREATE TABLE IF NOT EXISTS status_logs (
 
 conn.commit()
 
-class ChargePoint(OcppChargePoint):
-
-
-
 from ocpp.v16 import call
 
 class ChargePoint(OcppChargePoint):
