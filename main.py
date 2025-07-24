@@ -2370,7 +2370,9 @@ async def debug_ids():
     cursor.execute("SELECT charge_point_id FROM charge_points")
     return [row[0] for row in cursor.fetchall()]
 
-
+@app.get("/api/debug/connected-cp")
+def debug_connected_cp():
+    return list(connected_charge_points.keys())
 
 
 if __name__ == "__main__":
