@@ -2336,44 +2336,41 @@ async def duplicate_by_rule(data: dict = Body(...)):
 
 
 
-
 from fastapi import HTTPException
-from datetime import datetime
 
 @app.post("/api/charge-points/{charge_point_id}/stop")
 async def stop_transaction_by_charge_point(charge_point_id: str):
-    # 印出已連線充電樁
-    print("連線中 charge_point_id 有：", list(connected_charge_points.keys()))
-
-    cp = connected_charge_points.get(charge_point_id)
-    if not cp:
-        raise HTTPException(
-            status_code=404,
-            detail=f"⚠️ 找不到連線中的充電樁：{charge_point_id}",
-            headers={"X-Connected-CPs": str(list(connected_charge_points.keys()))}
-        )
-
-    # 查詢進行中 transaction（注意只有 transaction_id）
-    cursor.execute("""
-        SELECT transaction_id FROM transactions
-        WHERE charge_point_id = ? AND stop_timestamp IS NULL
-        ORDER BY start_timestamp DESC LIMIT 1
-    """, (charge_point_id,))
-    row = cursor.fetchone()
-
-    if not row:
-        raise HTTPException(status_code=404, detail="找不到進行中的交易")
-
-    transaction_id = row[0]
-
-    # 由後端直接叫 OCPP 停止（假設 cp 有 async stop_transaction 方法）
     try:
-        # 你如果有自己定義 send_stop_transaction，這裡呼叫它
-        result = await cp.send_stop_transaction(transaction_id)
-        return {"message": "已發送停止命令", "result": result}
+        print(f"收到停止充電API請求, charge_point_id = {charge_point_id}")
+        cp = connected_charge_points.get(charge_point_id)
+        print(f"目前所有連線中的充電樁：{list(connected_charge_points.keys())}")
+        if not cp:
+            raise HTTPException(
+                status_code=404,
+                detail=f"⚠️ 找不到連線中的充電樁：{charge_point_id}",
+                headers={"X-Connected-CPs": str(list(connected_charge_points.keys()))}
+            )
+        # 查詢進行中的 transaction_id
+        with sqlite3.connect("ocpp_data.db") as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT transaction_id FROM transactions
+                WHERE charge_point_id = ? AND stop_timestamp IS NULL
+                ORDER BY start_timestamp DESC LIMIT 1
+            """, (charge_point_id,))
+            row = cursor.fetchone()
+            if not row:
+                raise HTTPException(status_code=400, detail="⚠️ 無進行中交易")
+            transaction_id = row[0]
+        # 呼叫 OCPP StopTransaction
+        resp = await cp.send_stop_transaction(transaction_id)
+        return {"message": "已發送停止充電指令", "ocpp_response": str(resp)}
     except Exception as e:
-        print(f"❌ 停止充電失敗：{e}")
-        raise HTTPException(status_code=500, detail=f"停止充電失敗：{e}")
+        import traceback
+        print("停止充電API發生例外：", e)
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"❌ 停止充電API內部錯誤: {str(e)}")
+
 
 
 
