@@ -2274,6 +2274,42 @@ async def duplicate_by_rule(data: dict = Body(...)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
+@app.post("/api/charge-points/{charge_point_id}/stop")
+async def manual_stop_transaction(charge_point_id: str):
+    cp = connected_devices.get(charge_point_id)
+    if not cp:
+        raise HTTPException(status_code=404, detail="充電樁尚未連線")
+
+    # 查詢目前的 transaction_id
+    with sqlite3.connect("ocpp_data.db") as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT transaction_id FROM transactions
+            WHERE charge_point_id = ? AND stop_timestamp IS NULL
+            ORDER BY start_timestamp DESC LIMIT 1
+        """, (charge_point_id,))
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=400, detail="目前沒有進行中的交易")
+
+        transaction_id = row[0]
+
+    now = datetime.utcnow().isoformat()
+    # 發送 StopTransaction 指令
+    request = call.StopTransactionPayload(
+        transaction_id=int(transaction_id),
+        meter_stop=99999,  # 模擬結束度數，可替換為實際讀值
+        timestamp=now
+    )
+    await cp.send_call(request)
+
+    return {"message": f"已發送停止指令給 {charge_point_id}"}
+
+
+
+
+
 # 新增：依據日期批次刪除 daily_pricing_rules
 @app.delete("/api/daily-pricing")
 async def delete_daily_pricing_by_date(date: str = Query(...)):
