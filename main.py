@@ -2276,35 +2276,52 @@ async def duplicate_by_rule(data: dict = Body(...)):
 
 
 @app.post("/api/charge-points/{charge_point_id}/stop")
-async def manual_stop_transaction(charge_point_id: str):
-    cp = connected_devices.get(charge_point_id)
+async def stop_transaction_by_charge_point(charge_point_id: str):
+    cp = connected_charge_points.get(charge_point_id)
     if not cp:
-        raise HTTPException(status_code=404, detail="充電樁尚未連線")
+        raise HTTPException(status_code=404, detail=f"⚠️ 找不到連線中的充電樁：{charge_point_id}")
 
-    # 查詢目前的 transaction_id
+    # 查詢進行中的交易 ID
     with sqlite3.connect("ocpp_data.db") as conn:
         cursor = conn.cursor()
         cursor.execute("""
-            SELECT transaction_id FROM transactions
-            WHERE charge_point_id = ? AND stop_timestamp IS NULL
-            ORDER BY start_timestamp DESC LIMIT 1
+            SELECT id FROM transactions
+            WHERE charge_point_id = ? AND status = 'active'
+            ORDER BY start_time DESC LIMIT 1
         """, (charge_point_id,))
         row = cursor.fetchone()
         if not row:
-            raise HTTPException(status_code=400, detail="目前沒有進行中的交易")
-
+            raise HTTPException(status_code=404, detail="⚠️ 查無進行中的交易紀錄")
         transaction_id = row[0]
 
+        # 查詢最新度數（作為 meter_stop）
+        cursor.execute("""
+            SELECT value FROM meter_values
+            WHERE charge_point_id = ? AND measurand = 'Energy.Active.Import.Register'
+            ORDER BY timestamp DESC LIMIT 1
+        """, (charge_point_id,))
+        mv_row = cursor.fetchone()
+        if mv_row:
+            try:
+                meter_stop = int(float(mv_row[0]))
+            except ValueError:
+                meter_stop = 99999
+        else:
+            meter_stop = 99999  # fallback 預設值
+
     now = datetime.utcnow().isoformat()
+
     # 發送 StopTransaction 指令
     request = call.StopTransactionPayload(
         transaction_id=int(transaction_id),
-        meter_stop=99999,  # 模擬結束度數，可替換為實際讀值
+        meter_stop=meter_stop,
         timestamp=now
     )
+
     await cp.send_call(request)
 
-    return {"message": f"已發送停止指令給 {charge_point_id}"}
+    return {"message": f"✅ 已發送停止指令給 {charge_point_id}", "transaction_id": transaction_id}
+
 
 
 
