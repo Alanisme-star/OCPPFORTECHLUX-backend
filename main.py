@@ -741,40 +741,46 @@ def get_latest_current(charge_point_id: str):
 
 
 
-@app.get("/api/charge-points/{charge_point_id}/current-kwh")
-def get_current_kwh(charge_point_id: str):
-    with sqlite3.connect("ocpp_data.db") as conn:
-        cursor = conn.cursor()
+    @app.get("/api/charge-points/{charge_point_id}/current-kwh")
+    def get_current_kwh(charge_point_id: str):
+        try:
+            with sqlite3.connect("ocpp_data.db") as conn:
+                cursor = conn.cursor()
 
-        # 取得正在進行中的 transaction_id
-        cursor.execute('''
-            SELECT id FROM transactions
-            WHERE charge_point_id = ? AND status = 'active'
-            ORDER BY start_time DESC LIMIT 1
-        ''', (charge_point_id,))
-        result = cursor.fetchone()
+                # 🔍 取得尚未結束的交易（狀態為 active）
+                cursor.execute('''
+                    SELECT id FROM transactions
+                    WHERE charge_point_id = ? AND status = 'active'
+                    ORDER BY start_time DESC LIMIT 1
+                ''', (charge_point_id,))
+                result = cursor.fetchone()
 
-        if result is None:
-            logging.warning(f"⚠️ 無進行中交易：{charge_point_id}")
-            return {"kwh": 0}
+                if result is None:
+                    logging.warning(f"⚠️ 無進行中交易：{charge_point_id}")
+                    return {"kwh": 0.0}
 
-        transaction_id = result[0]
+                transaction_id = result[0]
 
-        # 計算該交易內的累積度數差（Wh → kWh）
-        cursor.execute('''
-            SELECT MAX(value) - MIN(value)
-            FROM meter_values
-            WHERE charge_point_id = ? AND transaction_id = ? AND measurand = 'Energy.Active.Import.Register'
-        ''', (charge_point_id, transaction_id))
-        row = cursor.fetchone()
+                # 🔢 取出該筆交易的最大與最小電表值
+                cursor.execute('''
+                    SELECT MAX(value) - MIN(value)
+                    FROM meter_values
+                    WHERE charge_point_id = ? AND transaction_id = ? AND measurand = 'Energy.Active.Import.Register'
+                ''', (charge_point_id, transaction_id))
+                row = cursor.fetchone()
 
+                if not row or row[0] is None:
+                    logging.warning(f"⚠️ 無 Power.Active.Import.Register 資料：{charge_point_id}, tx={transaction_id}")
+                    kwh = 0.0
+                else:
+                    kwh = round(row[0] / 1000.0, 2)
 
-        if row is None or row[0] is None:
-            logging.warning(f"⚠️ 無 Power.Active.Import.Register 資料：{charge_point_id}, tx={transaction_id}")
-            kwh = 0.0
-        else:
-            kwh = round(row[0] / 1000.0, 2)
-        return {"kwh": kwh}
+            return {"kwh": kwh}
+
+        except Exception as e:
+            logging.exception(f"❌ 查詢 current-kwh 時發生例外錯誤：{e}")
+            return {"kwh": 0.0}
+
 
 
 
