@@ -196,6 +196,18 @@ CREATE TABLE IF NOT EXISTS daily_pricing (
     price_per_kwh REAL
 )
 ''')
+
+
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS stop_transactions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    transaction_id TEXT,
+    meter_stop INTEGER,
+    timestamp TEXT,
+    reason TEXT
+)
+''')
+
 conn.commit()
 
 
