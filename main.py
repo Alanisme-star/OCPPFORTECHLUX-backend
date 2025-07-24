@@ -81,7 +81,7 @@ app.add_middleware(
 @app.websocket("/{charge_point_id}")
 async def websocket_endpoint(websocket: WebSocket, charge_point_id: str):
     from ocpp.routing import on
-    from your_adapter_module import FastAPIWebSocketAdapter  # 如果有自訂 Adapter
+    from your_adapter_module import FastAPIWebSocketAdapter  # 依你實際命名
     charge_point_id = charge_point_id.lstrip("/")
     print(f"🚨 WebSocket 連線請求進入")
     print(f"👉 解析後 charge_point_id = {charge_point_id}")
@@ -97,7 +97,7 @@ async def websocket_endpoint(websocket: WebSocket, charge_point_id: str):
         return
 
     try:
-        # 接受連線
+        # ✅ 只修正這一行，正確協定 negotiation
         await websocket.accept(subprotocol="ocpp1.6")
         print(f"✅ {charge_point_id} 通過白名單驗證，接受連線")
 
@@ -113,9 +113,9 @@ async def websocket_endpoint(websocket: WebSocket, charge_point_id: str):
         )
         conn.commit()
 
-        # 啟動 OCPP handler
-        cp = ChargePoint(charge_point_id, FastAPIWebSocketAdapter(websocket))
-        connected_charge_points[charge_point_id] = cp  # ✅ 新增這行！
+        # ✅ 啟動 OCPP handler
+        cp = ChargePoint(charge_point_id, FastAPIWebSocketAdapter(websocket))  # ⚡ 不要傳 protocols
+        connected_charge_points[charge_point_id] = cp
         await cp.start()
 
         # 其他後續處理（如有）
@@ -123,11 +123,15 @@ async def websocket_endpoint(websocket: WebSocket, charge_point_id: str):
 
     except WebSocketDisconnect:
         logger.warning(f"⚠️ Disconnected: {charge_point_id}")
-        # connected_devices.pop(charge_point_id, None)  # 若有用，保留；沒用可移除
+        # connected_devices.pop(charge_point_id, None)
 
     except Exception as e:
         logger.error(f"❌ WebSocket error for {charge_point_id}: {e}")
         await websocket.close()
+    finally:
+        # ⚠️ 建議最後 always 清理連線（避免殭屍）
+        connected_charge_points.pop(charge_point_id, None)
+
 
 
 # 初始化狀態儲存
