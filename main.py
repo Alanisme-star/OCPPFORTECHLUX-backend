@@ -641,6 +641,40 @@ def get_live_status(charge_point_id: str):
 
 
 
+from fastapi import HTTPException
+
+@app.post("/api/charge-points/{charge_point_id}/stop")
+async def stop_transaction_by_charge_point(charge_point_id: str):
+    print(f"收到停止充電API請求, charge_point_id = {charge_point_id}")
+    cp = connected_charge_points.get(charge_point_id)
+    print(f"目前所有連線中的充電樁：{list(connected_charge_points.keys())}")
+    if not cp:
+        raise HTTPException(
+            status_code=404,
+            detail=f"⚠️ 找不到連線中的充電樁：{charge_point_id}",
+            headers={"X-Connected-CPs": str(list(connected_charge_points.keys()))}
+        )
+    # 查詢進行中的 transaction_id
+    with sqlite3.connect("ocpp_data.db") as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT transaction_id FROM transactions
+            WHERE charge_point_id = ? AND stop_timestamp IS NULL
+            ORDER BY start_timestamp DESC LIMIT 1
+        """, (charge_point_id,))
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=400, detail="⚠️ 無進行中交易")
+        transaction_id = row[0]
+    # 呼叫 OCPP StopTransaction
+    resp = await cp.send_stop_transaction(transaction_id)
+    return {"message": "已發送停止充電指令", "ocpp_response": str(resp)}
+
+
+
+
+
+
     
 @app.get("/api/charge-points/{charge_point_id}/current-transaction")
 def get_current_transaction(charge_point_id: str):
