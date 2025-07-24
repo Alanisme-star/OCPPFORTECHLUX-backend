@@ -337,8 +337,6 @@ class ChargePoint(OcppChargePoint):
         response = await self.call(request)
         return response
 
-
-
     @on(Action.StopTransaction)
     async def on_stop_transaction(self, **kwargs):
         try:
