@@ -38,6 +38,19 @@ from reportlab.pdfgen import canvas
 
 app = FastAPI()
 
+
+logging.basicConfig(level=logging.INFO)
+
+# 允許跨域（若前端使用）
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # ✅ 改為英文半形引號
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
 charging_point_status = {}
 
 class FastAPIWebSocketAdapter:
@@ -64,18 +77,6 @@ def get_active_connections():
     return [{"charge_point_id": cp_id, "connected_at": data["time"], "ip": data["ip"]} for cp_id, data in connected_devices.items()]
 
 
-
-
-logging.basicConfig(level=logging.INFO)
-
-# 允許跨域（若前端使用）
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # ✅ 改為英文半形引號
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 
 @app.websocket("/{charge_point_id}")
