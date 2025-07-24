@@ -2302,62 +2302,38 @@ from datetime import datetime
 
 @app.post("/api/charge-points/{charge_point_id}/stop")
 async def stop_transaction_by_charge_point(charge_point_id: str):
-    # 【印出目前已連線充電樁】方便 debug
+    # 印出已連線充電樁
     print("連線中 charge_point_id 有：", list(connected_charge_points.keys()))
 
     cp = connected_charge_points.get(charge_point_id)
     if not cp:
-        # 【找不到連線中的充電樁，回傳目前所有 key】
         raise HTTPException(
             status_code=404,
             detail=f"⚠️ 找不到連線中的充電樁：{charge_point_id}",
             headers={"X-Connected-CPs": str(list(connected_charge_points.keys()))}
         )
 
-    # 查詢進行中的交易 transaction_id
-    with sqlite3.connect("ocpp_data.db") as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT transaction_id FROM transactions
-            WHERE charge_point_id = ? AND stop_timestamp IS NULL
-            ORDER BY start_timestamp DESC LIMIT 1
-        """, (charge_point_id,))
-        row = cursor.fetchone()
-        if not row:
-            raise HTTPException(status_code=404, detail="⚠️ 查無進行中的交易紀錄")
-        transaction_id = row[0]
+    # 查詢進行中 transaction（注意只有 transaction_id）
+    cursor.execute("""
+        SELECT transaction_id FROM transactions
+        WHERE charge_point_id = ? AND stop_timestamp IS NULL
+        ORDER BY start_timestamp DESC LIMIT 1
+    """, (charge_point_id,))
+    row = cursor.fetchone()
 
-        # 查詢最新度數（作為 meter_stop）
-        cursor.execute("""
-            SELECT value FROM meter_values
-            WHERE charge_point_id = ? AND measurand = 'Energy.Active.Import.Register'
-            ORDER BY timestamp DESC LIMIT 1
-        """, (charge_point_id,))
-        mv_row = cursor.fetchone()
-        if mv_row:
-            try:
-                meter_stop = int(float(mv_row[0]))
-            except ValueError:
-                meter_stop = 99999
-        else:
-            meter_stop = 99999  # fallback 預設值
+    if not row:
+        raise HTTPException(status_code=404, detail="找不到進行中的交易")
 
-    now = datetime.utcnow().isoformat()
+    transaction_id = row[0]
 
-    # 發送 StopTransaction 指令
-    request = call.StopTransactionPayload(
-        transaction_id=int(transaction_id),
-        meter_stop=meter_stop,
-        timestamp=now
-    )
-
-    await cp.send_call(request)
-
-    return {
-        "message": f"✅ 已發送停止指令給 {charge_point_id}",
-        "transaction_id": transaction_id,
-        "connected_now": list(connected_charge_points.keys())
-    }
+    # 由後端直接叫 OCPP 停止（假設 cp 有 async stop_transaction 方法）
+    try:
+        # 你如果有自己定義 send_stop_transaction，這裡呼叫它
+        result = await cp.send_stop_transaction(transaction_id)
+        return {"message": "已發送停止命令", "result": result}
+    except Exception as e:
+        print(f"❌ 停止充電失敗：{e}")
+        raise HTTPException(status_code=500, detail=f"停止充電失敗：{e}")
 
 
 
