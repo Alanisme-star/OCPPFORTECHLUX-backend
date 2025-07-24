@@ -660,10 +660,7 @@ def get_latest_current(charge_point_id: str):
                 return {"balance": 0, "found": False}
             return {"balance": row[0], "found": True}
 
-
    
-
-
     @on(Action.StopTransaction)
     async def on_stop_transaction(self, **kwargs):
         try:
