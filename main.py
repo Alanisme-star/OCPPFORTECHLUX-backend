@@ -345,7 +345,7 @@ class ChargePoint(OcppChargePoint):
             logging.warning(f"StopTransaction self.id: {cp_id}")
 
             # 只用底線欄位名
-            transaction_id = kwargs.get("transaction_id")
+            transaction_id = kwargs.get("transactionId")
             meter_stop = kwargs.get("meter_stop")
             timestamp = kwargs.get("timestamp") or datetime.utcnow().isoformat()
             reason = kwargs.get("reason")
