@@ -542,101 +542,6 @@ def get_live_status(charge_point_id: str):
 
 
 
-from fastapi import HTTPException
-import logging
-
-@app.get("/api/charge-points/{charge_point_id}/current-cost")
-def get_current_cost(charge_point_id: str):
-    try:
-        with sqlite3.connect("ocpp_data.db") as conn:
-            cursor = conn.cursor()
-
-            # ✅ 查找最新一筆交易（以開始時間排序）
-            cursor.execute("""
-                SELECT transaction_id, meter_start, meter_stop, start_timestamp, stop_timestamp
-                FROM transactions
-                WHERE charge_point_id = ?
-                ORDER BY start_timestamp DESC LIMIT 1
-            """, (charge_point_id,))
-            row = cursor.fetchone()
-
-            if not row:
-                logging.warning(f"⚠️ 查無交易記錄 for {charge_point_id}")
-                return {"cost": 0, "active": False}
-
-            transaction_id, meter_start, meter_stop, start_time_str, stop_time_str = row
-            active = stop_time_str is None
-
-            if meter_stop is not None:
-                meter_now = meter_stop
-                timestamp = stop_time_str
-            else:
-                # ✅ 若仍在進行中，查詢最新度數（Wh）
-                cursor.execute("""
-                    SELECT value, timestamp
-                    FROM meter_values
-                    WHERE charge_point_id = ? AND transaction_id = ? AND measurand = 'Energy.Active.Import.Register'
-                    ORDER BY timestamp DESC LIMIT 1
-                """, (charge_point_id, transaction_id))
-                mv_row = cursor.fetchone()
-                if not mv_row:
-                    logging.warning(f"⚠️ 查無 meter_value 記錄 | CP={charge_point_id}, tx_id={transaction_id}")
-                    return {"cost": 0, "active": True}
-                meter_now, timestamp = mv_row
-
-            try:
-                kwh = max((float(meter_now) - float(meter_start)) / 1000.0, 0)
-            except Exception as e:
-                logging.error(f"❌ 無法計算 kWh | meter_now={meter_now}, meter_start={meter_start} | {e}")
-                return {"cost": 0, "active": active}
-
-            # ✅ 時段電價判斷
-            def is_summer(dt):
-                return datetime(dt.year, 6, 1, tzinfo=dt.tzinfo) <= dt <= datetime(dt.year, 9, 30, tzinfo=dt.tzinfo)
-
-            def is_holiday(dt):
-                return dt.weekday() >= 5  # 六日為假日
-
-            def get_price(dt):
-                season = "summer" if is_summer(dt) else "non_summer"
-                day_type = "holiday" if is_holiday(dt) else "weekday"
-                t = dt.time().strftime("%H:%M")
-
-                cursor.execute('''
-                    SELECT price FROM pricing_rules
-                    WHERE season = ? AND day_type = ? AND (
-                        (start_time <= end_time AND start_time <= ? AND end_time > ?) OR
-                        (start_time > end_time AND (? >= start_time OR ? < end_time))
-                    )
-                ORDER BY start_time DESC LIMIT 1
-                ''', (season, day_type, t, t, t, t))
-                row = cursor.fetchone()
-                return row[0] if row else 0
-
-            try:
-                if not timestamp:
-                    raise ValueError("Empty timestamp")
-                dt = parse_date(timestamp)
-            except Exception as e:
-                logging.warning(f"⚠️ 時間格式錯誤，使用 UTC 現在時間 | 原始={timestamp} | {e}")
-                dt = datetime.utcnow()
-
-            price_per_kwh = get_price(dt)
-            cost = round(kwh * price_per_kwh, 2)
-
-            return {
-                "kwh": round(kwh, 3),
-                "pricePerKWh": price_per_kwh,
-                "cost": cost,
-                "active": active
-            }
-
-    except Exception as e:
-        logging.error(f"❌ 查詢 current-cost 時發生錯誤: {e}")
-        raise HTTPException(status_code=500, detail="查詢充電成本失敗")
-
-
-
     
 @app.get("/api/charge-points/{charge_point_id}/current-transaction")
 def get_current_transaction(charge_point_id: str):
@@ -666,40 +571,6 @@ def get_current_transaction(charge_point_id: str):
             "active": active
         }
 
-
-
-
-
-@app.get("/api/charge-points/{charge_point_id}/latest-power")
-def get_latest_power(charge_point_id: str):
-    try:
-        with sqlite3.connect("ocpp_data.db") as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT timestamp, value, unit
-                FROM meter_values
-                WHERE charge_point_id = ? AND measurand = 'Power.Active.Import'
-                ORDER BY timestamp DESC
-                LIMIT 1
-            """, (charge_point_id,))
-            row = cursor.fetchone()
-
-            if row:
-                try:
-                    value = float(row[0])
-                except ValueError:
-                    logging.warning(f"⚠️ Power 值轉換失敗：{row[0]}")
-                    value = 0.0
-            else:
-                logging.warning(f"⚠️ 無 Power.Active.Import 資料：{charge_point_id}")
-                value = 0.0
-
-            logging.info(f"🔍 查詢即時功率：{charge_point_id} -> {value} kW")
-            return {"value": round(value, 2)}
-
-    except Exception as e:
-        logging.error(f"❌ 查詢最新功率錯誤：{e}")
-        return {"value": 0.0}
 
 
 
@@ -741,47 +612,7 @@ def get_latest_current(charge_point_id: str):
 
 
 
-    @app.get("/api/charge-points/{charge_point_id}/current-kwh")
-    def get_current_kwh(charge_point_id: str):
-        try:
-            with sqlite3.connect("ocpp_data.db") as conn:
-                cursor = conn.cursor()
-
-                # 🔍 取得尚未結束的交易（狀態為 active）
-                cursor.execute('''
-                    SELECT id FROM transactions
-                    WHERE charge_point_id = ? AND status = 'active'
-                    ORDER BY start_time DESC LIMIT 1
-                ''', (charge_point_id,))
-                result = cursor.fetchone()
-
-                if result is None:
-                    logging.warning(f"⚠️ 無進行中交易：{charge_point_id}")
-                    return {"kwh": 0.0}
-
-                transaction_id = result[0]
-
-                # 🔢 取出該筆交易的最大與最小電表值
-                cursor.execute('''
-                    SELECT MAX(value) - MIN(value)
-                    FROM meter_values
-                    WHERE charge_point_id = ? AND transaction_id = ? AND measurand = 'Energy.Active.Import.Register'
-                ''', (charge_point_id, transaction_id))
-                row = cursor.fetchone()
-
-                if not row or row[0] is None:
-                    logging.warning(f"⚠️ 無 Power.Active.Import.Register 資料：{charge_point_id}, tx={transaction_id}")
-                    kwh = 0.0
-                else:
-                    kwh = round(row[0] / 1000.0, 2)
-
-            return {"kwh": kwh}
-
-        except Exception as e:
-            logging.exception(f"❌ 查詢 current-kwh 時發生例外錯誤：{e}")
-            return {"kwh": 0.0}
-
-
+    
 
 
     @on(Action.StopTransaction)
