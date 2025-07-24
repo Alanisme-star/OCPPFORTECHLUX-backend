@@ -369,9 +369,10 @@ class ChargePoint(OcppChargePoint):
 
                 cursor.execute('''
                     UPDATE transactions
-                    SET status = 'completed'
+                    SET meter_stop = ?, stop_timestamp = ?, reason = ?
                     WHERE transaction_id = ?
-                ''', (transaction_id,))
+                ''', (meter_stop, timestamp, reason, transaction_id))
+
 
                 conn.commit()
 
