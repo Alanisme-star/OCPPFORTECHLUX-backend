@@ -477,7 +477,7 @@ class ChargePoint(OcppChargePoint):
             logging.info(f"📥 收到 MeterValues | cp_id={cp_id} | connector_id={connector_id} | tx_id={transaction_id}")
             logging.info(f"📦 meterValue 原始內容：{meter_value_list}")
 
-            insert_count = 0
+            insert_count += 1
   
             with sqlite3.connect("ocpp_data.db") as conn:
                 cursor = conn.cursor()
@@ -488,6 +488,12 @@ class ChargePoint(OcppChargePoint):
                     logging.info(f"⏱️ timestamp={timestamp}, sampledValue 數量={len(sampled_values)}")
 
                     for sv in sampled_values:
+
+
+                       if "value" not in sampled_value:
+                           print(f"⚠️ 遺失 value 欄位：{sv}")
+                           continue
+
                         value = sv.get("value")
                         measurand = sv.get("measurand", "")
                         unit = sv.get("unit", "")
