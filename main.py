@@ -729,7 +729,7 @@ async def stop_transaction_by_charge_point(charge_point_id: str):
         print(f"🔴【API異常】等待 StopTransaction 超時")
         return JSONResponse(status_code=504, content={"message": "等待充電樁停止回覆逾時 (StopTransaction timeout)"})
     finally:
-        pending_stop_transactions.pop(transaction_id, None)
+        pending_stop_transactions.pop(str(transaction_id), None)
 
 
 
