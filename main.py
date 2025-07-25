@@ -685,7 +685,7 @@ async def stop_transaction_by_charge_point(charge_point_id: str):
         """, (charge_point_id,))
         row = cursor.fetchone()
         if not row:
-        print(f"🔴【API異常】無進行中交易 charge_point_id={charge_point_id}")
+            print(f"🔴【API異常】無進行中交易 charge_point_id={charge_point_id}")
             raise HTTPException(status_code=400, detail="⚠️ 無進行中交易")
         transaction_id = row[0]
         print(f"🟢【API呼叫】找到進行中交易 transaction_id={transaction_id}")
