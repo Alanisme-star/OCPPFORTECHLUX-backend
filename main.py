@@ -399,7 +399,7 @@ class ChargePoint(OcppChargePoint):
             print(f"[DEBUG] 收到 StopTransaction，transaction_id 型別: {type(transaction_id)}, value: {transaction_id}")
             print(f"[DEBUG] 目前 pending_stop_transactions 的 key: {list(pending_stop_transactions.keys())}")
 
-            fut = pending_stop_transactions.get(transaction_id)
+            fut = pending_stop_transactions.get(str(transaction_id))
             if fut and not fut.done():
                 print(f"StopTransaction | 解除future? {transaction_id} | 現有pending: {list(pending_stop_transactions.keys())}")
                 fut.set_result({"meter_stop": meter_stop, "timestamp": timestamp, "reason": reason})
@@ -600,7 +600,7 @@ class ChargePoint(OcppChargePoint):
                     """, (cp_id,))
                     row = cursor.fetchone()
                     if row:
-                        transaction_id = row[0]
+                        transaction_id = str(row[0])
                         logging.warning(f"⚠️ 從 DB 補上 transaction_id = {transaction_id}")
 
             logging.info(f"📥 收到 MeterValues | cp_id={cp_id} | connector_id={connector_id} | tx_id={transaction_id}")
@@ -711,7 +711,7 @@ async def stop_transaction_by_charge_point(charge_point_id: str):
     # 新增同步等待機制
     loop = asyncio.get_event_loop()
     fut = loop.create_future()
-    pending_stop_transactions[transaction_id] = fut
+    pending_stop_transactions[str(transaction_id)] = fut
 
     # 發送 RemoteStopTransaction
     print(f"🟢【API呼叫】發送 RemoteStopTransaction 給充電樁")
