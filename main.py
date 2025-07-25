@@ -355,9 +355,11 @@ class ChargePoint(OcppChargePoint):
     @on(Action.StopTransaction)
     async def on_stop_transaction(self, **kwargs):
         try:
-            logging.warning(f"StopTransaction kwargs: {kwargs}")
+
+            print(f"🟢【OCPP Handler】StopTransaction kwargs: {kwargs}")
             cp_id = getattr(self, "id", None)
-            logging.warning(f"StopTransaction self.id: {cp_id}")
+            print(f"🟢【OCPP Handler】StopTransaction self.id: {cp_id}")
+
 
             # 只用底線欄位名
             transaction_id = kwargs.get("transaction_id") or kwargs.get("transactionId")
@@ -366,8 +368,10 @@ class ChargePoint(OcppChargePoint):
             reason = kwargs.get("reason")
 
             if cp_id is None or transaction_id is None:
-                logging.error(f"❌ StopTransaction 欄位缺失 | cp_id={cp_id} | transaction_id={transaction_id}")
+            print(f"🔴【OCPP Handler】❌ StopTransaction 欄位缺失 | cp_id={cp_id} | transaction_id={transaction_id}")
+
                 return StopTransactionPayload()
+            print(f"🟢【OCPP Handler】UPDATE transactions，transaction_id={transaction_id}")
 
             with sqlite3.connect("ocpp_data.db") as conn:
                 cursor = conn.cursor()
@@ -390,9 +394,10 @@ class ChargePoint(OcppChargePoint):
 
 
                 conn.commit()
+            print(f"🟢【OCPP Handler】交易已成功結束 transaction_id={transaction_id}")
 
         except Exception as e:
-            logging.error(f"❌ StopTransaction 儲存失敗：{e}")
+            print(f"🔴【OCPP Handler】❌ StopTransaction 儲存失敗：{e}")
 
         return StopTransactionPayload()
 
@@ -660,10 +665,12 @@ from fastapi import HTTPException
 
 @app.post("/api/charge-points/{charge_point_id}/stop")
 async def stop_transaction_by_charge_point(charge_point_id: str):
-    print(f"收到停止充電API請求, charge_point_id = {charge_point_id}")
+    print(f"🟢【API呼叫】收到停止充電API請求, charge_point_id = {charge_point_id}")
+    print(f"🟢【API呼叫】目前所有連線中的充電樁：{list(connected_charge_points.keys())}")
     cp = connected_charge_points.get(charge_point_id)
-    print(f"目前所有連線中的充電樁：{list(connected_charge_points.keys())}")
+
     if not cp:
+    print(f"🔴【API異常】找不到連線中的充電樁：{charge_point_id}")
         raise HTTPException(
             status_code=404,
             detail=f"⚠️ 找不到連線中的充電樁：{charge_point_id}",
@@ -679,10 +686,14 @@ async def stop_transaction_by_charge_point(charge_point_id: str):
         """, (charge_point_id,))
         row = cursor.fetchone()
         if not row:
+        print(f"🔴【API異常】無進行中交易 charge_point_id={charge_point_id}")
             raise HTTPException(status_code=400, detail="⚠️ 無進行中交易")
         transaction_id = row[0]
+        print(f"🟢【API呼叫】找到進行中交易 transaction_id={transaction_id}")
     # 呼叫 OCPP StopTransaction
+    print(f"🟢【API呼叫】準備呼叫 cp.send_stop_transaction(transaction_id={transaction_id})")
     resp = await cp.send_stop_transaction(transaction_id)
+    print(f"🟢【API回應】呼叫 OCPP StopTransaction 完成，resp={resp}")
     return {"message": "已發送停止充電指令", "ocpp_response": str(resp)}
 
 
