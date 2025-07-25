@@ -368,8 +368,7 @@ class ChargePoint(OcppChargePoint):
             reason = kwargs.get("reason")
 
             if cp_id is None or transaction_id is None:
-            print(f"🔴【OCPP Handler】❌ StopTransaction 欄位缺失 | cp_id={cp_id} | transaction_id={transaction_id}")
-
+                print(f"🔴【OCPP Handler】❌ StopTransaction 欄位缺失 | cp_id={cp_id} | transaction_id={transaction_id}")
                 return StopTransactionPayload()
             print(f"🟢【OCPP Handler】UPDATE transactions，transaction_id={transaction_id}")
 
