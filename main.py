@@ -363,7 +363,8 @@ class ChargePoint(OcppChargePoint):
             cp_id = getattr(self, "id", None)
             print(f"🟢【OCPP Handler】StopTransaction self.id: {cp_id}")
 
-            transaction_id = kwargs.get("transaction_id") or kwargs.get("transactionId")
+            # transaction_id 統一成 str
+            transaction_id = str(kwargs.get("transaction_id") or kwargs.get("transactionId"))
             meter_stop = kwargs.get("meter_stop")
             timestamp = kwargs.get("timestamp") or datetime.utcnow().isoformat()
             reason = kwargs.get("reason")
@@ -373,7 +374,7 @@ class ChargePoint(OcppChargePoint):
                 return StopTransactionPayload()
 
             print(f"🟢【OCPP Handler】UPDATE transactions，transaction_id={transaction_id}")
- 
+   
             with sqlite3.connect("ocpp_data.db") as conn:
                 cursor = conn.cursor()
                 cursor.execute('''
@@ -394,16 +395,17 @@ class ChargePoint(OcppChargePoint):
                 conn.commit()
             print(f"🟢【OCPP Handler】交易已成功結束 transaction_id={transaction_id}")
 
-            # ➡️【加這一段】解除等待 future，並加強print
-            tid_str = str(transaction_id)
-            print(f"🟢【DEBUG】收到 StopTransaction，transaction_id 原始型別: {type(transaction_id)}, value: {transaction_id}")
-            print(f"🟢【DEBUG】目前 pending_stop_transactions 的 key: {[repr(k) + ' ' + str(type(k)) for k in pending_stop_transactions.keys()]}")
-            fut = pending_stop_transactions.get(tid_str)
+            # 【這裡關鍵】全部統一 str
+            print(f"[DEBUG] 收到 StopTransaction，transaction_id 型別: {type(transaction_id)}, value: {transaction_id}")
+            print(f"[DEBUG] 目前 pending_stop_transactions 的 key: {list(pending_stop_transactions.keys())}")
+
+            fut = pending_stop_transactions.get(transaction_id)
             if fut and not fut.done():
-                print(f"StopTransaction | 解除future? {tid_str} | 現有pending: {list(pending_stop_transactions.keys())}")
+                print(f"StopTransaction | 解除future? {transaction_id} | 現有pending: {list(pending_stop_transactions.keys())}")
                 fut.set_result({"meter_stop": meter_stop, "timestamp": timestamp, "reason": reason})
             else:
-                print(f"【未找到 future 或已done】transaction_id={tid_str}，pending={pending_stop_transactions}")
+                print(f"【未找到 future 或已done】transaction_id={transaction_id}，pending={pending_stop_transactions}")
+
         except Exception as e:
             print(f"🔴【OCPP Handler】❌ StopTransaction 儲存失敗：{e}")
 
