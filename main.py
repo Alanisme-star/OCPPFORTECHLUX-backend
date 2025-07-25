@@ -669,7 +669,7 @@ async def stop_transaction_by_charge_point(charge_point_id: str):
     cp = connected_charge_points.get(charge_point_id)
 
     if not cp:
-    print(f"🔴【API異常】找不到連線中的充電樁：{charge_point_id}")
+        print(f"🔴【API異常】找不到連線中的充電樁：{charge_point_id}")
         raise HTTPException(
             status_code=404,
             detail=f"⚠️ 找不到連線中的充電樁：{charge_point_id}",
