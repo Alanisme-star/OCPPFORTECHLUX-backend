@@ -644,6 +644,14 @@ class ChargePoint(OcppChargePoint):
         return MeterValuesPayload()
 
 
+    @on(Action.RemoteStopTransaction)
+    async def on_remote_stop_transaction(self, transaction_id, **kwargs):
+        # 充電樁端收到後，應立即主動送 StopTransaction
+        # 這裡回應 Central 系統 "Accepted" 表示已處理
+        print(f"✅ 收到遠端停止充電要求，transaction_id={transaction_id}")
+        return call_result.RemoteStopTransactionPayload(status="Accepted")
+
+
 @app.get("/api/charge-points/{charge_point_id}/live-status")
 def get_live_status(charge_point_id: str):
     data = live_status_cache.get(charge_point_id)
@@ -665,7 +673,6 @@ from fastapi import HTTPException
 @app.post("/api/charge-points/{charge_point_id}/stop")
 async def stop_transaction_by_charge_point(charge_point_id: str):
     print(f"🟢【API呼叫】收到停止充電API請求, charge_point_id = {charge_point_id}")
-    print(f"🟢【API呼叫】目前所有連線中的充電樁：{list(connected_charge_points.keys())}")
     cp = connected_charge_points.get(charge_point_id)
 
     if not cp:
@@ -689,11 +696,13 @@ async def stop_transaction_by_charge_point(charge_point_id: str):
             raise HTTPException(status_code=400, detail="⚠️ 無進行中交易")
         transaction_id = row[0]
         print(f"🟢【API呼叫】找到進行中交易 transaction_id={transaction_id}")
-    # 呼叫 OCPP StopTransaction
-    print(f"🟢【API呼叫】準備呼叫 cp.send_stop_transaction(transaction_id={transaction_id})")
-    resp = await cp.send_stop_transaction(transaction_id)
-    print(f"🟢【API回應】呼叫 OCPP StopTransaction 完成，resp={resp}")
-    return {"message": "已發送停止充電指令", "ocpp_response": str(resp)}
+
+    # 發送 RemoteStopTransaction
+    print(f"🟢【API呼叫】發送 RemoteStopTransaction 給充電樁")
+    req = call.RemoteStopTransactionPayload(transaction_id=transaction_id)
+    resp = await cp.call(req)
+    print(f"🟢【API回應】呼叫 RemoteStopTransaction 完成，resp={resp}")
+    return {"message": "已發送遠端停止充電指令", "ocpp_response": str(resp)}
 
 
 
