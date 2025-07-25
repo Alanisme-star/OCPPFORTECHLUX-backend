@@ -398,8 +398,11 @@ class ChargePoint(OcppChargePoint):
             # ➡️【加這一段】解除等待 future
             fut = pending_stop_transactions.get(transaction_id)
             if fut and not fut.done():
+                print(f"StopTransaction | 解除future? {transaction_id} | 現有pending: {list(pending_stop_transactions.keys())}")
                 fut.set_result({"meter_stop": meter_stop, "timestamp": timestamp, "reason": reason})
 
+            else:
+                print(f"【未找到 future 或已done】transaction_id={transaction_id}，pending={pending_stop_transactions}")
         except Exception as e:
             print(f"🔴【OCPP Handler】❌ StopTransaction 儲存失敗：{e}")
 
