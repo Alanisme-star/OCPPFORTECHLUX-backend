@@ -12,6 +12,8 @@ import asyncio
 import logging
 import sqlite3
 import uvicorn
+import asyncio
+pending_stop_transactions = {}
 
 logger = logging.getLogger(__name__)
 
@@ -352,16 +354,16 @@ class ChargePoint(OcppChargePoint):
         response = await self.call(request)
         return response
 
+
+
     @on(Action.StopTransaction)
     async def on_stop_transaction(self, **kwargs):
         try:
-
             print(f"🟢【OCPP Handler】StopTransaction kwargs: {kwargs}")
             cp_id = getattr(self, "id", None)
             print(f"🟢【OCPP Handler】StopTransaction self.id: {cp_id}")
 
-
-            # 只用底線欄位名
+            # transaction_id 兼容命名
             transaction_id = kwargs.get("transaction_id") or kwargs.get("transactionId")
             meter_stop = kwargs.get("meter_stop")
             timestamp = kwargs.get("timestamp") or datetime.utcnow().isoformat()
@@ -370,11 +372,11 @@ class ChargePoint(OcppChargePoint):
             if cp_id is None or transaction_id is None:
                 print(f"🔴【OCPP Handler】❌ StopTransaction 欄位缺失 | cp_id={cp_id} | transaction_id={transaction_id}")
                 return StopTransactionPayload()
+
             print(f"🟢【OCPP Handler】UPDATE transactions，transaction_id={transaction_id}")
 
             with sqlite3.connect("ocpp_data.db") as conn:
                 cursor = conn.cursor()
-                # 儲存停止交易資訊
                 cursor.execute('''
                     INSERT INTO stop_transactions (transaction_id, meter_stop, timestamp, reason)
                     VALUES (?, ?, ?, ?)
@@ -390,16 +392,18 @@ class ChargePoint(OcppChargePoint):
                     SET meter_stop = ?, stop_timestamp = ?, reason = ?
                     WHERE transaction_id = ?
                 ''', (meter_stop, timestamp, reason, transaction_id))
-
-
                 conn.commit()
             print(f"🟢【OCPP Handler】交易已成功結束 transaction_id={transaction_id}")
+
+            # ➡️【加這一段】解除等待 future
+            fut = pending_stop_transactions.get(transaction_id)
+            if fut and not fut.done():
+                fut.set_result({"meter_stop": meter_stop, "timestamp": timestamp, "reason": reason})
 
         except Exception as e:
             print(f"🔴【OCPP Handler】❌ StopTransaction 儲存失敗：{e}")
 
         return StopTransactionPayload()
-
 
 
 
@@ -697,12 +701,28 @@ async def stop_transaction_by_charge_point(charge_point_id: str):
         transaction_id = row[0]
         print(f"🟢【API呼叫】找到進行中交易 transaction_id={transaction_id}")
 
+
+    # 新增同步等待機制
+    loop = asyncio.get_event_loop()
+    fut = loop.create_future()
+    pending_stop_transactions[transaction_id] = fut
+
     # 發送 RemoteStopTransaction
     print(f"🟢【API呼叫】發送 RemoteStopTransaction 給充電樁")
     req = call.RemoteStopTransactionPayload(transaction_id=transaction_id)
     resp = await cp.call(req)
     print(f"🟢【API回應】呼叫 RemoteStopTransaction 完成，resp={resp}")
-    return {"message": "已發送遠端停止充電指令", "ocpp_response": str(resp)}
+
+    # 等待 StopTransaction 被觸發（最多 10 秒）
+    try:
+        stop_result = await asyncio.wait_for(fut, timeout=10)
+        print(f"🟢【API回應】StopTransaction 完成: {stop_result}")
+        return {"message": "充電已停止", "transaction_id": transaction_id, "stop_result": stop_result}
+    except asyncio.TimeoutError:
+        print(f"🔴【API異常】等待 StopTransaction 超時")
+        return JSONResponse(status_code=504, content={"message": "等待充電樁停止回覆逾時 (StopTransaction timeout)"})
+    finally:
+        pending_stop_transactions.pop(transaction_id, None)
 
 
 
@@ -2423,13 +2443,13 @@ async def debug_ids():
 def debug_connected_cp():
     return list(connected_charge_points.keys())
 
-
 @app.post("/api/charge-points/{charge_point_id}/stop")
 async def stop_transaction_by_charge_point(charge_point_id: str):
-    print(f"收到停止充電API請求, charge_point_id = {charge_point_id}")
+    print(f"🟢【API呼叫】收到停止充電API請求, charge_point_id = {charge_point_id}")
     cp = connected_charge_points.get(charge_point_id)
-    print(f"目前所有連線中的充電樁：{list(connected_charge_points.keys())}")
+
     if not cp:
+        print(f"🔴【API異常】找不到連線中的充電樁：{charge_point_id}")
         raise HTTPException(
             status_code=404,
             detail=f"⚠️ 找不到連線中的充電樁：{charge_point_id}",
@@ -2445,11 +2465,32 @@ async def stop_transaction_by_charge_point(charge_point_id: str):
         """, (charge_point_id,))
         row = cursor.fetchone()
         if not row:
+            print(f"🔴【API異常】無進行中交易 charge_point_id={charge_point_id}")
             raise HTTPException(status_code=400, detail="⚠️ 無進行中交易")
         transaction_id = row[0]
-    # 呼叫 OCPP StopTransaction
-    resp = await cp.send_stop_transaction(transaction_id)
-    return {"message": "已發送停止充電指令", "ocpp_response": str(resp)}
+        print(f"🟢【API呼叫】找到進行中交易 transaction_id={transaction_id}")
+
+    # 新增同步等待機制
+    loop = asyncio.get_event_loop()
+    fut = loop.create_future()
+    pending_stop_transactions[transaction_id] = fut
+
+    # 發送 RemoteStopTransaction
+    print(f"🟢【API呼叫】發送 RemoteStopTransaction 給充電樁")
+    req = call.RemoteStopTransactionPayload(transaction_id=transaction_id)
+    resp = await cp.call(req)
+    print(f"🟢【API回應】呼叫 RemoteStopTransaction 完成，resp={resp}")
+
+    # 等待 StopTransaction 被觸發（最多 10 秒）
+    try:
+        stop_result = await asyncio.wait_for(fut, timeout=10)
+        print(f"🟢【API回應】StopTransaction 完成: {stop_result}")
+        return {"message": "充電已停止", "transaction_id": transaction_id, "stop_result": stop_result}
+    except asyncio.TimeoutError:
+        print(f"🔴【API異常】等待 StopTransaction 超時")
+        return JSONResponse(status_code=504, content={"message": "等待充電樁停止回覆逾時 (StopTransaction timeout)"})
+    finally:
+        pending_stop_transactions.pop(transaction_id, None)
 
 
 @app.get("/api/devtools/last-transactions")
