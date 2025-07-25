@@ -2360,15 +2360,16 @@ from fastapi import HTTPException
 @app.post("/api/charge-points/{charge_point_id}/stop")
 async def stop_transaction_by_charge_point(charge_point_id: str):
     try:
-        print(f"收到停止充電API請求, charge_point_id = {charge_point_id}")
+        print(f"🟢【API呼叫】收到停止充電API請求, charge_point_id = {charge_point_id}")
         cp = connected_charge_points.get(charge_point_id)
-        print(f"目前所有連線中的充電樁：{list(connected_charge_points.keys())}")
         if not cp:
+            print(f"🔴【API異常】找不到連線中的充電樁：{charge_point_id}")
             raise HTTPException(
                 status_code=404,
                 detail=f"⚠️ 找不到連線中的充電樁：{charge_point_id}",
                 headers={"X-Connected-CPs": str(list(connected_charge_points.keys()))}
             )
+
         # 查詢進行中的 transaction_id
         with sqlite3.connect("ocpp_data.db") as conn:
             cursor = conn.cursor()
@@ -2379,16 +2380,26 @@ async def stop_transaction_by_charge_point(charge_point_id: str):
             """, (charge_point_id,))
             row = cursor.fetchone()
             if not row:
+                print(f"🔴【API異常】無進行中交易 charge_point_id={charge_point_id}")
                 raise HTTPException(status_code=400, detail="⚠️ 無進行中交易")
             transaction_id = row[0]
-        # 呼叫 OCPP StopTransaction
-        resp = await cp.send_stop_transaction(transaction_id)
-        return {"message": "已發送停止充電指令", "ocpp_response": str(resp)}
+            print(f"🟢【API呼叫】找到進行中交易 transaction_id={transaction_id}")
+
+        # 發送 RemoteStopTransaction，設定 60 秒 timeout
+        print(f"🟢【API呼叫】發送 RemoteStopTransaction 給充電樁")
+        req = call.RemoteStopTransactionPayload(transaction_id=transaction_id)
+        try:
+            resp = await asyncio.wait_for(cp.call(req), timeout=60)
+        except asyncio.TimeoutError:
+            print(f"🔴【API異常】等待充電樁回應逾時 (RemoteStopTransaction)")
+            raise HTTPException(status_code=504, detail="等待充電樁回應逾時")
+        print(f"🟢【API回應】呼叫 RemoteStopTransaction 完成，resp={resp}")
+        return {"message": "已發送遠端停止充電指令", "ocpp_response": str(resp)}
+
     except Exception as e:
-        import traceback
-        print("停止充電API發生例外：", e)
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"❌ 停止充電API內部錯誤: {str(e)}")
+        print(f"🔴【API異常】API 處理時例外: {e}")
+        raise HTTPException(status_code=500, detail=f"內部錯誤: {e}")
+
 
 
 
