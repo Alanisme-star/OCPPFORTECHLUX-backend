@@ -1459,26 +1459,6 @@ async def webhook(request: Request):
     return {"status": "ok"}
 
 
-@app.get("/api/users")
-async def list_users():
-    cursor.execute("SELECT id_tag, name, department, card_number FROM users")
-    rows = cursor.fetchall()
-    return JSONResponse(content=[
-        {"idTag": row[0], "name": row[1], "department": row[2], "cardNumber": row[3]} for row in rows
-    ])
-
-cursor.execute('''
-CREATE TABLE IF NOT EXISTS reservations (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    charge_point_id TEXT,
-    id_tag TEXT,
-    start_time TEXT,
-    end_time TEXT,
-    status TEXT  -- 'active', 'cancelled', 'completed'
-)
-''')
-conn.commit()
-
 
 @app.get("/api/users/{id_tag}")
 async def get_user(id_tag: str = Path(...)):
@@ -1494,25 +1474,6 @@ async def get_user(id_tag: str = Path(...)):
     }
 
 
-@app.post("/api/users")
-async def add_user(data: dict = Body(...)):
-    id_tag = data.get("idTag")
-    name = data.get("name")
-    department = data.get("department")
-    card_number = data.get("cardNumber")
-
-    if not id_tag:
-        raise HTTPException(status_code=400, detail="idTag is required")
-
-    try:
-        cursor.execute('''
-            INSERT INTO users (id_tag, name, department, card_number)
-            VALUES (?, ?, ?, ?)
-        ''', (id_tag, name, department, card_number))
-        conn.commit()
-    except sqlite3.IntegrityError:
-        raise HTTPException(status_code=409, detail="User already exists")
-    return {"message": "User added successfully"}
 
 @app.post("/api/reservations")
 async def create_reservation(data: dict = Body(...)):
