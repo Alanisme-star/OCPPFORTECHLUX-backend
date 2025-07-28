@@ -356,6 +356,21 @@ class ChargePoint(OcppChargePoint):
 
 
 
+    async def send_remote_start_transaction(self, id_tag: str, connector_id: int = 1):
+        from ocpp.v16 import call
+
+        request = call.RemoteStartTransactionPayload(
+            id_tag=id_tag,
+            connector_id=connector_id
+        )
+        response = await self.call(request)
+        return response
+
+
+
+
+
+
     @on(Action.StopTransaction)
     async def on_stop_transaction(self, **kwargs):
         try:
@@ -732,6 +747,27 @@ async def stop_transaction_by_charge_point(charge_point_id: str):
         pending_stop_transactions.pop(str(transaction_id), None)
 
 
+@app.post("/api/charge-points/{charge_point_id}/start")
+async def start_transaction_by_charge_point(charge_point_id: str, data: dict = Body(...)):
+    id_tag = data.get("idTag")
+    connector_id = data.get("connectorId", 1)
+
+    if not id_tag:
+        raise HTTPException(status_code=400, detail="缺少 idTag")
+
+    cp = connected_charge_points.get(charge_point_id)
+    if not cp:
+        raise HTTPException(
+            status_code=404,
+            detail=f"⚠️ 找不到連線中的充電樁：{charge_point_id}",
+            headers={"X-Connected-CPs": str(list(connected_charge_points.keys()))}
+        )
+
+    # 發送 RemoteStartTransaction
+    print(f"🟢【API】遠端啟動充電 | CP={charge_point_id} | idTag={id_tag} | connector={connector_id}")
+    response = await cp.send_remote_start_transaction(id_tag=id_tag, connector_id=connector_id)
+    print(f"🟢【API】回應 RemoteStartTransaction: {response}")
+    return {"message": "已送出啟動充電請求", "response": response}
 
 
 
