@@ -1550,11 +1550,7 @@ async def update_user(id_tag: str = Path(...), data: dict = Body(...)):
     conn.commit()
     return {"message": "User updated successfully"}
 
-@app.delete("/api/users/{id_tag}")
-async def delete_user(id_tag: str = Path(...)):
-    cursor.execute("DELETE FROM users WHERE id_tag = ?", (id_tag,))
-    conn.commit()
-    return {"message": "User deleted successfully"}
+
 
 
 @app.get("/api/summary/pricing-matrix")
@@ -1962,49 +1958,7 @@ async def root():
     return {"status": "API is running"}
 
 
-# 取得
-@app.get("/api/weekly-pricing")
-async def get_weekly_pricing(season: str = Query(...)):
-    cursor.execute('''
-        SELECT id, season, weekday, type, start_time, end_time, price
-        FROM weekly_pricing
-        WHERE season = ?
-        ORDER BY weekday, start_time
-    ''', (season,))
-    rows = cursor.fetchall()
-    return [
-        {
-            "id": r[0], "season": r[1], "weekday": r[2],
-            "type": r[3], "startTime": r[4], "endTime": r[5], "price": r[6]
-        } for r in rows
-    ]
 
-# 新增
-@app.post("/api/weekly-pricing")
-async def add_weekly_pricing(data: dict = Body(...)):
-    cursor.execute('''
-        INSERT INTO weekly_pricing (season, weekday, type, start_time, end_time, price)
-        VALUES (?, ?, ?, ?, ?, ?)
-    ''', (
-        data["season"], data["weekday"], data["type"],
-        data["startTime"], data["endTime"], float(data["price"])
-    ))
-    conn.commit()
-    return {"message": "新增成功"}
-
-# 更新
-@app.put("/api/weekly-pricing/{id}")
-async def update_weekly_pricing(id: int = Path(...), data: dict = Body(...)):
-    cursor.execute('''
-        UPDATE weekly_pricing
-        SET season = ?, weekday = ?, type = ?, start_time = ?, end_time = ?, price = ?
-        WHERE id = ?
-    ''', (
-        data["season"], data["weekday"], data["type"],
-        data["startTime"], data["endTime"], float(data["price"]), id
-    ))
-    conn.commit()
-    return {"message": "更新成功"}
 
 # 刪除
 @app.delete("/api/weekly-pricing/{id}")
