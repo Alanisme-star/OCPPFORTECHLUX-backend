@@ -840,12 +840,6 @@ def get_latest_current(charge_point_id: str):
 
    
 
-   
-
-
- 
-
-
 @app.get("/api/charge-points/{charge_point_id}/status")
 def get_charge_point_status(charge_point_id: str):
     status = charging_point_status.get(charge_point_id)
@@ -1450,14 +1444,6 @@ async def create_reservation(data: dict = Body(...)):
     conn.commit()
     return {"message": "Reservation created"}
 
-@app.get("/api/reservations")
-async def list_reservations():
-    cursor.execute("SELECT * FROM reservations")
-    rows = cursor.fetchall()
-    return [{
-        "id": r[0], "chargePointId": r[1], "idTag": r[2],
-        "startTime": r[3], "endTime": r[4], "status": r[5]
-    } for r in rows]
 
 @app.get("/api/reservations/{id}")
 async def get_reservation(id: int = Path(...)):
