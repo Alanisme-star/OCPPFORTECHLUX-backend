@@ -2269,14 +2269,19 @@ def get_card_balance(cardId: str):
 
 @app.get("/api/current_price")
 def get_current_price():
-    from datetime import datetime
-    today = datetime.utcnow().strftime("%Y-%m-%d")
+    from datetime import datetime, timedelta
+
+    now = datetime.utcnow() + timedelta(hours=8)
+    today = now.strftime("%Y-%m-%d")
+    
+    cursor = conn.cursor()
     cursor.execute("SELECT price_per_kwh FROM daily_pricing WHERE date = ?", (today,))
     row = cursor.fetchone()
     if row:
         return {"price": row[0]}
     else:
         raise HTTPException(status_code=404, detail="今日無電價設定")
+
 
 
 
