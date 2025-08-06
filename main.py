@@ -2256,13 +2256,13 @@ async def stop_transaction_by_charge_point(charge_point_id: str):
 
 
 # ✅ API 1：取得卡片餘額
-@app.get("/api/card_balance/{card_id}")
-def get_card_balance(card_id: str):
+@app.get("/api/card-balance/{cardId}")
+def get_card_balance(cardId: str):
     cursor = conn.cursor()
-    cursor.execute("SELECT balance FROM cards WHERE card_id = ?", (card_id,))
+    cursor.execute("SELECT balance FROM cards WHERE cardId = ?", (cardId,))
     result = cursor.fetchone()
     if result:
-        return {"card_id": card_id, "balance": result[0]}
+        return {"cardId": cardId, "balance": result[0]}
     else:
         raise HTTPException(status_code=404, detail="Card not found")
 
