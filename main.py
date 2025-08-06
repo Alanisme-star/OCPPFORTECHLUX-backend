@@ -2267,16 +2267,17 @@ def get_card_balance(card_id: str):
         raise HTTPException(status_code=404, detail="Card not found")
 
 # ✅ API 2：取得目前電價（根據現在時間查詢 tariffs 表）
-@app.get("/api/current_tariff")
-def get_current_tariff():
+@app.get("/api/current_price")
+def get_current_price():
     now = datetime.now().time()
     cursor = conn.cursor()
     cursor.execute("SELECT price FROM tariffs WHERE start_time <= ? AND end_time > ?", (now, now))
     result = cursor.fetchone()
     if result:
-        return {"current_tariff": result[0]}
+        return {"current_price": result[0]}
     else:
         raise HTTPException(status_code=404, detail="No tariff found for current time")
+
 
 
 
