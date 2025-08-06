@@ -37,6 +37,8 @@ from ocpp.v16.enums import Action, RegistrationStatus
 from ocpp.routing import on
 from urllib.parse import urlparse, parse_qs
 from reportlab.pdfgen import canvas
+from fastapi import HTTPException
+from datetime import datetime
 
 app = FastAPI()
 
@@ -2251,6 +2253,31 @@ async def stop_transaction_by_charge_point(charge_point_id: str):
         return JSONResponse(status_code=504, content={"message": "等待充電樁停止回覆逾時 (StopTransaction timeout)"})
     finally:
         pending_stop_transactions.pop(transaction_id, None)
+
+
+# ✅ API 1：取得卡片餘額
+@app.get("/api/card_balance/{card_id}")
+def get_card_balance(card_id: str):
+    cursor = conn.cursor()
+    cursor.execute("SELECT balance FROM cards WHERE card_id = ?", (card_id,))
+    result = cursor.fetchone()
+    if result:
+        return {"card_id": card_id, "balance": result[0]}
+    else:
+        raise HTTPException(status_code=404, detail="Card not found")
+
+# ✅ API 2：取得目前電價（根據現在時間查詢 tariffs 表）
+@app.get("/api/current_tariff")
+def get_current_tariff():
+    now = datetime.now().time()
+    cursor = conn.cursor()
+    cursor.execute("SELECT price FROM tariffs WHERE start_time <= ? AND end_time > ?", (now, now))
+    result = cursor.fetchone()
+    if result:
+        return {"current_tariff": result[0]}
+    else:
+        raise HTTPException(status_code=404, detail="No tariff found for current time")
+
 
 
 @app.get("/api/devtools/last-transactions")
