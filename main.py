@@ -2403,26 +2403,32 @@ class SimulateTransaction(BaseModel):
 
 @app.post("/api/simulate_transaction")
 def simulate_transaction(data: SimulateTransaction):
-    cursor = conn.cursor()
+    try:
+        cursor = conn.cursor()
 
-    # 檢查卡片是否存在
-    cursor.execute("SELECT balance FROM cards WHERE card_id = ?", (data.card_id,))
-    row = cursor.fetchone()
-    if row is None:
-        raise HTTPException(status_code=404, detail="卡片不存在")
+        # 檢查卡片是否存在
+        cursor.execute("SELECT balance FROM cards WHERE card_id = ?", (data.card_id,))
+        row = cursor.fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="卡片不存在")
 
-    # 寫入交易紀錄
-    cursor.execute("""
-        INSERT INTO transactions (card_id, energy_kwh, cost)
-        VALUES (?, ?, ?)
-    """, (data.card_id, data.energy_kwh, data.cost))
+        # 寫入交易紀錄
+        cursor.execute("""
+            INSERT INTO transactions (card_id, energy_kwh, cost)
+            VALUES (?, ?, ?)
+        """, (data.card_id, data.energy_kwh, data.cost))
 
-    # 扣款更新餘額
-    cursor.execute("""
-        UPDATE cards SET balance = balance - ? WHERE card_id = ?
-    """, (data.cost, data.card_id))
+        # 扣款更新餘額
+        cursor.execute("""
+            UPDATE cards SET balance = balance - ? WHERE card_id = ?
+        """, (data.cost, data.card_id))
 
-    conn.commit()
-    return {"message": "模擬交易成功"}
+        conn.commit()
+        return {"message": "模擬交易成功"}
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
 
 
