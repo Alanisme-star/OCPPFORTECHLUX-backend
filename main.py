@@ -2334,6 +2334,16 @@ class SimulateTransaction(BaseModel):
     energy_kwh: float
     cost: float
 
+
+
+from pydantic import BaseModel
+from fastapi import HTTPException
+
+class SimulateTransaction(BaseModel):
+    card_id: str
+    energy_kwh: float
+    cost: float
+
 @app.post("/api/simulate_transaction")
 def simulate_transaction(data: SimulateTransaction):
     card_id = data.card_id
@@ -2342,12 +2352,13 @@ def simulate_transaction(data: SimulateTransaction):
 
     cursor = conn.cursor()
 
-    # 確認卡片是否存在
+    # 檢查卡片是否存在
     cursor.execute("SELECT balance FROM cards WHERE card_id = ?", (card_id,))
-    if cursor.fetchone() is None:
+    row = cursor.fetchone()
+    if row is None:
         raise HTTPException(status_code=404, detail="卡片不存在")
 
-    # 插入交易紀錄
+    # 寫入交易資料
     cursor.execute("""
         INSERT INTO transactions (card_id, energy_kwh, cost)
         VALUES (?, ?, ?)
@@ -2361,6 +2372,7 @@ def simulate_transaction(data: SimulateTransaction):
 
     conn.commit()
     return {"message": "模擬交易成功"}
+
 
 
 
