@@ -2386,6 +2386,18 @@ else:
     print(f"伺服器回應內容：{res.text}")
 
 
+from pydantic import BaseModel
+
+class SimulateTransaction(BaseModel):
+    card_id: str
+    energy_kwh: float
+    cost: float
+
+@app.post("/api/simulate_transaction")
+def simulate_transaction(data: SimulateTransaction):
+    # 實作內容
+
+
 
 
 
