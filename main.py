@@ -2336,47 +2336,44 @@ class SimulateTransaction(BaseModel):
 
 
 
-import requests
-import time
-
-# 後端網址
-API_BASE = "https://ocppfortechlux-backend.onrender.com"
-
-# 測試用卡片
-card_id = "6678B3EB"
-energy_kwh = 2.5
-cost = 25.0
-
-# 查詢原始餘額
-print("取得原始餘額...")
-r1 = requests.get(f"{API_BASE}/api/card_balance/{card_id}")
-if r1.status_code == 200:
-    old_balance = r1.json()["balance"]
-    print(f"🔸 原始餘額：{old_balance} 元")
-else:
-    print("❌ 查詢餘額失敗")
-    exit()
-
-# 模擬交易
-print("模擬充電交易中...")
-payload = {
-    "card_id": card_id,
-    "energy_kwh": energy_kwh,
-    "cost": cost
-}
-r2 = requests.post(f"{API_BASE}/api/simulate_transaction", json=payload)
-if r2.status_code == 200:
-    print("✅ 交易完成，等待餘額更新...")
-    time.sleep(2)
-    r3 = requests.get(f"{API_BASE}/api/card_balance/{card_id}")
-    new_balance = r3.json()["balance"]
-    print(f"🔹 新餘額：{new_balance} 元")
-    print(f"🧮 差額：{old_balance - new_balance:.2f} 元")
-else:
-    print("❌ 模擬交易失敗")
-    print("伺服器回應：", r2.text)
 
 
+from pydantic import BaseModel
+from fastapi import HTTPException
+
+class SimulateTransaction(BaseModel):
+    card_id: str
+    energy_kwh: float
+    cost: float
+
+@app.post("/api/simulate_transaction")
+def simulate_transaction(data: SimulateTransaction):
+    card_id = data.card_id
+    energy_kwh = data.energy_kwh
+    cost = data.cost
+
+    cursor = conn.cursor()
+
+    # 驗證卡片是否存在
+    cursor.execute("SELECT balance FROM cards WHERE card_id = ?", (card_id,))
+    row = cursor.fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="卡片不存在")
+
+    # 寫入交易資料
+    cursor.execute("""
+        INSERT INTO transactions (card_id, energy_kwh, cost)
+        VALUES (?, ?, ?)
+    """, (card_id, energy_kwh, cost))
+
+    # 扣除卡片餘額
+    cursor.execute("""
+        UPDATE cards SET balance = balance - ?
+        WHERE card_id = ?
+    """, (cost, card_id))
+
+    conn.commit()
+    return {"message": "模擬交易成功"}
 
 
 
