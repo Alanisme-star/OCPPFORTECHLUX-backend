@@ -39,6 +39,7 @@ from urllib.parse import urlparse, parse_qs
 from reportlab.pdfgen import canvas
 from fastapi import HTTPException
 from datetime import datetime
+from fastapi import APIRouter
 
 app = FastAPI()
 
@@ -2255,15 +2256,17 @@ async def stop_transaction_by_charge_point(charge_point_id: str):
         pending_stop_transactions.pop(transaction_id, None)
 
 
-# ✅ API 1：取得卡片餘額
-@app.get("/api/card-balance/{cardId}")
-def get_card_balance(cardId: str):
+@app.get("/api/card_balance/{card_id}")
+def get_card_balance(card_id: str):
+    print(f"🔍 查詢卡片餘額，卡片 ID：{card_id}")
     cursor = conn.cursor()
-    cursor.execute("SELECT balance FROM cards WHERE cardId = ?", (cardId,))
+    cursor.execute("SELECT balance FROM cards WHERE card_id = ?", (card_id,))
     result = cursor.fetchone()
     if result:
-        return {"cardId": cardId, "balance": result[0]}
+        print(f"✅ 找到卡片 {card_id}，餘額為 {result[0]}")
+        return {"card_id": card_id, "balance": result[0]}
     else:
+        print(f"❌ 卡片 {card_id} 未找到")
         raise HTTPException(status_code=404, detail="Card not found")
 
 
@@ -2315,20 +2318,28 @@ def last_transactions():
         return {"last_transactions": result}
 
 
-@app.get("/api/seed")
+@app.post("/api/seed")
 def seed_data():
-    from datetime import datetime
+    print("⚙️ 執行 /api/seed 建立測試資料")
+    cursor = conn.cursor()
+
+    # 測試卡片資料
     card_id = "6678B3EB"
     balance = 300.0
-    price = 4.5
-    today = datetime.utcnow().astimezone(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
+    cursor.execute("INSERT OR IGNORE INTO cards (card_id, balance) VALUES (?, ?)", (card_id, balance))
 
-    # 插入卡片
-    cursor.execute("INSERT OR REPLACE INTO cards (card_id, balance) VALUES (?, ?)", (card_id, balance))
-    # 插入當日電價
-    cursor.execute("INSERT OR REPLACE INTO daily_pricing (date, price_per_kwh) VALUES (?, ?)", (today, price))
+    # 當天電價資料
+    today = date.today().isoformat()
+    price = 4.5
+    cursor.execute("INSERT OR IGNORE INTO tariffs (date, price) VALUES (?, ?)", (today, price))
+
     conn.commit()
-    return {"status": "✅ 測試資料已注入", "card_id": card_id, "price": price, "date": today}
+    return {
+        "status": "✅ 測試資料已注入",
+        "card_id": card_id,
+        "price": price,
+        "date": today
+    }
 
 
 
