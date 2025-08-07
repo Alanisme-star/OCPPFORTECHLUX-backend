@@ -165,6 +165,24 @@ DB_FILE = os.path.join(BASE_DIR, "ocpp_data.db")  # ✅ 固定資料庫絕對路
 conn = sqlite3.connect(DB_FILE, check_same_thread=False)
 cursor = conn.cursor()
 
+# 正確建立 transactions 資料表
+cursor = conn.cursor()
+cursor.execute("""
+    DROP TABLE IF EXISTS transactions
+""")
+cursor.execute("""
+    CREATE TABLE transactions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        card_id TEXT,
+        energy_kwh REAL,
+        cost REAL,
+        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+""")
+conn.commit()
+
+
+
 # ✅ 確保資料表存在（若不存在則建立）
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS charge_points (
@@ -239,19 +257,7 @@ cursor.execute('INSERT OR IGNORE INTO cards (card_id, balance) VALUES (?, ?)', (
 cursor.execute('INSERT OR IGNORE INTO cards (card_id, balance) VALUES (?, ?)', ("USER999", 500))
 conn.commit()
 
-cursor.execute('''
-CREATE TABLE IF NOT EXISTS transactions (
-    transaction_id INTEGER PRIMARY KEY,
-    charge_point_id TEXT,
-    connector_id INTEGER,
-    id_tag TEXT,
-    meter_start INTEGER,
-    start_timestamp TEXT,
-    meter_stop INTEGER,
-    stop_timestamp TEXT,
-    reason TEXT
-)
-''')
+
 
 
 cursor.execute('''
