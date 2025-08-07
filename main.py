@@ -2339,7 +2339,6 @@ class SimulateTransaction(BaseModel):
 
 
 from pydantic import BaseModel
-from fastapi import HTTPException
 
 class SimulateTransaction(BaseModel):
     card_id: str
@@ -2366,7 +2365,7 @@ def simulate_transaction(data: SimulateTransaction):
         VALUES (?, ?, ?)
     """, (card_id, energy_kwh, cost))
 
-    # 扣除卡片餘額
+    # 扣款
     cursor.execute("""
         UPDATE cards SET balance = balance - ?
         WHERE card_id = ?
