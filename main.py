@@ -2320,21 +2320,40 @@ def last_transactions():
         return {"last_transactions": result}
 
 
+
+
+
+
+
+
+
+from pydantic import BaseModel
+
+class SimulateTransaction(BaseModel):
+    card_id: str
+    energy_kwh: float
+    cost: float
+
 @app.post("/api/simulate_transaction")
-def simulate_transaction(data: dict):
-    card_id = data.get("card_id")
-    energy_kwh = data.get("energy_kwh")
-    cost = data.get("cost")
+def simulate_transaction(data: SimulateTransaction):
+    card_id = data.card_id
+    energy_kwh = data.energy_kwh
+    cost = data.cost
 
     cursor = conn.cursor()
 
-    # 插入一筆交易
+    # 確認卡片是否存在
+    cursor.execute("SELECT balance FROM cards WHERE card_id = ?", (card_id,))
+    if cursor.fetchone() is None:
+        raise HTTPException(status_code=404, detail="卡片不存在")
+
+    # 插入交易紀錄
     cursor.execute("""
         INSERT INTO transactions (card_id, energy_kwh, cost)
         VALUES (?, ?, ?)
     """, (card_id, energy_kwh, cost))
 
-    # 從卡片扣款
+    # 扣款
     cursor.execute("""
         UPDATE cards SET balance = balance - ?
         WHERE card_id = ?
@@ -2342,6 +2361,9 @@ def simulate_transaction(data: dict):
 
     conn.commit()
     return {"message": "模擬交易成功"}
+
+
+
 
 
 
