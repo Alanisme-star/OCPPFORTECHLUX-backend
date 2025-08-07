@@ -2345,34 +2345,46 @@ class SimulateTransaction(BaseModel):
     energy_kwh: float
     cost: float
 
-@app.post("/api/simulate_transaction")
-def simulate_transaction(data: SimulateTransaction):
-    card_id = data.card_id
-    energy_kwh = data.energy_kwh
-    cost = data.cost
 
-    cursor = conn.cursor()
 
-    # 驗證卡片是否存在
-    cursor.execute("SELECT balance FROM cards WHERE card_id = ?", (card_id,))
-    row = cursor.fetchone()
-    if row is None:
-        raise HTTPException(status_code=404, detail="卡片不存在")
+import requests
+import time
 
-    # 寫入交易資料
-    cursor.execute("""
-        INSERT INTO transactions (card_id, energy_kwh, cost)
-        VALUES (?, ?, ?)
-    """, (card_id, energy_kwh, cost))
+BASE_URL = "https://ocppfortechlux-backend.onrender.com"
+card_id = "6678B3EB"
+charging_kwh = 2.5
+price_per_kwh = 10.0
+cost = charging_kwh * price_per_kwh
 
-    # 扣款
-    cursor.execute("""
-        UPDATE cards SET balance = balance - ?
-        WHERE card_id = ?
-    """, (cost, card_id))
+print("取得原始餘額...")
+r1 = requests.get(f"{BASE_URL}/api/card_balance/{card_id}")
+if r1.status_code == 200:
+    old_balance = r1.json()["balance"]
+    print(f"🔸 原始餘額：{old_balance} 元")
+else:
+    print("❌ 查詢餘額失敗")
+    exit()
 
-    conn.commit()
-    return {"message": "模擬交易成功"}
+print("模擬充電交易中...")
+tx_payload = {
+    "card_id": card_id,
+    "energy_kwh": charging_kwh,
+    "cost": cost
+}
+res = requests.post(f"{BASE_URL}/api/simulate_transaction", json=tx_payload)
+
+if res.status_code == 200:
+    print("✅ 交易完成，等待餘額更新...")
+    time.sleep(2)
+    r3 = requests.get(f"{BASE_URL}/api/card_balance/{card_id}")
+    new_balance = r3.json()["balance"]
+    print(f"🔹 新餘額：{new_balance} 元")
+    print(f"🧮 差額：{old_balance - new_balance:.2f} 元")
+else:
+    print("❌ 模擬交易失敗")
+    print(f"伺服器回應碼：{res.status_code}")
+    print(f"伺服器回應內容：{res.text}")
+
 
 
 
