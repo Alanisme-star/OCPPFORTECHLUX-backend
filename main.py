@@ -39,7 +39,8 @@ from urllib.parse import urlparse, parse_qs
 from reportlab.pdfgen import canvas
 from fastapi import HTTPException
 from datetime import datetime
-from fastapi import APIRouter
+
+
 
 app = FastAPI()
 
@@ -2283,7 +2284,8 @@ def get_current_price():
     if row:
         return {"price": row[0]}
     else:
-        raise HTTPException(status_code=404, detail="今日無電價設定")
+        return {"price": 10.0}  # ✅ 預設電價
+
 
 
 
@@ -2317,29 +2319,6 @@ def last_transactions():
         ]
         return {"last_transactions": result}
 
-
-@app.post("/api/seed")
-def seed_data():
-    print("⚙️ 執行 /api/seed 建立測試資料")
-    cursor = conn.cursor()
-
-    # 測試卡片資料
-    card_id = "6678B3EB"
-    balance = 300.0
-    cursor.execute("INSERT OR IGNORE INTO cards (card_id, balance) VALUES (?, ?)", (card_id, balance))
-
-    # 當天電價資料
-    today = date.today().isoformat()
-    price = 4.5
-    cursor.execute("INSERT OR IGNORE INTO tariffs (date, price) VALUES (?, ?)", (today, price))
-
-    conn.commit()
-    return {
-        "status": "✅ 測試資料已注入",
-        "card_id": card_id,
-        "price": price,
-        "date": today
-    }
 
 
 
