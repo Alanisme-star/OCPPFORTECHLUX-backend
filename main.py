@@ -2315,6 +2315,23 @@ def last_transactions():
         return {"last_transactions": result}
 
 
+@app.get("/api/seed")
+def seed_data():
+    from datetime import datetime
+    card_id = "6678B3EB"
+    balance = 300.0
+    price = 4.5
+    today = datetime.utcnow().astimezone(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
+
+    # 插入卡片
+    cursor.execute("INSERT OR REPLACE INTO cards (card_id, balance) VALUES (?, ?)", (card_id, balance))
+    # 插入當日電價
+    cursor.execute("INSERT OR REPLACE INTO daily_pricing (date, price_per_kwh) VALUES (?, ?)", (today, price))
+    conn.commit()
+    return {"status": "✅ 測試資料已注入", "card_id": card_id, "price": price, "date": today}
+
+
+
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=10000, reload=True)
