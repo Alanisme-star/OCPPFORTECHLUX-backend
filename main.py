@@ -38,7 +38,6 @@ from ocpp.routing import on
 from urllib.parse import urlparse, parse_qs
 from reportlab.pdfgen import canvas
 from fastapi import HTTPException
-from datetime import datetime
 
 
 
@@ -2263,38 +2262,6 @@ async def stop_transaction_by_charge_point(charge_point_id: str):
         pending_stop_transactions.pop(transaction_id, None)
 
 
-@app.get("/api/card_balance/{card_id}")
-def get_card_balance(card_id: str):
-    print(f"🔍 查詢卡片餘額，卡片 ID：{card_id}")
-    cursor = conn.cursor()
-    cursor.execute("SELECT balance FROM cards WHERE card_id = ?", (card_id,))
-    result = cursor.fetchone()
-    if result:
-        print(f"✅ 找到卡片 {card_id}，餘額為 {result[0]}")
-        return {"card_id": card_id, "balance": result[0]}
-    else:
-        print(f"❌ 卡片 {card_id} 未找到")
-        raise HTTPException(status_code=404, detail="Card not found")
-
-
-@app.get("/api/current_price")
-def get_current_price():
-    from datetime import datetime, timedelta
-
-    now = datetime.utcnow() + timedelta(hours=8)
-    today = now.strftime("%Y-%m-%d")
-    
-    cursor = conn.cursor()
-    cursor.execute("SELECT price_per_kwh FROM daily_pricing WHERE date = ?", (today,))
-    row = cursor.fetchone()
-    if row:
-        return {"price": row[0]}
-    else:
-        return {"price": 10.0}  # ✅ 預設電價
-
-
-
-
 
 
 @app.get("/api/devtools/last-transactions")
@@ -2327,114 +2294,11 @@ def last_transactions():
 
 
 
-
-
-
-
-
-
-from pydantic import BaseModel
-
-class SimulateTransaction(BaseModel):
-    card_id: str
-    energy_kwh: float
-    cost: float
-
-
-
-
-
-from pydantic import BaseModel
-
-class SimulateTransaction(BaseModel):
-    card_id: str
-    energy_kwh: float
-    cost: float
-
-
-
-import requests
-import time
-
-BASE_URL = "https://ocppfortechlux-backend.onrender.com"
-card_id = "6678B3EB"
-charging_kwh = 2.5
-price_per_kwh = 10.0
-cost = charging_kwh * price_per_kwh
-
-print("取得原始餘額...")
-r1 = requests.get(f"{BASE_URL}/api/card_balance/{card_id}")
-if r1.status_code == 200:
-    old_balance = r1.json()["balance"]
-    print(f"🔸 原始餘額：{old_balance} 元")
-else:
-    print("❌ 查詢餘額失敗")
-    exit()
-
-print("模擬充電交易中...")
-tx_payload = {
-    "card_id": card_id,
-    "energy_kwh": charging_kwh,
-    "cost": cost
-}
-res = requests.post(f"{BASE_URL}/api/simulate_transaction", json=tx_payload)
-
-if res.status_code == 200:
-    print("✅ 交易完成，等待餘額更新...")
-    time.sleep(2)
-    r3 = requests.get(f"{BASE_URL}/api/card_balance/{card_id}")
-    new_balance = r3.json()["balance"]
-    print(f"🔹 新餘額：{new_balance} 元")
-    print(f"🧮 差額：{old_balance - new_balance:.2f} 元")
-else:
-    print("❌ 模擬交易失敗")
-    print(f"伺服器回應碼：{res.status_code}")
-    print(f"伺服器回應內容：{res.text}")
-
-
-
-
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=10000, reload=True)
 # force deploy trigger
 
 
 
-from pydantic import BaseModel
-
-class SimulateTransaction(BaseModel):
-    card_id: str
-    energy_kwh: float
-    cost: float
-
-@app.post("/api/simulate_transaction")
-def simulate_transaction(data: SimulateTransaction):
-    try:
-        cursor = conn.cursor()
-
-        # 檢查卡片是否存在
-        cursor.execute("SELECT balance FROM cards WHERE card_id = ?", (data.card_id,))
-        row = cursor.fetchone()
-        if row is None:
-            raise HTTPException(status_code=404, detail="卡片不存在")
-
-        # 寫入交易紀錄
-        cursor.execute("""
-            INSERT INTO transactions (card_id, energy_kwh, cost)
-            VALUES (?, ?, ?)
-        """, (data.card_id, data.energy_kwh, data.cost))
-
-        # 扣款更新餘額
-        cursor.execute("""
-            UPDATE cards SET balance = balance - ? WHERE card_id = ?
-        """, (data.cost, data.card_id))
-
-        conn.commit()
-        return {"message": "模擬交易成功"}
-
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
 
 
