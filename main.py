@@ -2320,6 +2320,28 @@ def last_transactions():
         return {"last_transactions": result}
 
 
+@app.post("/api/simulate_transaction")
+def simulate_transaction(data: dict):
+    card_id = data.get("card_id")
+    energy_kwh = data.get("energy_kwh")
+    cost = data.get("cost")
+
+    cursor = conn.cursor()
+
+    # 插入一筆交易
+    cursor.execute("""
+        INSERT INTO transactions (card_id, energy_kwh, cost)
+        VALUES (?, ?, ?)
+    """, (card_id, energy_kwh, cost))
+
+    # 從卡片扣款
+    cursor.execute("""
+        UPDATE cards SET balance = balance - ?
+        WHERE card_id = ?
+    """, (cost, card_id))
+
+    conn.commit()
+    return {"message": "模擬交易成功"}
 
 
 
