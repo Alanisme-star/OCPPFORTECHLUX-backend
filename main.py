@@ -37,9 +37,6 @@ from ocpp.v16.enums import Action, RegistrationStatus
 from ocpp.routing import on
 from urllib.parse import urlparse, parse_qs
 from reportlab.pdfgen import canvas
-from fastapi import HTTPException
-
-
 
 app = FastAPI()
 
@@ -127,7 +124,7 @@ async def websocket_endpoint(websocket: WebSocket, charge_point_id: str):
         await cp.start()
 
         # 其他後續處理（如有）
-        await on_connect(websocket, charge_point_id)
+
 
     except WebSocketDisconnect:
         logger.warning(f"⚠️ Disconnected: {charge_point_id}")
@@ -163,24 +160,6 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_FILE = os.path.join(BASE_DIR, "ocpp_data.db")  # ✅ 固定資料庫絕對路徑
 conn = sqlite3.connect(DB_FILE, check_same_thread=False)
 cursor = conn.cursor()
-
-# 正確建立 transactions 資料表
-cursor = conn.cursor()
-cursor.execute("""
-    DROP TABLE IF EXISTS transactions
-""")
-cursor.execute("""
-    CREATE TABLE transactions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        card_id TEXT,
-        energy_kwh REAL,
-        cost REAL,
-        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-    )
-""")
-conn.commit()
-
-
 
 # ✅ 確保資料表存在（若不存在則建立）
 cursor.execute("""
@@ -241,11 +220,14 @@ cursor.execute("""
     CREATE TABLE IF NOT EXISTS payments (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         transaction_id INTEGER,
-        charge_point_id TEXT,
-        amount REAL,
+        base_fee REAL,
+        energy_fee REAL,
+        overuse_fee REAL,
+        total_amount REAL,
         paid_at TEXT
     )
 """)
+
 
 conn.commit()
 
@@ -256,7 +238,19 @@ cursor.execute('INSERT OR IGNORE INTO cards (card_id, balance) VALUES (?, ?)', (
 cursor.execute('INSERT OR IGNORE INTO cards (card_id, balance) VALUES (?, ?)', ("USER999", 500))
 conn.commit()
 
-
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS transactions (
+    transaction_id INTEGER PRIMARY KEY,
+    charge_point_id TEXT,
+    connector_id INTEGER,
+    id_tag TEXT,
+    meter_start INTEGER,
+    start_timestamp TEXT,
+    meter_stop INTEGER,
+    stop_timestamp TEXT,
+    reason TEXT
+)
+''')
 
 
 cursor.execute('''
@@ -815,37 +809,31 @@ def get_current_transaction(charge_point_id: str):
 
 @app.get("/api/charge-points/{charge_point_id}/latest-current")
 def get_latest_current(charge_point_id: str):
-    with sqlite3.connect("ocpp_data.db") as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT timestamp, value, unit
-            FROM meter_values
-            WHERE charge_point_id = ? AND measurand = 'Current.Import'
-            ORDER BY timestamp DESC
-            LIMIT 1
-        """, (charge_point_id,))
-        row = cursor.fetchone()
-
-        if not row:
-            return {}
-
-        return {
-            "timestamp": row[0],
-            "value": round(row[1], 2),
-            "unit": row[2]
-        }
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT timestamp, value, unit
+        FROM meter_values
+        WHERE charge_point_id = ?
+          AND measurand = 'Current.Import'
+        ORDER BY timestamp DESC
+        LIMIT 1
+    """, (charge_point_id,))
+    row = cursor.fetchone()
+    if not row:
+        return {}
+    return {"timestamp": row[0], "value": round(row[1], 2), "unit": row[2]}
 
 
 
-    @app.get("/api/cards/{id_tag}/balance")
-    def get_card_balance(id_tag: str):
-        with sqlite3.connect("ocpp_data.db") as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT balance FROM cards WHERE card_id = ?", (id_tag,))
-            row = cursor.fetchone()
-            if not row:
-                return {"balance": 0, "found": False}
-            return {"balance": row[0], "found": True}
+# 新增獨立的卡片餘額查詢 API（修正縮排）
+@app.get("/api/cards/{id_tag}/balance")
+def get_card_balance(id_tag: str):
+    cursor = conn.cursor()
+    cursor.execute("SELECT balance FROM cards WHERE card_id = ?", (id_tag,))
+    row = cursor.fetchone()
+    if not row:
+        return {"balance": 0, "found": False}
+    return {"balance": row[0], "found": True}
 
    
 
@@ -1007,6 +995,19 @@ async def get_transactions(
 
 
 
+
+def compute_transaction_cost(transaction_id: int):
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT total_amount
+        FROM payments
+        WHERE transaction_id = ?
+    """, (transaction_id,))
+    row = cursor.fetchone()
+    if row:
+        return {"transaction_id": transaction_id, "total_amount": row[0]}
+    else:
+        raise HTTPException(status_code=404, detail="Transaction not found")
 
 @app.get("/api/transactions/{transaction_id}/cost")
 async def calculate_transaction_cost(transaction_id: int):
@@ -1304,6 +1305,8 @@ async def test_line_messaging(payload: dict = Body(...)):
 
 
 
+import requests
+LINE_TOKEN = os.getenv("LINE_TOKEN", "")
 
 @app.post("/webhook")
 async def webhook(request: Request):
@@ -1733,28 +1736,29 @@ async def get_daily_by_chargepoint_range(
     start: str = Query(...),
     end: str = Query(...)
 ):
+    result_map = {}
     with sqlite3.connect("ocpp_data.db") as conn:
         cursor = conn.cursor()
-    cursor.execute("""
-        SELECT strftime('%Y-%m-%d', start_timestamp) as day,
-               charge_point_id,
-               SUM(meter_stop - meter_start) as total_energy
-        FROM transactions
-        WHERE meter_stop IS NOT NULL
-          AND start_timestamp >= ?
-          AND start_timestamp <= ?
-        GROUP BY day, charge_point_id
-        ORDER BY day ASC
-    """, (start, end))
-    rows = cursor.fetchall()
+        cursor.execute("""
+            SELECT strftime('%Y-%m-%d', start_timestamp) as day,
+                   charge_point_id,
+                   SUM(meter_stop - meter_start) as total_energy
+            FROM transactions
+            WHERE meter_stop IS NOT NULL
+              AND start_timestamp >= ?
+              AND start_timestamp <= ?
+            GROUP BY day, charge_point_id
+            ORDER BY day ASC
+        """, (start, end))
+        rows = cursor.fetchall()
 
-    result_map = {}
     for day, cp_id, energy in rows:
         if day not in result_map:
             result_map[day] = {"period": day}
-        result_map[day][cp_id] = round(energy / 1000, 3)  # kWh
+        result_map[day][cp_id] = round((energy or 0) / 1000, 3)
 
     return list(result_map.values())
+
 
 
 
@@ -1763,6 +1767,7 @@ async def get_daily_by_chargepoint_range(
 # 新增：每日電價設定 daily_pricing_rules API 與資料表
 
 # 建立資料表
+# 這裡是其他 CREATE TABLE IF NOT EXISTS ...
 cursor.execute('''
 CREATE TABLE IF NOT EXISTS daily_pricing_rules (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1773,7 +1778,33 @@ CREATE TABLE IF NOT EXISTS daily_pricing_rules (
     label TEXT DEFAULT ''
 )
 ''')
+
+# 🔹 補上 pricing_rules 表
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS pricing_rules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    season TEXT,
+    day_type TEXT,
+    start_time TEXT,
+    end_time TEXT,
+    price REAL
+)
+''')
+
+# 🔹 補上 reservations 表
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS reservations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    charge_point_id TEXT,
+    id_tag TEXT,
+    start_time TEXT,
+    end_time TEXT,
+    status TEXT
+)
+''')
+
 conn.commit()
+
 
 # 取得指定日期的設定
 @app.get("/api/daily-pricing")
@@ -2262,8 +2293,6 @@ async def stop_transaction_by_charge_point(charge_point_id: str):
         pending_stop_transactions.pop(transaction_id, None)
 
 
-
-
 @app.get("/api/devtools/last-transactions")
 def last_transactions():
     import sqlite3
@@ -2297,8 +2326,3 @@ def last_transactions():
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=10000, reload=True)
 # force deploy trigger
-
-
-
-
-
