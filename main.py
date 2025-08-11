@@ -881,6 +881,41 @@ def get_charge_point_status(charge_point_id: str):
         return {"status": "未知"}
 
 
+@app.get("/api/charge-points/{charge_point_id}/latest-status")
+def get_latest_status(charge_point_id: str):
+    c = conn.cursor()
+
+    # 優先取充電樁傳來的 StatusNotification 紀錄
+    # 你的表名若不同，請把 status_notifications 換成實際表名
+    c.execute("""
+        SELECT status, error_code, timestamp
+        FROM status_notifications
+        WHERE charge_point_id = ?
+        ORDER BY timestamp DESC
+        LIMIT 1
+    """, (charge_point_id,))
+    row = c.fetchone()
+    if row:
+        return {"status": row[0], "errorCode": row[1], "timestamp": row[2]}
+
+    # 後備：用目前交易是否 active 推估
+    try:
+        c.execute("""
+            SELECT active FROM current_transactions
+            WHERE charge_point_id = ?
+            ORDER BY updated_at DESC
+            LIMIT 1
+        """, (charge_point_id,))
+        r = c.fetchone()
+        if r and r[0]:
+            return {"status": "Charging", "inferred": True}
+    except Exception:
+        pass
+
+    return {"status": "Unknown"}
+
+
+
 
 # ✅ 時段電價設定管理：新增與刪除
 @app.post("/api/pricing-rules")
