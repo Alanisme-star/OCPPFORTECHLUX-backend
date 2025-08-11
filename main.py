@@ -807,21 +807,56 @@ def get_current_transaction(charge_point_id: str):
 
 
 
-@app.get("/api/charge-points/{charge_point_id}/latest-current")
-def get_latest_current(charge_point_id: str):
-    cursor = conn.cursor()
-    cursor.execute("""
+@app.get("/api/charge-points/{charge_point_id}/latest-power")
+def get_latest_power(charge_point_id: str):
+    c = conn.cursor()
+
+    # 1) 優先使用充電樁直接上報的主動功率（單相/三相）
+    c.execute("""
         SELECT timestamp, value, unit
         FROM meter_values
         WHERE charge_point_id = ?
-          AND measurand = 'Current.Import'
+          AND measurand IN (
+            'Power.Active.Import',
+            'Power.Active.Import.L1','Power.Active.Import.L2','Power.Active.Import.L3'
+          )
         ORDER BY timestamp DESC
         LIMIT 1
     """, (charge_point_id,))
-    row = cursor.fetchone()
-    if not row:
-        return {}
-    return {"timestamp": row[0], "value": round(row[1], 2), "unit": row[2]}
+    row = c.fetchone()
+    if row:
+        val = float(row[1])
+        unit = (row[2] or "").lower()
+        # 正規化成 kW
+        if unit == "w":
+            kw = val / 1000.0
+        else:
+            # 若單位本身是 kW 或未知，就直接當 kW 使用
+            kw = val
+        return {"timestamp": row[0], "value": round(kw, 3), "unit": "kW"}
+
+    # 2) 後備：用同一個 timestamp 的 Voltage × Current.Import 推得 kW
+    c.execute("""
+        SELECT v.timestamp, v.value AS v, a.value AS a
+        FROM meter_values v
+        JOIN meter_values a
+          ON v.charge_point_id = a.charge_point_id
+         AND v.timestamp = a.timestamp
+        WHERE v.charge_point_id = ?
+          AND v.measurand LIKE 'Voltage%'
+          AND a.measurand = 'Current.Import'
+        ORDER BY v.timestamp DESC
+        LIMIT 1
+    """, (charge_point_id,))
+    r = c.fetchone()
+    if r:
+        v = float(r[1]); a = float(r[2])
+        kw = (v * a) / 1000.0
+        return {"timestamp": r[0], "value": round(kw, 3), "unit": "kW", "derived": True}
+
+    # 3) 找不到資料
+    return {}
+
 
 
 
