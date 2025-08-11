@@ -775,38 +775,6 @@ async def start_transaction_by_charge_point(charge_point_id: str, data: dict = B
 
 
 
-    
-@app.get("/api/charge-points/{charge_point_id}/current-transaction")
-def get_current_transaction(charge_point_id: str):
-    with sqlite3.connect("ocpp_data.db") as conn:
-        cursor = conn.cursor()
-
-        # ✅ 查找最新一筆交易，不論是否 stop
-        cursor.execute("""
-            SELECT transaction_id, start_timestamp, stop_timestamp
-            FROM transactions
-            WHERE charge_point_id = ?
-            ORDER BY start_timestamp DESC
-            LIMIT 1
-        """, (charge_point_id,))
-        row = cursor.fetchone()
-
-        if not row:
-            return {"active": False}
-
-        transaction_id, start_time, stop_time = row
-        active = stop_time is None
-
-        return {
-            "transaction_id": transaction_id,
-            "start_time": start_time,
-            "stop_time": stop_time,
-            "active": active
-        }
-
-
-
-
 @app.get("/api/charge-points/{charge_point_id}/latest-power")
 def get_latest_power(charge_point_id: str):
     c = conn.cursor()
