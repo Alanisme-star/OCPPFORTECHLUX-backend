@@ -2473,6 +2473,51 @@ def last_transactions():
 
 
 
+
+from datetime import datetime, timedelta, timezone
+from fastapi import Query
+
+TZ_TAIPEI = timezone(timedelta(hours=8))
+
+def _in_range(now_hm: str, start: str, end: str) -> bool:
+    """時間字串 HH:MM；處理跨日與 start==end（視為全天）。"""
+    if start == end:
+        return True  # 全天
+    if start < end:
+        return start <= now_hm < end
+    else:
+        # 跨日，如 22:00~06:00
+        return now_hm >= start or now_hm < end
+
+@app.get("/api/pricing/price-now")
+def get_price_now(date: str | None = Query(None), time: str | None = Query(None)):
+    now = datetime.now(TZ_TAIPEI)
+    d = date or now.strftime("%Y-%m-%d")
+    t = time or now.strftime("%H:%M")
+
+    c = conn.cursor()
+    c.execute("""
+        SELECT start_time, end_time, price, COALESCE(label,'')
+        FROM daily_pricing_rules
+        WHERE date = ?
+        ORDER BY start_time
+    """, (d,))
+    rows = c.fetchall()
+
+    # 找到所有符合的區間；若重疊，取價格較高者（保守計費）
+    matches = [r for r in rows if _in_range(t, r[0], r[1])]
+    if matches:
+        start_time, end_time, price, label = max(matches, key=lambda r: float(r[2]))
+        return {"date": d, "time": t, "price": float(price), "label": label}
+
+    # 找不到就用預設
+    return {"date": d, "time": t, "price": 6.0, "fallback": True}
+
+
+
+
+
+
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=10000, reload=True)
 # force deploy trigger
