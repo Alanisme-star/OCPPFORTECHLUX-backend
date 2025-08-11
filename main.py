@@ -1885,8 +1885,14 @@ from datetime import datetime, timedelta
 from fastapi import Query
 
 def _time_in_range(now_str: str, start: str, end: str) -> bool:
-    # 字串 HH:MM 比較（處理跨日時段，例如 22:00~06:00）
-    return (start <= end and start <= now_str < end) or (start > end and (now_str >= start or now_str < end))
+    """時間字串 HH:MM；處理跨日與 start==end（視為全天）。"""
+    if start == end:
+        return True  # 全天
+    if start < end:
+        return start <= now_str < end
+    # 跨日，例如 22:00~06:00
+    return now_str >= start or now_str < end
+
 
 @app.get("/api/pricing/price-now")
 def get_price_now(date: str = Query(None), time: str = Query(None)):
@@ -1904,9 +1910,18 @@ def get_price_now(date: str = Query(None), time: str = Query(None)):
     """, (d,))
     rows = c.fetchall()
 
+    matches = []
     for start_time, end_time, price, label in rows:
         if _time_in_range(t, start_time, end_time):
-            return {"date": d, "time": t, "price": float(price), "label": label}
+            matches.append((start_time, end_time, float(price), label))
+
+if matches:
+    # 若重疊，保守起見取最高價
+    start_time, end_time, price, label = max(matches, key=lambda r: r[2])
+    return {"date": d, "time": t, "price": price, "label": label}
+
+return {"date": d, "time": t, "price": 6.0, "fallback": True}
+
 
     # 找不到對應時段就回預設（你也可以改成 0 或丟 404）
     return {"date": d, "time": t, "price": 6.0, "fallback": True}
