@@ -935,35 +935,23 @@ def get_charge_point_status(charge_point_id: str):
 @app.get("/api/charge-points/{charge_point_id}/latest-status")
 def get_latest_status(charge_point_id: str):
     c = conn.cursor()
-
-    # 優先取充電樁傳來的 StatusNotification 紀錄
-    # 你的表名若不同，請把 status_notifications 換成實際表名
-    c.execute("""
-        SELECT status, error_code, timestamp
-        FROM status_notifications
+    # 優先取充電樁傳來的最新 StatusNotification 紀錄
+    c.execute(
+        """
+        SELECT status, timestamp
+        FROM status_logs
         WHERE charge_point_id = ?
         ORDER BY timestamp DESC
         LIMIT 1
-    """, (charge_point_id,))
+        """,
+        (charge_point_id,),
+    )
     row = c.fetchone()
     if row:
-        return {"status": row[0], "errorCode": row[1], "timestamp": row[2]}
-
-    # 後備：用目前交易是否 active 推估
-    try:
-        c.execute("""
-            SELECT active FROM current_transactions
-            WHERE charge_point_id = ?
-            ORDER BY updated_at DESC
-            LIMIT 1
-        """, (charge_point_id,))
-        r = c.fetchone()
-        if r and r[0]:
-            return {"status": "Charging", "inferred": True}
-    except Exception:
-        pass
-
+        return {"status": row[0], "timestamp": row[1]}
+    # 找不到就回 Unknown
     return {"status": "Unknown"}
+
 
 
 
@@ -1847,8 +1835,6 @@ async def topup_card(card_id: str = Path(...), data: dict = Body(...)):
 def version_check():
     return {"version": "✅ 偵錯用 main.py v1.0 已啟動成功"}
 
-...
-
 
 
 
@@ -1881,68 +1867,135 @@ async def get_daily_by_chargepoint_range(
     return list(result_map.values())
 
 
-from datetime import datetime, timedelta
+
+
+from datetime import datetime, timedelta, timezone
 from fastapi import Query
 
-def _time_in_range(now_str: str, start: str, end: str) -> bool:
-    """時間字串 HH:MM；處理跨日與 start==end（視為全天）。"""
+TZ_TAIPEI = timezone(timedelta(hours=8))
+
+def _price_time_in_range(now_hm: str, start: str, end: str) -> bool:
+    """HH:MM；處理跨日，且 start==end 視為全天。"""
     if start == end:
-        return True  # 全天
+        return True
     if start < end:
-        return start <= now_str < end
-    # 跨日，例如 22:00~06:00
-    return now_str >= start or now_str < end
+        return start <= now_hm < end
+    return now_hm >= start or now_hm < end  # 跨日，如 22:00~06:00
 
 
 @app.get("/api/pricing/price-now")
-def get_price_now(date: str = Query(None), time: str = Query(None)):
-    # 以台北時間為準
-    now_tw = datetime.utcnow() + timedelta(hours=8)
-    d = date or now_tw.strftime("%Y-%m-%d")
-    t = time or now_tw.strftime("%H:%M")
+def price_now(date: str | None = Query(None), time: str | None = Query(None)):
+    now = datetime.now(TZ_TAIPEI)
+    d = date or now.strftime("%Y-%m-%d")
+    t = time or now.strftime("%H:%M")
 
     c = conn.cursor()
     c.execute("""
-        SELECT start_time, end_time, price, COALESCE(label, '')
+        SELECT start_time, end_time, price, COALESCE(label,'')
         FROM daily_pricing_rules
         WHERE date = ?
         ORDER BY start_time
     """, (d,))
     rows = c.fetchall()
 
-    matches = []
-    for start_time, end_time, price, label in rows:
-        if _time_in_range(t, start_time, end_time):
-            matches.append((start_time, end_time, float(price), label))
+    hits = [(s, e, float(p), lbl) for (s, e, p, lbl) in rows if _price_time_in_range(t, s, e)]
+    if hits:
+        s, e, price, lbl = max(hits, key=lambda r: r[2])  # 時段重疊取最高價
+        return {"date": d, "time": t, "price": price, "label": lbl}
 
-if matches:
-    # 若重疊，保守起見取最高價
-    start_time, end_time, price, label = max(matches, key=lambda r: r[2])
-    return {"date": d, "time": t, "price": price, "label": label}
-
-return {"date": d, "time": t, "price": 6.0, "fallback": True}
-
-
-    # 找不到對應時段就回預設（你也可以改成 0 或丟 404）
+    # 找不到對應時段 → 回預設（你也可改成 0 或 404）
     return {"date": d, "time": t, "price": 6.0, "fallback": True}
 
 
 
 
-# 新增：每日電價設定 daily_pricing_rules API 與資料表
 
-# 建立資料表
-# 這裡是其他 CREATE TABLE IF NOT EXISTS ...
+# 建表（若已存在會略過）
 cursor.execute('''
 CREATE TABLE IF NOT EXISTS daily_pricing_rules (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    date TEXT,               -- yyyy-mm-dd
-    start_time TEXT,         -- HH:MM
-    end_time TEXT,           -- HH:MM
+    date TEXT,        -- yyyy-mm-dd
+    start_time TEXT,  -- HH:MM
+    end_time TEXT,    -- HH:MM
     price REAL,
     label TEXT DEFAULT ''
 )
 ''')
+conn.commit()
+
+# 取得指定日期設定
+@app.get("/api/daily-pricing")
+async def get_daily_pricing(date: str = Query(...)):
+    cursor.execute('''
+        SELECT id, date, start_time, end_time, price, label
+        FROM daily_pricing_rules
+        WHERE date = ?
+        ORDER BY start_time ASC
+    ''', (date,))
+    rows = cursor.fetchall()
+    return [
+        {"id": r[0], "date": r[1], "startTime": r[2], "endTime": r[3], "price": r[4], "label": r[5]}
+        for r in rows
+    ]
+
+# 新增設定
+@app.post("/api/daily-pricing")
+async def add_daily_pricing(data: dict = Body(...)):
+    cursor.execute('''
+        INSERT INTO daily_pricing_rules (date, start_time, end_time, price, label)
+        VALUES (?, ?, ?, ?, ?)
+    ''', (data["date"], data["startTime"], data["endTime"], float(data["price"]), data.get("label", "")))
+    conn.commit()
+    return {"message": "新增成功"}
+
+# 修改設定
+@app.put("/api/daily-pricing/{id}")
+async def update_daily_pricing(id: int = Path(...), data: dict = Body(...)):
+    cursor.execute('''
+        UPDATE daily_pricing_rules
+        SET date = ?, start_time = ?, end_time = ?, price = ?, label = ?
+        WHERE id = ?
+    ''', (data["date"], data["startTime"], data["endTime"], float(data["price"]), data.get("label", ""), id))
+    conn.commit()
+    return {"message": "更新成功"}
+
+# 刪除單筆
+@app.delete("/api/daily-pricing/{id}")
+async def delete_daily_pricing(id: int = Path(...)):
+    cursor.execute("DELETE FROM daily_pricing_rules WHERE id = ?", (id,))
+    conn.commit()
+    return {"message": "已刪除"}
+
+# 刪除某日期所有設定
+@app.delete("/api/daily-pricing")
+async def delete_daily_pricing_by_date(date: str = Query(...)):
+    cursor.execute("DELETE FROM daily_pricing_rules WHERE date = ?", (date,))
+    conn.commit()
+    return {"message": f"已刪除 {date} 所有設定"}
+
+# 複製設定到多日期
+@app.post("/api/daily-pricing/duplicate")
+async def duplicate_pricing(data: dict = Body(...)):
+    source_date = data["sourceDate"]
+    target_dates = data["targetDates"]  # list[str]
+
+    cursor.execute("SELECT start_time, end_time, price, label FROM daily_pricing_rules WHERE date = ?", (source_date,))
+    rows = cursor.fetchall()
+
+    for target in target_dates:
+        for s, e, p, lbl in rows:
+            cursor.execute("""
+                INSERT INTO daily_pricing_rules (date, start_time, end_time, price, label)
+                VALUES (?, ?, ?, ?, ?)
+            """, (target, s, e, p, lbl))
+    conn.commit()
+    return {"message": f"已複製 {len(rows)} 筆設定至 {len(target_dates)} 天"}
+
+
+
+
+
+
 
 # 🔹 補上 pricing_rules 表
 cursor.execute('''
@@ -1971,69 +2024,18 @@ CREATE TABLE IF NOT EXISTS reservations (
 conn.commit()
 
 
-# 取得指定日期的設定
-@app.get("/api/daily-pricing")
-async def get_daily_pricing(date: str = Query(...)):
-    cursor.execute('''
-        SELECT id, date, start_time, end_time, price, label
-        FROM daily_pricing_rules
-        WHERE date = ?
-        ORDER BY start_time ASC
-    ''', (date,))
-    rows = cursor.fetchall()
-    return [
-        {
-            "id": r[0], "date": r[1], "startTime": r[2],
-            "endTime": r[3], "price": r[4], "label": r[5]
-        } for r in rows
-    ]
 
-# 新增設定
-@app.post("/api/daily-pricing")
-async def add_daily_pricing(data: dict = Body(...)):
-    cursor.execute('''
-        INSERT INTO daily_pricing_rules (date, start_time, end_time, price, label)
-        VALUES (?, ?, ?, ?, ?)
-    ''', (data["date"], data["startTime"], data["endTime"], float(data["price"]), data.get("label", "")))
-    conn.commit()
-    return {"message": "新增成功"}
 
-# 修改設定
-@app.put("/api/daily-pricing/{id}")
-async def update_daily_pricing(id: int = Path(...), data: dict = Body(...)):
-    cursor.execute('''
-        UPDATE daily_pricing_rules
-        SET date = ?, start_time = ?, end_time = ?, price = ?, label = ?
-        WHERE id = ?
-    ''', (data["date"], data["startTime"], data["endTime"], float(data["price"]), data.get("label", ""), id))
-    conn.commit()
-    return {"message": "更新成功"}
 
-# 刪除設定
-@app.delete("/api/daily-pricing/{id}")
-async def delete_daily_pricing(id: int = Path(...)):
-    cursor.execute("DELETE FROM daily_pricing_rules WHERE id = ?", (id,))
-    conn.commit()
-    return {"message": "已刪除"}
 
-# 複製到多個日期
-@app.post("/api/daily-pricing/duplicate")
-async def duplicate_pricing(data: dict = Body(...)):
-    source_date = data["sourceDate"]
-    target_dates = data["targetDates"]  # list of yyyy-mm-dd
 
-    cursor.execute("SELECT start_time, end_time, price, label FROM daily_pricing_rules WHERE date = ?", (source_date,))
-    rows = cursor.fetchall()
 
-    for target in target_dates:
-        for r in rows:
-            cursor.execute("""
-                INSERT INTO daily_pricing_rules (date, start_time, end_time, price, label)
-                VALUES (?, ?, ?, ?, ?)
-            """, (target, r[0], r[1], r[2], r[3]))
 
-    conn.commit()
-    return {"message": f"已複製 {len(rows)} 筆設定至 {len(target_dates)} 天"}
+
+
+
+
+
 
 
 @app.get("/")
@@ -2265,7 +2267,7 @@ async def missing_cost_transactions():
 
 
 @app.post("/api/internal/mock-status")
-async def mock_status(data: dict = Body(...)):
+async def mock_status(data: dict = Body(...)):  # 這裡要三個點
     cp_id = data["cp_id"]
     charging_point_status[cp_id] = {
         "connectorId": data.get("connector_id", 1),
@@ -2391,12 +2393,7 @@ async def stop_transaction_by_charge_point(charge_point_id: str):
 
 
 
-# 新增：依據日期批次刪除 daily_pricing_rules
-@app.delete("/api/daily-pricing")
-async def delete_daily_pricing_by_date(date: str = Query(...)):
-    cursor.execute("DELETE FROM daily_pricing_rules WHERE date = ?", (date,))
-    conn.commit()
-    return {"message": f"已刪除 {date} 所有設定"}
+
 
 
 @app.get("/debug/charge-points")
@@ -2438,7 +2435,7 @@ async def stop_transaction_by_charge_point(charge_point_id: str):
     # 新增同步等待機制
     loop = asyncio.get_event_loop()
     fut = loop.create_future()
-    pending_stop_transactions[transaction_id] = fut
+    pending_stop_transactions[str(transaction_id)] = fut
 
     # 發送 RemoteStopTransaction
     print(f"🟢【API呼叫】發送 RemoteStopTransaction 給充電樁")
@@ -2455,7 +2452,7 @@ async def stop_transaction_by_charge_point(charge_point_id: str):
         print(f"🔴【API異常】等待 StopTransaction 超時")
         return JSONResponse(status_code=504, content={"message": "等待充電樁停止回覆逾時 (StopTransaction timeout)"})
     finally:
-        pending_stop_transactions.pop(transaction_id, None)
+        pending_stop_transactions.pop(str(transaction_id), None)
 
 
 @app.get("/api/devtools/last-transactions")
@@ -2485,48 +2482,6 @@ def last_transactions():
             for row in rows
         ]
         return {"last_transactions": result}
-
-
-
-
-from datetime import datetime, timedelta, timezone
-from fastapi import Query
-
-TZ_TAIPEI = timezone(timedelta(hours=8))
-
-def _in_range(now_hm: str, start: str, end: str) -> bool:
-    """時間字串 HH:MM；處理跨日與 start==end（視為全天）。"""
-    if start == end:
-        return True  # 全天
-    if start < end:
-        return start <= now_hm < end
-    else:
-        # 跨日，如 22:00~06:00
-        return now_hm >= start or now_hm < end
-
-@app.get("/api/pricing/price-now")
-def get_price_now(date: str | None = Query(None), time: str | None = Query(None)):
-    now = datetime.now(TZ_TAIPEI)
-    d = date or now.strftime("%Y-%m-%d")
-    t = time or now.strftime("%H:%M")
-
-    c = conn.cursor()
-    c.execute("""
-        SELECT start_time, end_time, price, COALESCE(label,'')
-        FROM daily_pricing_rules
-        WHERE date = ?
-        ORDER BY start_time
-    """, (d,))
-    rows = c.fetchall()
-
-    # 找到所有符合的區間；若重疊，取價格較高者（保守計費）
-    matches = [r for r in rows if _in_range(t, r[0], r[1])]
-    if matches:
-        start_time, end_time, price, label = max(matches, key=lambda r: float(r[2]))
-        return {"date": d, "time": t, "price": float(price), "label": label}
-
-    # 找不到就用預設
-    return {"date": d, "time": t, "price": 6.0, "fallback": True}
 
 
 
