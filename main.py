@@ -1913,6 +1913,35 @@ async def get_daily_by_chargepoint_range(
     return list(result_map.values())
 
 
+from datetime import datetime, timedelta
+from fastapi import Query
+
+def _time_in_range(now_str: str, start: str, end: str) -> bool:
+    # 字串 HH:MM 比較（處理跨日時段，例如 22:00~06:00）
+    return (start <= end and start <= now_str < end) or (start > end and (now_str >= start or now_str < end))
+
+@app.get("/api/pricing/price-now")
+def get_price_now(date: str = Query(None), time: str = Query(None)):
+    # 以台北時間為準
+    now_tw = datetime.utcnow() + timedelta(hours=8)
+    d = date or now_tw.strftime("%Y-%m-%d")
+    t = time or now_tw.strftime("%H:%M")
+
+    c = conn.cursor()
+    c.execute("""
+        SELECT start_time, end_time, price, COALESCE(label, '')
+        FROM daily_pricing_rules
+        WHERE date = ?
+        ORDER BY start_time
+    """, (d,))
+    rows = c.fetchall()
+
+    for start_time, end_time, price, label in rows:
+        if _time_in_range(t, start_time, end_time):
+            return {"date": d, "time": t, "price": float(price), "label": label}
+
+    # 找不到對應時段就回預設（你也可以改成 0 或丟 404）
+    return {"date": d, "time": t, "price": 6.0, "fallback": True}
 
 
 
