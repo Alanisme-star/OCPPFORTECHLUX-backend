@@ -858,6 +858,89 @@ def get_latest_power(charge_point_id: str):
     return {}
 
 
+@app.get("/api/charge-points/{charge_point_id}/latest-voltage")
+def get_latest_voltage(charge_point_id: str):
+    c = conn.cursor()
+
+    # 1) 優先使用充電樁直接上報的總電壓 Voltage
+    c.execute("""
+        SELECT timestamp, value, unit
+        FROM meter_values
+        WHERE charge_point_id = ?
+          AND measurand = 'Voltage'
+        ORDER BY timestamp DESC
+        LIMIT 1
+    """, (charge_point_id,))
+    row = c.fetchone()
+    if row:
+        val = float(row[1])
+        unit = (row[2] or "V")
+        return {"timestamp": row[0], "value": round(val, 1), "unit": unit}
+
+    # 2) 後備：以同一時間戳的三相電壓平均（Voltage.L1~L3）
+    c.execute("""
+        WITH latest AS (
+            SELECT MAX(timestamp) AS ts
+            FROM meter_values
+            WHERE charge_point_id = ?
+              AND measurand IN ('Voltage.L1','Voltage.L2','Voltage.L3')
+        )
+        SELECT m.timestamp, AVG(m.value) AS v_avg
+        FROM meter_values m
+        JOIN latest L ON m.timestamp = L.ts
+        WHERE m.charge_point_id = ?
+          AND m.measurand IN ('Voltage.L1','Voltage.L2','Voltage.L3')
+    """, (charge_point_id, charge_point_id))
+    r = c.fetchone()
+    if r and r[1] is not None:
+        return {"timestamp": r[0], "value": round(float(r[1]), 1), "unit": "V", "derived": True}
+
+    return {}
+
+
+@app.get("/api/charge-points/{charge_point_id}/latest-current")
+def get_latest_current_api(charge_point_id: str):
+    c = conn.cursor()
+
+    # 1) 優先使用充電樁直接上報的總電流 Current.Import
+    c.execute("""
+        SELECT timestamp, value, unit
+        FROM meter_values
+        WHERE charge_point_id = ?
+          AND measurand = 'Current.Import'
+        ORDER BY timestamp DESC
+        LIMIT 1
+    """, (charge_point_id,))
+    row = c.fetchone()
+    if row:
+        val = float(row[1])
+        unit = (row[2] or "A")
+        return {"timestamp": row[0], "value": round(val, 2), "unit": unit}
+
+    # 2) 後備：以同一時間戳三相電流相加（Current.Import.L1~L3）
+    c.execute("""
+        WITH latest AS (
+            SELECT MAX(timestamp) AS ts
+            FROM meter_values
+            WHERE charge_point_id = ?
+              AND measurand IN ('Current.Import.L1','Current.Import.L2','Current.Import.L3')
+        )
+        SELECT m.timestamp, SUM(m.value) AS a_sum
+        FROM meter_values m
+        JOIN latest L ON m.timestamp = L.ts
+        WHERE m.charge_point_id = ?
+          AND m.measurand IN ('Current.Import.L1','Current.Import.L2','Current.Import.L3')
+    """, (charge_point_id, charge_point_id))
+    r = c.fetchone()
+    if r and r[1] is not None:
+        return {"timestamp": r[0], "value": round(float(r[1]), 2), "unit": "A", "derived": True}
+
+    return {}
+
+
+
+
+
 
 
 # 新增獨立的卡片餘額查詢 API（修正縮排）
