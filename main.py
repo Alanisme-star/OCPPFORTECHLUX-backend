@@ -23,7 +23,6 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from dateutil.parser import parse as parse_date
 from websockets.exceptions import ConnectionClosedOK
-from werkzeug.security import generate_password_hash, check_password_hash
 from ocpp.v16 import call, call_result, ChargePoint as OcppChargePoint
 from ocpp.v16.enums import Action, RegistrationStatus
 from ocpp.routing import on
