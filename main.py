@@ -402,8 +402,6 @@ class ChargePoint(OcppChargePoint):
 
 
 
-
-
     @on(Action.StopTransaction)
     async def on_stop_transaction(self, **kwargs):
         try:
@@ -411,7 +409,7 @@ class ChargePoint(OcppChargePoint):
             cp_id = getattr(self, "id", None)
             print(f"🟢【OCPP Handler】StopTransaction self.id: {cp_id}")
 
-            # transaction_id 統一成 str
+            # 正規化傳入欄位
             transaction_id = str(kwargs.get("transaction_id") or kwargs.get("transactionId"))
             meter_stop = kwargs.get("meter_stop")
             timestamp = kwargs.get("timestamp") or datetime.utcnow().isoformat()
@@ -421,32 +419,58 @@ class ChargePoint(OcppChargePoint):
                 print(f"🔴【OCPP Handler】❌ StopTransaction 欄位缺失 | cp_id={cp_id} | transaction_id={transaction_id}")
                 return call_result.StopTransactionPayload()
 
-            print(f"🟢【OCPP Handler】UPDATE transactions，transaction_id={transaction_id}")
-   
-            with sqlite3.connect("ocpp_data.db") as conn:
-                cursor = conn.cursor()
-                cursor.execute('''
+            with sqlite3.connect("ocpp_data.db") as _conn:
+                _cur = _conn.cursor()
+
+                # 1) 落 StopTransaction 與更新交易紀錄
+                _cur.execute('''
                     INSERT INTO stop_transactions (transaction_id, meter_stop, timestamp, reason)
                     VALUES (?, ?, ?, ?)
-                ''', (
-                    transaction_id,
-                    meter_stop,
-                    timestamp,
-                    reason
-                ))
+                ''', (transaction_id, meter_stop, timestamp, reason))
 
-                cursor.execute('''
+                _cur.execute('''
                     UPDATE transactions
                     SET meter_stop = ?, stop_timestamp = ?, reason = ?
                     WHERE transaction_id = ?
                 ''', (meter_stop, timestamp, reason, transaction_id))
-                conn.commit()
-            print(f"🟢【OCPP Handler】交易已成功結束 transaction_id={transaction_id}")
 
-            # 【這裡關鍵】全部統一 str
-            print(f"[DEBUG] 收到 StopTransaction，transaction_id 型別: {type(transaction_id)}, value: {transaction_id}")
-            print(f"[DEBUG] 目前 pending_stop_transactions 的 key: {list(pending_stop_transactions.keys())}")
+                # 2) 取交易起始資料 → 算本次用電（Wh→kWh）
+                _cur.execute('''
+                    SELECT meter_start, id_tag FROM transactions
+                    WHERE transaction_id = ?
+                ''', (transaction_id,))
+                row = _cur.fetchone()
 
+                if row:
+                    meter_start, id_tag = row
+                    energy_kwh = max(0.0, ((meter_stop or 0) - (meter_start or 0)) / 1000.0)
+
+                    # 3) 依「停止時間」求單價（用你 daily_pricing_rules 的規則；找不到時預設 6 元）
+                    unit_price = float(_price_for_timestamp(timestamp))
+
+                    # 4) 記 payments（可視需求調整 base/overuse）
+                    base_fee = 0.0
+                    energy_fee = round(energy_kwh * unit_price, 2)
+                    overuse_fee = 0.0
+                    total = round(base_fee + energy_fee + overuse_fee, 2)
+
+                    _cur.execute('''
+                        INSERT INTO payments (transaction_id, base_fee, energy_fee, overuse_fee, total_amount, paid_at)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                    ''', (transaction_id, base_fee, energy_fee, overuse_fee, total, timestamp))
+
+                    # 5) 扣卡片餘額（不足則扣到 0）
+                    _cur.execute("SELECT balance FROM cards WHERE card_id = ?", (id_tag,))
+                    card_row = _cur.fetchone()
+                    if card_row is not None:
+                        old_balance = float(card_row[0] or 0)
+                        new_balance = max(0.0, round(old_balance - total, 2))
+                        _cur.execute("UPDATE cards SET balance = ? WHERE card_id = ?", (new_balance, id_tag))
+                        print(f"💳 扣款：{id_tag} | {old_balance} → {new_balance} 元 | txn={transaction_id} | kWh={energy_kwh:.3f} | 單價={unit_price}")
+
+                _conn.commit()
+
+            # 6) 喚醒等待 RemoteStop 的 future（若有用到）
             fut = pending_stop_transactions.get(str(transaction_id))
             if fut and not fut.done():
                 print(f"StopTransaction | 解除future? {transaction_id} | 現有pending: {list(pending_stop_transactions.keys())}")
@@ -455,9 +479,12 @@ class ChargePoint(OcppChargePoint):
                 print(f"【未找到 future 或已done】transaction_id={transaction_id}，pending={pending_stop_transactions}")
 
         except Exception as e:
-            print(f"🔴【OCPP Handler】❌ StopTransaction 儲存失敗：{e}")
+            print(f"🔴【OCPP Handler】❌ StopTransaction 儲存/扣款失敗：{e}")
 
         return call_result.StopTransactionPayload()
+
+
+
 
 
 
@@ -2075,6 +2102,29 @@ def price_now(date: str | None = Query(None), time: str | None = Query(None)):
 
     # 找不到對應時段 → 回預設（你也可改成 0 或 404）
     return {"date": d, "time": t, "price": 6.0, "fallback": True}
+
+
+
+# === Helper: 依時間算電價（找不到就回預設 6.0 元/kWh） ===
+def _price_for_timestamp(ts_iso: str) -> float:
+    try:
+        dt = datetime.fromisoformat(ts_iso.replace("Z", "+00:00")).astimezone(TZ_TAIPEI)
+    except Exception:
+        dt = datetime.now(TZ_TAIPEI)
+    d = dt.strftime("%Y-%m-%d")
+    t = dt.strftime("%H:%M")
+
+    c = conn.cursor()
+    c.execute("""
+        SELECT start_time, end_time, price
+        FROM daily_pricing_rules
+        WHERE date = ?
+        ORDER BY start_time
+    """, (d,))
+    rows = c.fetchall()
+
+    hits = [float(p) for (s, e, p) in rows if _price_time_in_range(t, s, e)]
+    return max(hits) if hits else 6.0
 
 
 
