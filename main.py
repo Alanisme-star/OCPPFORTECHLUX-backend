@@ -1013,6 +1013,74 @@ def get_latest_current_api(charge_point_id: str):
     return {}
 
 
+
+@app.get("/api/charge-points/{charge_point_id}/latest-energy")
+def get_latest_energy(charge_point_id: str):
+    """
+    回傳該充電樁最新的累積用電量（kWh），以及若有進行中交易，回傳本次充電用電量 sessionEnergyKWh。
+    - 來源優先：measurand='Energy.Active.Import.Register'（通常為 Wh 或 kWh）
+    - 單位處理：Wh → /1000；kWh → 原值
+    """
+    c = conn.cursor()
+
+    # 1) 讀取最新的 Energy.Active.Import.Register（不分相）
+    c.execute("""
+        SELECT timestamp, value, unit
+        FROM meter_values
+        WHERE charge_point_id = ?
+          AND measurand = 'Energy.Active.Import.Register'
+          AND (phase IS NULL OR phase = '')
+        ORDER BY timestamp DESC
+        LIMIT 1
+    """, (charge_point_id,))
+    row = c.fetchone()
+    if not row:
+        # 無對應量測，回傳空物件
+        return {}
+
+    ts, raw_val, unit = row[0], float(row[1]), (row[2] or "").lower()
+    # 轉為 kWh
+    if unit == "wh" or unit == "w*h" or unit == "w_h":
+        total_kwh = raw_val / 1000.0
+    else:
+        # 預設已是 kWh（或未知單位時依 kWh 解讀）
+        total_kwh = raw_val
+
+    result = {
+        "timestamp": ts,
+        "totalEnergyKWh": round(total_kwh, 6),  # 累積表值（從樁的電表來）
+        "unit": "kWh"
+    }
+
+    # 2) 若有「進行中的交易」，計算本次充電用電量（以 meter_start 當基準）
+    c.execute("""
+        SELECT transaction_id, meter_start
+        FROM transactions
+        WHERE charge_point_id = ? AND stop_timestamp IS NULL
+        ORDER BY start_timestamp DESC
+        LIMIT 1
+    """, (charge_point_id,))
+    tx = c.fetchone()
+    if tx:
+        _, meter_start = tx
+        try:
+            # OCPP 的 meter_start 通常是 Wh，若數值看起來偏大就視為 Wh
+            # 若想嚴謹，也可加入 unit 欄（目前表設計沒有 unit）
+            if meter_start is not None:
+                # 以「最新表值（kWh）」換算回 Wh 再相減，或直接假設 meter_start 單位與表值一致
+                # 這裡假設 meter_start 為 Wh → 先把 total_kwh 轉回 Wh 再相減
+                session_wh = (total_kwh * 1000.0) - float(meter_start)
+                session_kwh = max(0.0, session_wh / 1000.0)
+                result["sessionEnergyKWh"] = round(session_kwh, 6)
+        except Exception:
+            # 若有例外就略過 session 欄位
+            pass
+
+    return result
+
+
+
+
 # 新增獨立的卡片餘額查詢 API（修正縮排）
 @app.get("/api/cards/{id_tag}/balance")
 def get_card_balance(id_tag: str):
