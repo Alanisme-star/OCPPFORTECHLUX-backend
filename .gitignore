@@ -7,10 +7,19 @@ __pycache__/
 venv/
 .env
 
+# SQLite 資料庫
+*.db
+
 # 系統暫存檔
 .DS_Store
 Thumbs.db
+*.swp
 
 # 測試日誌或其他暫存檔
 *.log
 *.bak
+*.coverage
+*.pytest_cache/
+
+# VSCode 設定
+.vscode/

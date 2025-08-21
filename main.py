@@ -305,9 +305,17 @@ CREATE TABLE IF NOT EXISTS meter_values (
     measurand TEXT,
     unit TEXT,
     context TEXT,
-    format TEXT
+    format TEXT,
+    phase TEXT               -- ★ 新增：存相別 L1/L2/L3/N 等
 )
 ''')
+
+# ★ 舊庫相容：若既有資料表沒有 phase 欄位，自動補上
+cursor.execute("PRAGMA table_info(meter_values)")
+_cols = [r[1] for r in cursor.fetchall()]
+if "phase" not in _cols:
+    cursor.execute("ALTER TABLE meter_values ADD COLUMN phase TEXT")
+conn.commit()
 
 
 cursor.execute('''
@@ -643,21 +651,20 @@ class ChargePoint(OcppChargePoint):
                         value = sv.get("value")
                         measurand = sv.get("measurand", "")
                         unit = sv.get("unit", "")
+                        phase = sv.get("phase")  # ★ 新增：相別
 
-                        logging.info(f"📦 sampled_value = {sv}")
- 
                         if not value or not measurand:
-                            logging.warning(f"⚠️ 忽略無效測量資料：value={value}, measurand={measurand}")
+                            logging.warning(f"⚠️ 忽略無效測量資料：value={value}, measurand={measurand}, phase={phase}")
                             continue
 
                         cursor.execute("""
                             INSERT INTO meter_values (
                                 charge_point_id, connector_id, transaction_id,
-                                value, measurand, unit, timestamp
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                                value, measurand, unit, timestamp, phase
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                         """, (
                             cp_id, connector_id, transaction_id,
-                            value, measurand, unit, timestamp
+                            value, measurand, unit, timestamp, phase
                         ))
                         insert_count += 1  # ✅ 每次成功插入就加一
 
@@ -774,36 +781,100 @@ async def start_transaction_by_charge_point(charge_point_id: str, data: dict = B
 
 
 
-
 @app.get("/api/charge-points/{charge_point_id}/latest-power")
 def get_latest_power(charge_point_id: str):
     c = conn.cursor()
 
-    # 1) 優先使用充電樁直接上報的主動功率（單相/三相）
+    # 0) 優先：總功率（無相別）
     c.execute("""
         SELECT timestamp, value, unit
         FROM meter_values
         WHERE charge_point_id = ?
-          AND measurand IN (
-            'Power.Active.Import',
-            'Power.Active.Import.L1','Power.Active.Import.L2','Power.Active.Import.L3'
-          )
+          AND measurand = 'Power.Active.Import'
+          AND (phase IS NULL OR phase = '')
         ORDER BY timestamp DESC
         LIMIT 1
     """, (charge_point_id,))
     row = c.fetchone()
     if row:
-        val = float(row[1])
-        unit = (row[2] or "").lower()
-        # 正規化成 kW
-        if unit == "w":
-            kw = val / 1000.0
-        else:
-            # 若單位本身是 kW 或未知，就直接當 kW 使用
-            kw = val
+        val = float(row[1]); unit = (row[2] or "").lower()
+        kw = val / 1000.0 if unit == "w" else val
         return {"timestamp": row[0], "value": round(kw, 3), "unit": "kW"}
 
-    # 2) 後備：用同一個 timestamp 的 Voltage × Current.Import 推得 kW
+    # 1) 次優：分相功率加總（同時支援兩種寫法：phase 欄位或 measurand 後綴）
+    c.execute("""
+        WITH latest AS (
+          SELECT MAX(timestamp) AS ts
+          FROM meter_values
+          WHERE charge_point_id = ?
+            AND (
+              (measurand = 'Power.Active.Import' AND phase IN ('L1','L2','L3'))
+              OR measurand IN ('Power.Active.Import.L1','Power.Active.Import.L2','Power.Active.Import.L3')
+            )
+        )
+        SELECT m.timestamp,
+               SUM(CASE WHEN LOWER(COALESCE(m.unit,'')) = 'w' THEN m.value/1000.0 ELSE m.value END) AS kw
+        FROM meter_values m
+        JOIN latest L ON m.timestamp = L.ts
+        WHERE m.charge_point_id = ?
+          AND (
+            (m.measurand = 'Power.Active.Import' AND m.phase IN ('L1','L2','L3'))
+            OR m.measurand IN ('Power.Active.Import.L1','Power.Active.Import.L2','Power.Active.Import.L3')
+          )
+    """, (charge_point_id, charge_point_id))
+    r = c.fetchone()
+    if r and r[1] is not None:
+        return {"timestamp": r[0], "value": round(float(r[1]), 3), "unit": "kW"}
+
+    # 2) 後備：以分相 V×I 推總功率（支援 phase 欄位 & 後綴兩種）
+    c.execute("""
+        WITH v AS (
+          SELECT timestamp,
+                 CASE
+                   WHEN measurand LIKE 'Voltage.L%' THEN substr(measurand, length('Voltage.')+1)
+                   WHEN measurand = 'Voltage' THEN phase
+                 END AS ph,
+                 value
+          FROM meter_values
+          WHERE charge_point_id = ?
+            AND (
+              (measurand = 'Voltage' AND phase IN ('L1','L2','L3'))
+              OR measurand IN ('Voltage.L1','Voltage.L2','Voltage.L3')
+            )
+        ),
+        a AS (
+          SELECT timestamp,
+                 CASE
+                   WHEN measurand LIKE 'Current.Import.L%' THEN substr(measurand, length('Current.Import.')+1)
+                   WHEN measurand = 'Current.Import' THEN phase
+                 END AS ph,
+                 value
+          FROM meter_values
+          WHERE charge_point_id = ?
+            AND (
+              (measurand = 'Current.Import' AND phase IN ('L1','L2','L3'))
+              OR measurand IN ('Current.Import.L1','Current.Import.L2','Current.Import.L3')
+            )
+        ),
+        joined AS (
+          SELECT v.timestamp, v.ph, v.value AS vv, a.value AS aa
+          FROM v JOIN a
+            ON v.timestamp = a.timestamp
+           AND v.ph IN ('L1','L2','L3') AND v.ph = a.ph
+        ),
+        latest AS (
+          SELECT MAX(timestamp) AS ts FROM joined
+        )
+        SELECT j.timestamp, SUM(j.vv * j.aa)/1000.0 AS kw
+        FROM joined j
+        JOIN latest L ON j.timestamp = L.ts
+        GROUP BY j.timestamp
+    """, (charge_point_id, charge_point_id))
+    r = c.fetchone()
+    if r and r[1] is not None:
+        return {"timestamp": r[0], "value": round(float(r[1]), 3), "unit": "kW", "derived": True}
+
+    # 3) 最後備：保留原本「同一 timestamp 的 Voltage% × 總電流」作為兜底
     c.execute("""
         SELECT v.timestamp, v.value AS v, a.value AS a
         FROM meter_values v
@@ -822,42 +893,49 @@ def get_latest_power(charge_point_id: str):
         kw = (v * a) / 1000.0
         return {"timestamp": r[0], "value": round(kw, 3), "unit": "kW", "derived": True}
 
-    # 3) 找不到資料
     return {}
+
+
 
 
 @app.get("/api/charge-points/{charge_point_id}/latest-voltage")
 def get_latest_voltage(charge_point_id: str):
     c = conn.cursor()
 
-    # 1) 優先使用充電樁直接上報的總電壓 Voltage
+    # 1) 直接 Voltage（無相別）
     c.execute("""
         SELECT timestamp, value, unit
         FROM meter_values
         WHERE charge_point_id = ?
           AND measurand = 'Voltage'
+          AND (phase IS NULL OR phase = '')
         ORDER BY timestamp DESC
         LIMIT 1
     """, (charge_point_id,))
     row = c.fetchone()
     if row:
-        val = float(row[1])
-        unit = (row[2] or "V")
+        val = float(row[1]); unit = (row[2] or "V")
         return {"timestamp": row[0], "value": round(val, 1), "unit": unit}
 
-    # 2) 後備：以同一時間戳的三相電壓平均（Voltage.L1~L3）
+    # 2) 後備：同一 timestamp 的三相平均（同時支援兩種填法）
     c.execute("""
-        WITH latest AS (
-            SELECT MAX(timestamp) AS ts
-            FROM meter_values
-            WHERE charge_point_id = ?
-              AND measurand IN ('Voltage.L1','Voltage.L2','Voltage.L3')
+    WITH latest AS (
+      SELECT MAX(timestamp) AS ts
+      FROM meter_values
+      WHERE charge_point_id = ?
+        AND (
+          measurand IN ('Voltage.L1','Voltage.L2','Voltage.L3')
+          OR (measurand = 'Voltage' AND phase IN ('L1','L2','L3'))
         )
-        SELECT m.timestamp, AVG(m.value) AS v_avg
-        FROM meter_values m
-        JOIN latest L ON m.timestamp = L.ts
-        WHERE m.charge_point_id = ?
-          AND m.measurand IN ('Voltage.L1','Voltage.L2','Voltage.L3')
+    )
+    SELECT m.timestamp, AVG(m.value) AS v_avg
+    FROM meter_values m
+    JOIN latest L ON m.timestamp = L.ts
+    WHERE m.charge_point_id = ?
+      AND (
+        m.measurand IN ('Voltage.L1','Voltage.L2','Voltage.L3')
+        OR (m.measurand = 'Voltage' AND m.phase IN ('L1','L2','L3'))
+      )
     """, (charge_point_id, charge_point_id))
     r = c.fetchone()
     if r and r[1] is not None:
@@ -866,49 +944,51 @@ def get_latest_voltage(charge_point_id: str):
     return {}
 
 
+
 @app.get("/api/charge-points/{charge_point_id}/latest-current")
 def get_latest_current_api(charge_point_id: str):
     c = conn.cursor()
 
-    # 1) 優先使用充電樁直接上報的總電流 Current.Import
+    # 1) 直接 Current.Import（無相別）
     c.execute("""
         SELECT timestamp, value, unit
         FROM meter_values
         WHERE charge_point_id = ?
           AND measurand = 'Current.Import'
+          AND (phase IS NULL OR phase = '')
         ORDER BY timestamp DESC
         LIMIT 1
     """, (charge_point_id,))
     row = c.fetchone()
     if row:
-        val = float(row[1])
-        unit = (row[2] or "A")
+        val = float(row[1]); unit = (row[2] or "A")
         return {"timestamp": row[0], "value": round(val, 2), "unit": unit}
 
-    # 2) 後備：以同一時間戳三相電流相加（Current.Import.L1~L3）
+    # 2) 後備：同一 timestamp 的三相相加（同時支援兩種填法）
     c.execute("""
-        WITH latest AS (
-            SELECT MAX(timestamp) AS ts
-            FROM meter_values
-            WHERE charge_point_id = ?
-              AND measurand IN ('Current.Import.L1','Current.Import.L2','Current.Import.L3')
+    WITH latest AS (
+      SELECT MAX(timestamp) AS ts
+      FROM meter_values
+      WHERE charge_point_id = ?
+        AND (
+          measurand IN ('Current.Import.L1','Current.Import.L2','Current.Import.L3')
+          OR (measurand = 'Current.Import' AND phase IN ('L1','L2','L3'))
         )
-        SELECT m.timestamp, SUM(m.value) AS a_sum
-        FROM meter_values m
-        JOIN latest L ON m.timestamp = L.ts
-        WHERE m.charge_point_id = ?
-          AND m.measurand IN ('Current.Import.L1','Current.Import.L2','Current.Import.L3')
+    )
+    SELECT m.timestamp, SUM(m.value) AS a_sum
+    FROM meter_values m
+    JOIN latest L ON m.timestamp = L.ts
+    WHERE m.charge_point_id = ?
+      AND (
+        m.measurand IN ('Current.Import.L1','Current.Import.L2','Current.Import.L3')
+        OR (m.measurand = 'Current.Import' AND m.phase IN ('L1','L2','L3'))
+      )
     """, (charge_point_id, charge_point_id))
     r = c.fetchone()
     if r and r[1] is not None:
         return {"timestamp": r[0], "value": round(float(r[1]), 2), "unit": "A", "derived": True}
 
     return {}
-
-
-
-
-
 
 
 # 新增獨立的卡片餘額查詢 API（修正縮排）

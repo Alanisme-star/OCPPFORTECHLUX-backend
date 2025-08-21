@@ -1,104 +1,111 @@
 import asyncio
 import websockets
 import json
-import uuid
 from datetime import datetime, timezone
+import uuid
 
-URI = "wss://ocppfortechlux-backend.onrender.com/TW*MSI*E000100"
+OCPP_URL = "wss://ocppfortechlux-backend.onrender.com/TW*MSI*E000100"
+CHARGE_POINT_ID = "TW*MSI*E000100"
 ID_TAG = "6678B3EB"
-CONNECTOR_ID = 1
-METER_START = 10000
 
-def build_call_msg(action, payload):
-    return json.dumps([
-        2,
-        str(uuid.uuid4()),
-        action,
-        payload
-    ])
+def now():
+    return datetime.now(timezone.utc).isoformat()
 
-async def simulate():
-    async with websockets.connect(URI, subprotocols=["ocpp1.6"]) as ws:
+def new_uid():
+    return str(uuid.uuid4())
+
+async def main():
+    # ⬇️ 關鍵！補上 subprotocols
+    async with websockets.connect(OCPP_URL, subprotocols=["ocpp1.6"]) as ws:
         print("已連線 WebSocket")
+        
+        # 1. BootNotification
+        boot_payload = {
+            "chargePointVendor": "TEST",
+            "chargePointModel": "SIMULATOR"
+        }
+        await ws.send(json.dumps([2, new_uid(), "BootNotification", boot_payload]))
+        print("已送出 BootNotification")
+        msg = await ws.recv()
+        print(f"BootNotification 回應：{msg}")
 
-        # 發送 BootNotification
-        await ws.send(build_call_msg("BootNotification", {
-            "chargePointModel": "SimCP",
-            "chargePointVendor": "TechLux"
-        }))
-        response = await ws.recv()
-        print("BootNotification 回應：", response)
-
-        # 發送 Authorize
-        await ws.send(build_call_msg("Authorize", {
+        # 2. Authorize
+        authorize_payload = {
             "idTag": ID_TAG
-        }))
-        response = await ws.recv()
-        print("Authorize 回應：", response)
+        }
+        await ws.send(json.dumps([2, new_uid(), "Authorize", authorize_payload]))
+        print("已送出 Authorize")
+        msg = await ws.recv()
+        print(f"Authorize 回應：{msg}")
 
-        # 發送 StartTransaction
-        now = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
-        await ws.send(build_call_msg("StartTransaction", {
-            "connectorId": CONNECTOR_ID,
+        # 3. StartTransaction
+        transaction_id = None
+        start_payload = {
+            "connectorId": 1,
             "idTag": ID_TAG,
-            "meterStart": METER_START,
-            "timestamp": now
-        }))
+            "meterStart": 0,
+            "timestamp": now()
+        }
+        uid = new_uid()
+        await ws.send(json.dumps([2, uid, "StartTransaction", start_payload]))
         print("已送出 StartTransaction")
-        response = await ws.recv()
-        print("StartTransaction 回應：", response)
+        msg = await ws.recv()
+        print(f"StartTransaction 回應：{msg}")
+        try:
+            arr = json.loads(msg)
+            transaction_id = arr[2].get("transactionId") or arr[2].get("transaction_id")
+            print(f"StartTransaction 取得 transaction_id: {transaction_id}")
+        except Exception as e:
+            print(f"無法解析 StartTransaction 回應: {e}")
+            return
 
-        # 傳送 5 筆 MeterValues，每隔 10 秒
-        for i in range(5):
-            await asyncio.sleep(10)
-            meter_value = [{
-                "timestamp": datetime.utcnow().replace(tzinfo=timezone.utc).isoformat(),
-                "sampledValue": [{
-                    "value": str(METER_START + i * 100),
-                    "measurand": "Energy.Active.Import.Register",
-                    "unit": "Wh"
+        # 4. 定期送 MeterValues
+        for i in range(1, 6):
+            payload = {
+                "connectorId": 1,
+                "transactionId": transaction_id,
+                "meterValue": [{
+                    "timestamp": now(),
+                    "sampledValue": [{
+                        "value": str(i * 100),
+                        "measurand": "Energy.Active.Import.Register",
+                        "unit": "Wh"
+                    }]
                 }]
-            }]
-            await ws.send(build_call_msg("MeterValues", {
-                "connectorId": CONNECTOR_ID,
-                "meterValue": meter_value
-            }))
-            print(f"已傳送第 {i+1} 筆 MeterValues")
-            await ws.recv()  # 接收伺服器回應
+            }
+            await ws.send(json.dumps([2, new_uid(), "MeterValues", payload]))
+            print(f"已傳送第 {i} 筆 MeterValues")
+            msg = await ws.recv()
+            print(f"MeterValues 回應：{msg}")
+            await asyncio.sleep(1)
 
-        # 等待後端主動送出 StopTransaction 指令（最多 60 秒）
-        print("等待 StopTransaction 指令（最多 60 秒）...")
+        print("等待 RemoteStopTransaction 指令（最多 60 秒）...")
         try:
             while True:
-                message = await asyncio.wait_for(ws.recv(), timeout=60)
-                print("接收到訊息：", message)
-                # 處理 StopTransaction，主動回應 CallResult
-                try:
-                    msg_obj = json.loads(message)
-                except Exception:
-                    msg_obj = None
-
-                # OCPP message structure: [2,call_id,action,payload] or [3,call_id,payload]
-                # 我們只要處理 Call (type==2) 的 StopTransaction
-                if (
-                    isinstance(msg_obj, list) and
-                    len(msg_obj) >= 3 and
-                    msg_obj[0] == 2 and
-                    msg_obj[2] == "StopTransaction"
-                ):
-                    call_id = msg_obj[1]
-                    print("成功接收到停止命令，回覆 CallResult")
-                    # 標準 StopTransaction CallResult payload
-                    reply = [
-                        3,
-                        call_id,
-                        {"idTagInfo": {"status": "Accepted"}}
-                    ]
-                    await ws.send(json.dumps(reply))
-                    print("已送出 StopTransaction 回覆")
-                    break
+                msg = await asyncio.wait_for(ws.recv(), timeout=60)
+                print(f"接收到訊息：{msg}")
+                arr = json.loads(msg)
+                if arr[2] == "RemoteStopTransaction":
+                    remote_payload = arr[3]
+                    print(f"收到 RemoteStopTransaction，內容：{remote_payload}")
+                    if str(remote_payload.get("transactionId")) == str(transaction_id):
+                        # 立即主動發 StopTransaction
+                        stop_payload = {
+                            "transactionId": transaction_id,
+                            "idTag": ID_TAG,
+                            "meterStop": 500,
+                            "timestamp": now(),
+                            "reason": "Remote"
+                        }
+                        print(f"→ 主動發送 StopTransaction：{stop_payload}")
+                        await ws.send(json.dumps([2, new_uid(), "StopTransaction", stop_payload]))
+                        msg2 = await ws.recv()
+                        print(f"StopTransaction 回應：{msg2}")
+                        print("StopTransaction 回應完成，模擬器結束")
+                        await asyncio.sleep(2)
+                        return
         except asyncio.TimeoutError:
-            print("未收到停止命令，模擬器自動結束")
+            print("等待 RemoteStopTransaction 超時，模擬器結束")
 
 if __name__ == "__main__":
-    asyncio.run(simulate())
+    asyncio.run(main())

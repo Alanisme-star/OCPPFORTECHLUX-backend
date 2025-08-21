@@ -1,7 +1,7 @@
 fastapi
 uvicorn[standard]
-websockets
-ocpp==0.12.1
+websockets>=10.4,<12
+ocpp>=0.25
 requests
 reportlab
 werkzeug
