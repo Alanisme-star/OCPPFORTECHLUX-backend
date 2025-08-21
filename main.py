@@ -25,14 +25,6 @@ from dateutil.parser import parse as parse_date
 from websockets.exceptions import ConnectionClosedOK
 from werkzeug.security import generate_password_hash, check_password_hash
 from ocpp.v16 import call, call_result, ChargePoint as OcppChargePoint
-from ocpp.v16.call_result import (
-    BootNotificationPayload,
-    HeartbeatPayload,
-    MeterValuesPayload,
-    StartTransactionPayload,
-    StopTransactionPayload,
-    StatusNotificationPayload
-)
 from ocpp.v16.enums import Action, RegistrationStatus
 from ocpp.routing import on
 from urllib.parse import urlparse, parse_qs
@@ -81,7 +73,7 @@ def get_active_connections():
 
 
 
-@app.websocket("/{charge_point_id}")
+@app.websocket("/ocpp/{charge_point_id}")
 async def websocket_endpoint(websocket: WebSocket, charge_point_id: str):
     from ocpp.routing import on
     charge_point_id = charge_point_id.lstrip("/")
@@ -204,6 +196,22 @@ CREATE TABLE IF NOT EXISTS daily_pricing (
 ''')
 
 
+
+# ★ 新增：每日「多時段」電價規則，供 /api/pricing/price-now 使用
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS daily_pricing_rules (
+    date TEXT,          -- YYYY-MM-DD
+    start_time TEXT,    -- HH:MM
+    end_time TEXT,      -- HH:MM
+    price REAL,         -- 當時段電價
+    label TEXT          -- 可選：顯示用標籤（例如 尖峰/離峰/活動價）
+)
+''')
+conn.commit()
+
+
+
+
 cursor.execute('''
 CREATE TABLE IF NOT EXISTS stop_transactions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -292,6 +300,21 @@ CREATE TABLE IF NOT EXISTS weekly_pricing (
 )
 ''')
 conn.commit()
+
+
+
+# ★ 新增：一般季別/日別的時段電價規則，供 /api/pricing-rules 使用
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS pricing_rules (
+    season TEXT,        -- 例如：summer、winter…（你自訂）
+    day_type TEXT,      -- 例如：weekday、weekend…（你自訂）
+    start_time TEXT,    -- HH:MM
+    end_time TEXT,      -- HH:MM
+    price REAL
+)
+''')
+conn.commit()
+
 
 
 cursor.execute('''
@@ -397,7 +420,7 @@ class ChargePoint(OcppChargePoint):
 
             if cp_id is None or transaction_id is None:
                 print(f"🔴【OCPP Handler】❌ StopTransaction 欄位缺失 | cp_id={cp_id} | transaction_id={transaction_id}")
-                return StopTransactionPayload()
+                return call_result.StopTransactionPayload()
 
             print(f"🟢【OCPP Handler】UPDATE transactions，transaction_id={transaction_id}")
    
@@ -435,7 +458,7 @@ class ChargePoint(OcppChargePoint):
         except Exception as e:
             print(f"🔴【OCPP Handler】❌ StopTransaction 儲存失敗：{e}")
 
-        return StopTransactionPayload()
+        return call_result.StopTransactionPayload()
 
 
 
@@ -459,7 +482,7 @@ class ChargePoint(OcppChargePoint):
 
             if cp_id is None or status is None:
                 logging.error(f"❌ 欄位遺失 | cp_id={cp_id} | connector_id={connector_id} | status={status}")
-                return StatusNotificationPayload()
+                return call_result.StatusNotificationPayload()
 
             # 寫入資料庫
             with sqlite3.connect("ocpp_data.db") as conn:
@@ -479,11 +502,11 @@ class ChargePoint(OcppChargePoint):
             }
 
             logging.info(f"📡 StatusNotification | CP={cp_id} | connector={connector_id} | errorCode={error_code} | status={status}")
-            return StatusNotificationPayload()
+            return call_result.StatusNotificationPayload()
 
         except Exception as e:
             logging.exception(f"❌ StatusNotification 發生未預期錯誤：{e}")
-            return StatusNotificationPayload()
+            return call_result.StatusNotificationPayload()
 
 
 
@@ -492,7 +515,7 @@ class ChargePoint(OcppChargePoint):
     async def on_boot_notification(self, charge_point_model, charge_point_vendor, **kwargs):
         now = datetime.utcnow().replace(tzinfo=timezone.utc)
         logging.info(f"🔌 BootNotification | 模型={charge_point_model} | 廠商={charge_point_vendor}")
-        return BootNotificationPayload(
+        return call_result.BootNotificationPayload(
             current_time=now.isoformat(),
             interval=10,
             status="Accepted"
@@ -502,7 +525,7 @@ class ChargePoint(OcppChargePoint):
     async def on_heartbeat(self):
         now = datetime.utcnow().replace(tzinfo=timezone.utc)
         logging.info(f"❤️ Heartbeat | CP={self.id}")
-        return HeartbeatPayload(current_time=now.isoformat())
+        return call_result.HeartbeatPayload(current_time=now.isoformat())
 
     @on(Action.Authorize)
     async def on_authorize(self, id_tag, **kwargs):
@@ -608,7 +631,7 @@ class ChargePoint(OcppChargePoint):
         cp_id = getattr(self, "id", None)
         if cp_id is None:
             logging.error("❌ 無法識別充電樁 ID")
-            return MeterValuesPayload()
+            return call_result.MeterValuesPayload()
 
         try:
             connector_id = kwargs.get("connectorId", 0)
@@ -674,9 +697,9 @@ class ChargePoint(OcppChargePoint):
 
         except Exception as e:
             logging.exception(f"❌ 處理 MeterValues 時發生錯誤: {e}")
-            return MeterValuesPayload()
+            return call_result.MeterValuesPayload()
 
-        return MeterValuesPayload()
+        return call_result.MeterValuesPayload()
 
 
     @on(Action.RemoteStopTransaction)
