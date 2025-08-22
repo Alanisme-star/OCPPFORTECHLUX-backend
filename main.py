@@ -13,7 +13,6 @@ import os
 import io
 import csv
 import uuid
-import asyncio
 import logging
 import sqlite3
 import uvicorn
@@ -87,13 +86,6 @@ def get_active_connections():
 
 from fastapi import WebSocket, WebSocketDisconnect
 
-def _normalize_cp_id(raw: str) -> str:
-    """
-    將 URL 中的 charge_point_id 做標準化：
-    1) URL decode（把 %2A 還原成 *）
-    2) 去除前導斜線
-    """
-    return unquote(raw).lstrip("/")
 
 async def _accept_or_reject_ws(websocket: WebSocket, raw_cp_id: str):
     # 標準化 CPID
@@ -839,7 +831,7 @@ async def stop_transaction_by_charge_point(charge_point_id: str):
     # 發送 RemoteStopTransaction
     print(f"🟢【API呼叫】發送 RemoteStopTransaction 給充電樁")
     print(f"🟢【API呼叫】即將送出 RemoteStopTransaction | charge_point_id={charge_point_id} | transaction_id={transaction_id}")
-    req = call.RemoteStopTransactionPayload(transaction_id=transaction_id)
+    req = call.RemoteStopTransaction(transaction_id=transaction_id)
     resp = await cp.call(req)
     print(f"🟢【API回應】呼叫 RemoteStopTransaction 完成，resp={resp}")
 
@@ -2626,7 +2618,7 @@ async def stop_transaction_by_charge_point(charge_point_id: str):
 
         # 發送 RemoteStopTransaction，設定 60 秒 timeout
         print(f"🟢【API呼叫】發送 RemoteStopTransaction 給充電樁")
-        req = call.RemoteStopTransactionPayload(transaction_id=transaction_id)
+        req = call.RemoteStopTransaction(transaction_id=transaction_id)
         try:
             resp = await asyncio.wait_for(cp.call(req), timeout=60)
         except asyncio.TimeoutError:
@@ -2691,7 +2683,7 @@ async def stop_transaction_by_charge_point(charge_point_id: str):
 
     # 發送 RemoteStopTransaction
     print(f"🟢【API呼叫】發送 RemoteStopTransaction 給充電樁")
-    req = call.RemoteStopTransactionPayload(transaction_id=transaction_id)
+    req = call.RemoteStopTransaction(transaction_id=transaction_id)
     resp = await cp.call(req)
     print(f"🟢【API回應】呼叫 RemoteStopTransaction 完成，resp={resp}")
 
