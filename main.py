@@ -141,20 +141,29 @@ async def _accept_or_reject_ws(websocket: WebSocket, raw_cp_id: str):
 
 
 @app.websocket("/ocpp/{charge_point_id:path}")
-async def ocpp_endpoint(websocket: WebSocket, charge_point_id: str):
-    logging.info(f"New OCPP connection from {charge_point_id}")
+async def websocket_endpoint(websocket: WebSocket, charge_point_id: str):
     try:
-        while True:
-            message = await websocket.receive_text()
-            logging.debug(f"Received from {charge_point_id}: {message}")
-            await websocket.send_text(f"ACK: {message}")
+        # 1) 驗證 + accept(subprotocol="ocpp1.6")，並回傳標準化 cp_id
+        cp_id = await _accept_or_reject_ws(websocket, charge_point_id)
+        if cp_id is None:
+            return
+
+        # 2) 啟動 OCPP handler
+        cp = ChargePoint(cp_id, FastAPIWebSocketAdapter(websocket))
+        connected_charge_points[cp_id] = cp
+        await cp.start()
+
+    except WebSocketDisconnect:
+        logger.warning(f"⚠️ Disconnected: {charge_point_id}")
     except Exception as e:
-        logging.error(f"Error in OCPP WebSocket for {charge_point_id}: {e}")
+        logger.error(f"❌ WebSocket error for {charge_point_id}: {e}")
+        try:
+            await websocket.close()
+        except Exception:
+            pass
     finally:
-        await websocket.close()
-        logging.info(f"OCPP connection closed: {charge_point_id}")
-
-
+        # 3) 清理連線狀態
+        connected_charge_points.pop(_normalize_cp_id(charge_point_id), None)
 
 
 
@@ -412,7 +421,7 @@ class ChargePoint(OcppChargePoint):
             reason = "Remote"
 
         # 發送 OCPP StopTransaction
-        request = call.StopTransactionPayload(
+        request = call.StopTransaction(
             transaction_id=transaction_id,
             meter_stop=meter_stop or 0,
             timestamp=timestamp,
@@ -427,7 +436,7 @@ class ChargePoint(OcppChargePoint):
     async def send_remote_start_transaction(self, id_tag: str, connector_id: int = 1):
         from ocpp.v16 import call
 
-        request = call.RemoteStartTransactionPayload(
+        request = call.RemoteStartTransaction(
             id_tag=id_tag,
             connector_id=connector_id
         )
@@ -452,7 +461,7 @@ class ChargePoint(OcppChargePoint):
 
             if cp_id is None or transaction_id is None:
                 print(f"🔴【OCPP Handler】❌ StopTransaction 欄位缺失 | cp_id={cp_id} | transaction_id={transaction_id}")
-                return call_result.StopTransactionPayload()
+                return call_result.StopTransaction()
 
             with sqlite3.connect("ocpp_data.db") as _conn:
                 _cur = _conn.cursor()
@@ -516,7 +525,7 @@ class ChargePoint(OcppChargePoint):
         except Exception as e:
             print(f"🔴【OCPP Handler】❌ StopTransaction 儲存/扣款失敗：{e}")
 
-        return call_result.StopTransactionPayload()
+        return call_result.StopTransaction()
 
 
 
@@ -543,7 +552,7 @@ class ChargePoint(OcppChargePoint):
 
             if cp_id is None or status is None:
                 logging.error(f"❌ 欄位遺失 | cp_id={cp_id} | connector_id={connector_id} | status={status}")
-                return call_result.StatusNotificationPayload()
+                return call_result.StatusNotification()
 
             # 寫入資料庫
             with sqlite3.connect("ocpp_data.db") as conn:
@@ -563,11 +572,11 @@ class ChargePoint(OcppChargePoint):
             }
 
             logging.info(f"📡 StatusNotification | CP={cp_id} | connector={connector_id} | errorCode={error_code} | status={status}")
-            return call_result.StatusNotificationPayload()
+            return call_result.StatusNotification()
 
         except Exception as e:
             logging.exception(f"❌ StatusNotification 發生未預期錯誤：{e}")
-            return call_result.StatusNotificationPayload()
+            return call_result.StatusNotification()
 
 
 
@@ -576,7 +585,7 @@ class ChargePoint(OcppChargePoint):
     async def on_boot_notification(self, charge_point_model, charge_point_vendor, **kwargs):
         now = datetime.utcnow().replace(tzinfo=timezone.utc)
         logging.info(f"🔌 BootNotification | 模型={charge_point_model} | 廠商={charge_point_vendor}")
-        return call_result.BootNotificationPayload(
+        return call_result.BootNotification(
             current_time=now.isoformat(),
             interval=10,
             status="Accepted"
@@ -586,7 +595,7 @@ class ChargePoint(OcppChargePoint):
     async def on_heartbeat(self):
         now = datetime.utcnow().replace(tzinfo=timezone.utc)
         logging.info(f"❤️ Heartbeat | CP={self.id}")
-        return call_result.HeartbeatPayload(current_time=now.isoformat())
+        return call_result.Heartbeat(current_time=now.isoformat())
 
     @on(Action.Authorize)
     async def on_authorize(self, id_tag, **kwargs):
@@ -605,7 +614,7 @@ class ChargePoint(OcppChargePoint):
             logging.info(f"🔎 驗證有效期限valid_until={valid_until_dt.isoformat()} / now={now.isoformat()}")
             status = "Accepted" if status_db == "Accepted" and valid_until_dt > now else "Expired"
         logging.info(f"🆔 Authorize | idTag: {id_tag} | 查詢結果: {status}")
-        return call_result.AuthorizePayload(id_tag_info={"status": status})
+        return call_result.Authorize(id_tag_info={"status": status})
 
 
     logger = logging.getLogger("ocpp_logger")
@@ -655,17 +664,17 @@ class ChargePoint(OcppChargePoint):
             card = cursor.fetchone()
             if not card:
                 logging.warning(f"⛔ 無此卡片帳戶資料，StartTransaction 拒絕")
-                return call_result.StartTransactionPayload(transaction_id=0, id_tag_info={"status": "Invalid"})
+                return call_result.StartTransaction(transaction_id=0, id_tag_info={"status": "Invalid"})
 
             balance = float(card[0] or 0)
             if balance <= 0:
                 logging.warning(f"💳 餘額不足：{balance} 元，StartTransaction 拒絕")
-                return call_result.StartTransactionPayload(transaction_id=0, id_tag_info={"status": "Blocked"})
+                return call_result.StartTransaction(transaction_id=0, id_tag_info={"status": "Blocked"})
 
 
             if status != "Accepted":
                 logging.warning(f"⛔ StartTransaction 拒絕 | idTag={id_tag} | status={status}")
-                return call_result.StartTransactionPayload(transaction_id=0, id_tag_info={"status": status})
+                return call_result.StartTransaction(transaction_id=0, id_tag_info={"status": status})
 
             # ✅ 建立交易記錄
             transaction_id = int(datetime.utcnow().timestamp() * 1000)
@@ -681,7 +690,7 @@ class ChargePoint(OcppChargePoint):
             conn.commit()
             logging.info(f"🚗 StartTransaction 成功 | CP={self.id} | idTag={id_tag} | transactionId={transaction_id}")
 
-            return call_result.StartTransactionPayload(
+            return call_result.StartTransaction(
                 transaction_id=transaction_id,
                 id_tag_info={"status": "Accepted"}
             )
@@ -693,7 +702,7 @@ class ChargePoint(OcppChargePoint):
         cp_id = getattr(self, "id", None)
         if cp_id is None:
             logging.error("❌ 無法識別充電樁 ID")
-            return call_result.MeterValuesPayload()
+            return call_result.MeterValues()
 
         try:
             connector_id = kwargs.get("connector_id")
@@ -763,9 +772,9 @@ class ChargePoint(OcppChargePoint):
 
         except Exception as e:
             logging.exception(f"❌ 處理 MeterValues 時發生錯誤: {e}")
-            return call_result.MeterValuesPayload()
+            return call_result.MeterValues()
 
-        return call_result.MeterValuesPayload()
+        return call_result.MeterValues()
 
 
     @on(Action.RemoteStopTransaction)
@@ -773,7 +782,7 @@ class ChargePoint(OcppChargePoint):
         # 充電樁端收到後，應立即主動送 StopTransaction
         # 這裡回應 Central 系統 "Accepted" 表示已處理
         print(f"✅ 收到遠端停止充電要求，transaction_id={transaction_id}")
-        return call_result.RemoteStopTransactionPayload(status="Accepted")
+        return call_result.RemoteStopTransaction(status="Accepted")
 
 
 @app.get("/api/charge-points/{charge_point_id}/live-status")
@@ -875,14 +884,92 @@ from fastapi import FastAPI, HTTPException
 latest_power_data = {}
 
 @app.get("/api/charge-points/{charge_point_id}/latest-power")
-async def get_latest_power(charge_point_id: str):
+def get_latest_power(charge_point_id: str):
     """
-    回傳充電樁最新的電壓 / 電流 / 功率 / 電量等即時數據
+    回傳該樁「最新功率(kW)」。優先使用 measurand='Power.Active.Import'（W/kW），
+    若沒有，就在最近 5 秒內以各相 Voltage × Current.Import 推導。
     """
-    if charge_point_id not in latest_power_data:
-        raise HTTPException(status_code=404, detail="No power data found for this charge point")
+    charge_point_id = _normalize_cp_id(charge_point_id)
+    c = conn.cursor()
 
-    return latest_power_data[charge_point_id]
+    # 0) 直接取總功率（不分相）
+    c.execute("""
+        SELECT timestamp, value, unit
+        FROM meter_values
+        WHERE charge_point_id = ?
+          AND measurand = 'Power.Active.Import'
+          AND (phase IS NULL OR phase = '')
+        ORDER BY timestamp DESC
+        LIMIT 1
+    """, (charge_point_id,))
+    row = c.fetchone()
+    if row:
+        ts, val, unit = row[0], float(row[1]), (row[2] or "").lower()
+        kw = (val / 1000.0) if unit in ("w",) else val
+        return {"timestamp": ts, "value": round(kw, 3), "unit": "kW"}
+
+    # 1) 最近 5 秒內，各相取「該相最新」的 V 與 I，再做 Σ(V*I)/1000 推得 kW
+    c.execute("""
+    WITH latest_ts AS (
+      SELECT MAX(timestamp) AS ts FROM meter_values WHERE charge_point_id=?
+    ),
+    win AS (
+      SELECT datetime((SELECT ts FROM latest_ts), '-5 seconds') AS from_ts,
+             (SELECT ts FROM latest_ts) AS to_ts
+    ),
+    v_pick AS (   -- 各相最新電壓
+      SELECT COALESCE(
+               CASE WHEN measurand LIKE 'Voltage.L%' THEN substr(measurand, length('Voltage.')+1) END,
+               CASE WHEN measurand='Voltage' THEN phase END
+             ) AS ph,
+             MAX(timestamp) AS ts
+      FROM meter_values, win
+      WHERE charge_point_id=? AND (
+        measurand IN ('Voltage.L1','Voltage.L2','Voltage.L3')
+        OR (measurand='Voltage' AND phase IN ('L1','L2','L3'))
+      ) AND timestamp BETWEEN from_ts AND to_ts
+      GROUP BY ph
+    ),
+    i_pick AS (   -- 各相最新電流
+      SELECT COALESCE(
+               CASE WHEN measurand LIKE 'Current.Import.L%' THEN substr(measurand, length('Current.Import.')+1) END,
+               CASE WHEN measurand='Current.Import' THEN phase END
+             ) AS ph,
+             MAX(timestamp) AS ts
+      FROM meter_values, win
+      WHERE charge_point_id=? AND (
+        measurand IN ('Current.Import.L1','Current.Import.L2','Current.Import.L3')
+        OR (measurand='Current.Import' AND phase IN ('L1','L2','L3'))
+      ) AND timestamp BETWEEN from_ts AND to_ts
+      GROUP BY ph
+    ),
+    v AS (
+      SELECT p.ph, m.value AS v_val, m.timestamp AS v_ts
+      FROM v_pick p JOIN meter_values m ON m.timestamp=p.ts
+      WHERE m.charge_point_id=? AND (
+        (m.measurand='Voltage' AND m.phase=p.ph) OR m.measurand='Voltage.'||p.ph
+      )
+    ),
+    i AS (
+      SELECT p.ph, m.value AS i_val, m.timestamp AS i_ts
+      FROM i_pick p JOIN meter_values m ON m.timestamp=p.ts
+      WHERE m.charge_point_id=? AND (
+        (m.measurand='Current.Import' AND m.phase=p.ph) OR m.measurand='Current.Import.'||p.ph
+      )
+    )
+    SELECT
+      COALESCE(MAX(v.v_ts), MAX(i.i_ts)) AS ts,
+      SUM(CASE WHEN v.v_val IS NOT NULL AND i.i_val IS NOT NULL THEN (v.v_val * i.i_val) ELSE 0 END) AS watt_sum
+    FROM v LEFT JOIN i ON v.ph = i.ph
+    """, (charge_point_id, charge_point_id, charge_point_id, charge_point_id))
+    r = c.fetchone()
+    if r and r[1] is not None:
+        ts, watt_sum = r[0], float(r[1])
+        kw = max(0.0, watt_sum / 1000.0)
+        return {"timestamp": ts, "value": round(kw, 3), "unit": "kW", "derived": True}
+
+    # 2) 都沒有資料
+    return {}
 
 
 
