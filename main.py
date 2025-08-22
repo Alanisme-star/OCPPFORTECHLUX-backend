@@ -123,13 +123,15 @@ async def _accept_or_reject_ws(websocket: WebSocket, raw_cp_id: str):
     await websocket.accept(subprotocol="ocpp1.6")
     print(f"✅ 接受 WebSocket：cp_id={cp_id} | ip={websocket.client.host}")
 
-    # 寫入連線紀錄
     now = datetime.utcnow().isoformat()
-    cursor.execute(
-        "INSERT INTO connection_logs (charge_point_id, ip, time) VALUES (?, ?, ?)",
-        (cp_id, websocket.client.host, now)
-    )
-    conn.commit()
+    with get_conn() as _c:
+        cur = _c.cursor()
+        cur.execute(
+            "INSERT INTO connection_logs (charge_point_id, ip, time) VALUES (?, ?, ?)",
+            (cp_id, websocket.client.host, now)
+        )
+        _c.commit()
+
 
     return cp_id
 
@@ -730,15 +732,17 @@ class ChargePoint(OcppChargePoint):
                 logging.error("❌ 無法識別充電樁 ID")
                 return call_result.MeterValues()
 
-            connector_id = kwargs.get("connector_id")
-            if connector_id is None:
-                connector_id = kwargs.get("connectorId", 0)
+            connector_id = kwargs.get("connector_id") or kwargs.get("connectorId") or 0
             try:
-                connector_id = int(connector_id or 0)
+                connector_id = int(connector_id)
             except Exception:
                 connector_id = 0
 
-            transaction_id = kwargs.get("transaction_id") or kwargs.get("transactionId") or ""
+            transaction_id = (
+                kwargs.get("transaction_id") or
+                kwargs.get("transactionId") or
+                ""
+            )
             meter_value_list = kwargs.get("meter_value") or kwargs.get("meterValue") or []
 
             # 若缺 tx_id，從 DB 補最近未結束的一筆
@@ -768,6 +772,11 @@ class ChargePoint(OcppChargePoint):
                         phase = sv.get("phase")
                         if val is None or not meas:
                             continue
+                        # 轉成 float，避免字串寫入觸發型別/約束異常
+                        try:
+                            val = float(val)
+                        except Exception:
+                            continue
                         _cur.execute("""
                             INSERT INTO meter_values
                               (charge_point_id, connector_id, transaction_id,
@@ -776,11 +785,13 @@ class ChargePoint(OcppChargePoint):
                         """, (cp_id, connector_id, transaction_id, val, meas, unit, ts, phase))
                         insert_count += 1
                 _c.commit()
-            logging.info(f"📊 寫入完成，共 {insert_count} 筆測量資料")
+
+            logging.info(f"📊 MeterValues 寫入完成，共 {insert_count} 筆 | tx={transaction_id} | keys={list(kwargs.keys())}")
+            return call_result.MeterValues()
+
         except Exception as e:
-            logging.exception(f"❌ 處理 MeterValues 時發生錯誤: {e}")
-        finally:
-            # ✅ 無論如何都回應空確認（v1.6 規範）
+            # 把原始 payload 打出來便於追查為何 0 筆
+            logging.exception(f"❌ 處理 MeterValues 例外：{e} | payload={kwargs}")
             return call_result.MeterValues()
 
 
