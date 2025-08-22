@@ -438,7 +438,7 @@ class ChargePoint(OcppChargePoint):
 
 
 
-    @on(Action.stop_transaction)
+    @on(Action.StopTransaction)
     async def on_stop_transaction(self, **kwargs):
         try:
             print(f"🟢【OCPP Handler】StopTransaction kwargs: {kwargs}")
@@ -525,7 +525,7 @@ class ChargePoint(OcppChargePoint):
 
 
 
-    @on(Action.status_notification)
+    @on(Action.StatusNotification)
     async def on_status_notification(self, connector_id=None, status=None, error_code=None, timestamp=None, **kwargs):
         global charging_point_status
 
@@ -573,7 +573,7 @@ class ChargePoint(OcppChargePoint):
 
 
 
-    @on(Action.boot_notification)
+    @on(Action.BootNotification)
     async def on_boot_notification(self, charge_point_model, charge_point_vendor, **kwargs):
         now = datetime.utcnow().replace(tzinfo=timezone.utc)
         logging.info(f"🔌 BootNotification | 模型={charge_point_model} | 廠商={charge_point_vendor}")
@@ -583,13 +583,13 @@ class ChargePoint(OcppChargePoint):
             status="Accepted"
         )
 
-    @on(Action.heartbeat)
+    @on(Action.Heartbeat)
     async def on_heartbeat(self):
         now = datetime.utcnow().replace(tzinfo=timezone.utc)
         logging.info(f"❤️ Heartbeat | CP={self.id}")
         return call_result.Heartbeat(current_time=now.isoformat())
 
-    @on(Action.authorize)
+    @on(Action.Authorize)
     async def on_authorize(self, id_tag, **kwargs):
         cursor.execute("SELECT status, valid_until FROM id_tags WHERE id_tag = ?", (id_tag,))
         row = cursor.fetchone()
@@ -614,7 +614,7 @@ class ChargePoint(OcppChargePoint):
 
 
 
-    @on(Action.start_transaction)
+    @on(Action.StartTransaction)
     async def on_start_transaction(self, connector_id, id_tag, meter_start, timestamp, **kwargs):
         with sqlite3.connect("ocpp_data.db") as conn:
             cursor = conn.cursor()
@@ -689,7 +689,7 @@ class ChargePoint(OcppChargePoint):
 
 
 
-    @on(Action.meter_values)
+    @on(Action.MeterValues)
     async def on_meter_values(self, **kwargs):
         cp_id = getattr(self, "id", None)
         if cp_id is None:
@@ -769,7 +769,7 @@ class ChargePoint(OcppChargePoint):
         return call_result.MeterValues()
 
 
-    @on(Action.remote_stop_transaction)
+    @on(Action.RemoteStopTransaction)
     async def on_remote_stop_transaction(self, transaction_id, **kwargs):
         # 充電樁端收到後，應立即主動送 StopTransaction
         # 這裡回應 Central 系統 "Accepted" 表示已處理
