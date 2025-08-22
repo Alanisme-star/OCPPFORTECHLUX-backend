@@ -438,7 +438,7 @@ class ChargePoint(OcppChargePoint):
 
 
 
-    @on(Action.StopTransaction)
+    @on(Action.stop_transaction)
     async def on_stop_transaction(self, **kwargs):
         try:
             print(f"🟢【OCPP Handler】StopTransaction kwargs: {kwargs}")
@@ -525,7 +525,7 @@ class ChargePoint(OcppChargePoint):
 
 
 
-    @on(Action.StatusNotification)
+    @on(Action.status_notification)
     async def on_status_notification(self, connector_id=None, status=None, error_code=None, timestamp=None, **kwargs):
         global charging_point_status
 
@@ -573,7 +573,7 @@ class ChargePoint(OcppChargePoint):
 
 
 
-    @on(Action.BootNotification)
+    @on(Action.boot_notification)
     async def on_boot_notification(self, charge_point_model, charge_point_vendor, **kwargs):
         now = datetime.utcnow().replace(tzinfo=timezone.utc)
         logging.info(f"🔌 BootNotification | 模型={charge_point_model} | 廠商={charge_point_vendor}")
@@ -583,13 +583,13 @@ class ChargePoint(OcppChargePoint):
             status="Accepted"
         )
 
-    @on(Action.Heartbeat)
+    @on(Action.heartbeat)
     async def on_heartbeat(self):
         now = datetime.utcnow().replace(tzinfo=timezone.utc)
         logging.info(f"❤️ Heartbeat | CP={self.id}")
         return call_result.Heartbeat(current_time=now.isoformat())
 
-    @on(Action.Authorize)
+    @on(Action.authorize)
     async def on_authorize(self, id_tag, **kwargs):
         cursor.execute("SELECT status, valid_until FROM id_tags WHERE id_tag = ?", (id_tag,))
         row = cursor.fetchone()
@@ -614,7 +614,7 @@ class ChargePoint(OcppChargePoint):
 
 
 
-    @on(Action.StartTransaction)
+    @on(Action.start_transaction)
     async def on_start_transaction(self, connector_id, id_tag, meter_start, timestamp, **kwargs):
         with sqlite3.connect("ocpp_data.db") as conn:
             cursor = conn.cursor()
@@ -689,7 +689,7 @@ class ChargePoint(OcppChargePoint):
 
 
 
-    @on(Action.MeterValues)
+    @on(Action.meter_values)
     async def on_meter_values(self, **kwargs):
         cp_id = getattr(self, "id", None)
         if cp_id is None:
@@ -769,7 +769,7 @@ class ChargePoint(OcppChargePoint):
         return call_result.MeterValues()
 
 
-    @on(Action.RemoteStopTransaction)
+    @on(Action.remote_stop_transaction)
     async def on_remote_stop_transaction(self, transaction_id, **kwargs):
         # 充電樁端收到後，應立即主動送 StopTransaction
         # 這裡回應 Central 系統 "Accepted" 表示已處理
@@ -878,8 +878,9 @@ latest_power_data = {}
 @app.get("/api/charge-points/{charge_point_id}/latest-power")
 def get_latest_power(charge_point_id: str):
     """
-    回傳該樁「最新功率(kW)」。優先使用 measurand='Power.Active.Import'（W/kW），
-    若沒有，就在最近 5 秒內以各相 Voltage × Current.Import 推導。
+    回傳該樁「最新功率(kW)」。
+    優先使用 measurand='Power.Active.Import'（單位 W 或 kW）。
+    若沒有，則在最近 5 秒內以各相 Voltage × Current.Import 推導 ΣP。
     """
     charge_point_id = _normalize_cp_id(charge_point_id)
     c = conn.cursor()
@@ -900,7 +901,7 @@ def get_latest_power(charge_point_id: str):
         kw = (val / 1000.0) if unit in ("w",) else val
         return {"timestamp": ts, "value": round(kw, 3), "unit": "kW"}
 
-    # 1) 最近 5 秒內，各相取「該相最新」的 V 與 I，再做 Σ(V*I)/1000 推得 kW
+    # 1) 最近 5 秒：各相取「該相最新」的 V 與 I，Σ(V*I)/1000 推得 kW
     c.execute("""
     WITH latest_ts AS (
       SELECT MAX(timestamp) AS ts FROM meter_values WHERE charge_point_id=?
@@ -962,6 +963,7 @@ def get_latest_power(charge_point_id: str):
 
     # 2) 都沒有資料
     return {}
+
 
 
 
@@ -2590,46 +2592,52 @@ from fastapi import HTTPException
 
 @app.post("/api/charge-points/{charge_point_id}/stop")
 async def stop_transaction_by_charge_point(charge_point_id: str):
+    print(f"🟢【API呼叫】收到停止充電API請求, charge_point_id = {charge_point_id}")
+
+    norm_id = _normalize_cp_id(charge_point_id)
+    cp = connected_charge_points.get(norm_id)
+    if not cp:
+        print(f"🔴【API異常】找不到連線中的充電樁：{norm_id}")
+        raise HTTPException(
+            status_code=404,
+            detail=f"⚠️ 找不到連線中的充電樁：{norm_id}",
+            headers={"X-Connected-CPs": str(list(connected_charge_points.keys()))}
+        )
+
+    # 取進行中交易
+    with sqlite3.connect("ocpp_data.db") as lconn:
+        c = lconn.cursor()
+        c.execute("""
+            SELECT transaction_id FROM transactions
+            WHERE charge_point_id = ? AND stop_timestamp IS NULL
+            ORDER BY start_timestamp DESC LIMIT 1
+        """, (norm_id,))
+        r = c.fetchone()
+        if not r:
+            print(f"🔴【API異常】無進行中交易 charge_point_id={norm_id}")
+            raise HTTPException(status_code=400, detail="⚠️ 無進行中交易")
+        transaction_id = int(r[0])
+
+    # 等待 StopTransaction 回覆
+    loop = asyncio.get_event_loop()
+    fut = loop.create_future()
+    pending_stop_transactions[str(transaction_id)] = fut
+
+    # 發送 RemoteStopTransaction（新版類名，無 Payload）
+    print(f"🟢【API呼叫】發送 RemoteStopTransaction 給充電樁")
+    req = call.RemoteStopTransaction(transaction_id=transaction_id)
+    resp = await cp.call(req)
+    print(f"🟢【API回應】呼叫 RemoteStopTransaction 完成，resp={resp}")
+
     try:
-        print(f"🟢【API呼叫】收到停止充電API請求, charge_point_id = {charge_point_id}")
-        cp = connected_charge_points.get(charge_point_id)
-        if not cp:
-            print(f"🔴【API異常】找不到連線中的充電樁：{charge_point_id}")
-            raise HTTPException(
-                status_code=404,
-                detail=f"⚠️ 找不到連線中的充電樁：{charge_point_id}",
-                headers={"X-Connected-CPs": str(list(connected_charge_points.keys()))}
-            )
-
-        # 查詢進行中的 transaction_id
-        with sqlite3.connect("ocpp_data.db") as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT transaction_id FROM transactions
-                WHERE charge_point_id = ? AND stop_timestamp IS NULL
-                ORDER BY start_timestamp DESC LIMIT 1
-            """, (charge_point_id,))
-            row = cursor.fetchone()
-            if not row:
-                print(f"🔴【API異常】無進行中交易 charge_point_id={charge_point_id}")
-                raise HTTPException(status_code=400, detail="⚠️ 無進行中交易")
-            transaction_id = row[0]
-            print(f"🟢【API呼叫】找到進行中交易 transaction_id={transaction_id}")
-
-        # 發送 RemoteStopTransaction，設定 60 秒 timeout
-        print(f"🟢【API呼叫】發送 RemoteStopTransaction 給充電樁")
-        req = call.RemoteStopTransaction(transaction_id=transaction_id)
-        try:
-            resp = await asyncio.wait_for(cp.call(req), timeout=60)
-        except asyncio.TimeoutError:
-            print(f"🔴【API異常】等待充電樁回應逾時 (RemoteStopTransaction)")
-            raise HTTPException(status_code=504, detail="等待充電樁回應逾時")
-        print(f"🟢【API回應】呼叫 RemoteStopTransaction 完成，resp={resp}")
-        return {"message": "已發送遠端停止充電指令", "ocpp_response": str(resp)}
-
-    except Exception as e:
-        print(f"🔴【API異常】API 處理時例外: {e}")
-        raise HTTPException(status_code=500, detail=f"內部錯誤: {e}")
+        stop_result = await asyncio.wait_for(fut, timeout=10)
+        print(f"🟢【API回應】StopTransaction 完成: {stop_result}")
+        return {"message": "充電已停止", "transaction_id": transaction_id, "stop_result": stop_result}
+    except asyncio.TimeoutError:
+        print(f"🔴【API異常】等待 StopTransaction 超時")
+        return JSONResponse(status_code=504, content={"message": "等待充電樁停止回覆逾時 (StopTransaction timeout)"})
+    finally:
+        pending_stop_transactions.pop(str(transaction_id), None)
 
 
 
