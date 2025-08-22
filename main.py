@@ -97,8 +97,11 @@ async def _accept_or_reject_ws(websocket: WebSocket, raw_cp_id: str):
     supplied_token = qs.get("token")
 
     # 查白名單
-    cursor.execute("SELECT charge_point_id FROM charge_points")
-    allowed_ids = [row[0] for row in cursor.fetchall()]
+    with get_conn() as _c:
+        cur = _c.cursor()
+        cur.execute("SELECT charge_point_id FROM charge_points")
+        allowed_ids = [row[0] for row in cur.fetchall()]
+
 
     # === 驗證檢查 ===
     if REQUIRED_TOKEN:
@@ -174,6 +177,17 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_FILE = os.path.join(BASE_DIR, "ocpp_data.db")  # ✅ 固定資料庫絕對路徑
 conn = sqlite3.connect(DB_FILE, check_same_thread=False)
 cursor = conn.cursor()
+
+
+
+DB_FILE = os.path.join(BASE_DIR, "ocpp_data.db")
+
+def get_conn():
+    # 為每次查詢建立新的連線與游標，避免共用全域 cursor 造成並發問題
+    return sqlite3.connect(DB_FILE, check_same_thread=False)
+
+
+
 
 # ✅ 確保資料表存在（若不存在則建立）
 cursor.execute("""
@@ -577,13 +591,23 @@ class ChargePoint(OcppChargePoint):
 
     @on(Action.BootNotification)
     async def on_boot_notification(self, charge_point_model, charge_point_vendor, **kwargs):
-        now = datetime.utcnow().replace(tzinfo=timezone.utc)
-        logging.info(f"🔌 BootNotification | 模型={charge_point_model} | 廠商={charge_point_vendor}")
-        return call_result.BootNotification(
-            current_time=now.isoformat(),
-            interval=10,
-            status=RegistrationStatus.accepted   # ← 這裡改用列舉
-        )
+        try:
+            now = datetime.utcnow().replace(tzinfo=timezone.utc)
+            logging.info(f"🔌 BootNotification | 模型={charge_point_model} | 廠商={charge_point_vendor}")
+            return call_result.BootNotification(
+                current_time=now.isoformat(),
+                interval=10,
+                status=RegistrationStatus.accepted
+            )
+        except Exception as e:
+            logging.exception(f"BootNotification handler error: {e}")
+            # 依規範仍要回一個結果，避免 ocpp 套件丟 InternalError
+            now = datetime.utcnow().replace(tzinfo=timezone.utc)
+            return call_result.BootNotification(
+                current_time=now.isoformat(),
+                interval=10,
+                status=RegistrationStatus.accepted
+            )
 
 
     @on(Action.Heartbeat)
@@ -594,8 +618,11 @@ class ChargePoint(OcppChargePoint):
 
     @on(Action.Authorize)
     async def on_authorize(self, id_tag, **kwargs):
-        cursor.execute("SELECT status, valid_until FROM id_tags WHERE id_tag = ?", (id_tag,))
-        row = cursor.fetchone()
+        with get_conn() as _c:
+            cur = _c.cursor()
+            cur.execute("SELECT status, valid_until FROM id_tags WHERE id_tag = ?", (id_tag,))
+            row = cur.fetchone()
+
         if not row:
             status = "Invalid"
         else:
@@ -623,8 +650,11 @@ class ChargePoint(OcppChargePoint):
             cursor = conn.cursor()
 
             # 授權狀態驗證
-            cursor.execute("SELECT status, valid_until FROM id_tags WHERE id_tag = ?", (id_tag,))
-            row = cursor.fetchone()
+            with get_conn() as _c:
+                cur = _c.cursor()
+                cur.execute("SELECT status, valid_until FROM id_tags WHERE id_tag = ?", (id_tag,))
+                row = cur.fetchone()
+
             if not row:
                 status = "Invalid"
             else:
