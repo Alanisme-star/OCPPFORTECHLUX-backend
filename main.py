@@ -26,10 +26,14 @@ from websockets.exceptions import ConnectionClosedOK
 from ocpp.v16 import call, call_result, ChargePoint as OcppChargePoint
 from ocpp.v16.enums import Action, RegistrationStatus
 from ocpp.routing import on
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qsl, unquote
 from reportlab.pdfgen import canvas
 
 app = FastAPI()
+
+# === WebSocket 連線驗證設定（可選）===
+REQUIRED_TOKEN = os.getenv("OCPP_WS_TOKEN", None)  # 例：設成 "abc123"；不設就不驗證
+
 
 
 logging.basicConfig(level=logging.INFO)
@@ -60,73 +64,101 @@ class FastAPIWebSocketAdapter:
     # ocpp 會取 subprotocol 屬性
     @property
     def subprotocol(self):
-        return self.websocket.headers.get('sec-websocket-protocol')
+        return self.websocket.headers.get('sec-websocket-protocol') or "ocpp1.6"
 
 
-connected_devices = {}
+# ✅ 不再需要 connected_devices
+# ✅ 直接依據 connected_charge_points 來判定目前「已連線」的樁
 
 @app.get("/api/connections")
 def get_active_connections():
-    return [{"charge_point_id": cp_id, "connected_at": data["time"], "ip": data["ip"]} for cp_id, data in connected_devices.items()]
+    """
+    回傳目前已連線的充電樁列表。
+    以 connected_charge_points 的 key（cp_id）作為判定。
+    """
+    return [{"charge_point_id": cp_id} for cp_id in connected_charge_points.keys()]
 
 
 
+from fastapi import WebSocket, WebSocketDisconnect
 
-@app.websocket("/ocpp/{charge_point_id}")
-async def websocket_endpoint(websocket: WebSocket, charge_point_id: str):
-    from ocpp.routing import on
-    charge_point_id = charge_point_id.lstrip("/")
-    print(f"🚨 WebSocket 連線請求進入")
-    print(f"👉 解析後 charge_point_id = {charge_point_id}")
+def _normalize_cp_id(raw: str) -> str:
+    """
+    將 URL 中的 charge_point_id 做標準化：
+    1) URL decode（把 %2A 還原成 *）
+    2) 去除前導斜線
+    """
+    return unquote(raw).lstrip("/")
 
-    # 查詢白名單
+async def _accept_or_reject_ws(websocket: WebSocket, raw_cp_id: str):
+    # 標準化 CPID
+    cp_id = _normalize_cp_id(raw_cp_id)
+
+    # 解析 query token
+    url = str(websocket.url)
+    qs = dict(parse_qsl(urlparse(url).query))
+    supplied_token = qs.get("token")
+
+    # 查白名單
     cursor.execute("SELECT charge_point_id FROM charge_points")
     allowed_ids = [row[0] for row in cursor.fetchall()]
-    print(f"👉 白名單清單 = {allowed_ids}")
 
-    if charge_point_id not in allowed_ids:
-        print(f"❌ {charge_point_id} 未在白名單中，拒絕連線")
+    # === 驗證檢查 ===
+    if REQUIRED_TOKEN:
+        if supplied_token is None:
+            print(f"❌ 拒絕：缺少 token；URL={url}")
+            await websocket.close(code=1008)
+            return None
+        if supplied_token != REQUIRED_TOKEN:
+            print(f"❌ 拒絕：token 不正確；給定={supplied_token}")
+            await websocket.close(code=1008)
+            return None
+
+    if cp_id not in allowed_ids:
+        print(f"❌ 拒絕：{cp_id} 不在白名單 {allowed_ids}")
         await websocket.close(code=1008)
-        return
+        return None
 
+    # 接受連線（OCPP 1.6 子協定）
+    await websocket.accept(subprotocol="ocpp1.6")
+    print(f"✅ 接受 WebSocket：cp_id={cp_id} | ip={websocket.client.host}")
+
+    # 寫入連線紀錄
+    now = datetime.utcnow().isoformat()
+    cursor.execute(
+        "INSERT INTO connection_logs (charge_point_id, ip, time) VALUES (?, ?, ?)",
+        (cp_id, websocket.client.host, now)
+    )
+    conn.commit()
+
+    return cp_id
+
+# === 正式端點：建議充電樁設定使用這個（有 /ocpp/ 前綴）===
+@app.websocket("/ocpp/{charge_point_id:path}")
+async def websocket_endpoint(websocket: WebSocket, charge_point_id: str):
     try:
-        # ✅ 只修正這一行，正確協定 negotiation
-        await websocket.accept(subprotocol="ocpp1.6")
-        print(f"✅ {charge_point_id} 通過白名單驗證，接受連線")
+        cp_id = await _accept_or_reject_ws(websocket, charge_point_id)
+        if not cp_id:
+            return  # 已在函式內關閉
 
-        # 擷取 IP 與時間
-        client_ip = websocket.client.host
-        now = datetime.utcnow().isoformat()
-        logger.info(f"✅ WebSocket connected: {charge_point_id} from {client_ip} at {now}")
-
-        # ✅ 寫入資料庫紀錄
-        cursor.execute(
-            "INSERT INTO connection_logs (charge_point_id, ip, time) VALUES (?, ?, ?)",
-            (charge_point_id, client_ip, now)
-        )
-        conn.commit()
-
-
-
-
-        # ✅ 啟動 OCPP handler
-        cp = ChargePoint(charge_point_id, FastAPIWebSocketAdapter(websocket))  # ⚡ 不要傳 protocols
-        connected_charge_points[charge_point_id] = cp
+        # 啟動 OCPP handler
+        cp = ChargePoint(cp_id, FastAPIWebSocketAdapter(websocket))
+        connected_charge_points[cp_id] = cp
         await cp.start()
-
-        # 其他後續處理（如有）
-
 
     except WebSocketDisconnect:
         logger.warning(f"⚠️ Disconnected: {charge_point_id}")
-        # connected_devices.pop(charge_point_id, None)
-
     except Exception as e:
         logger.error(f"❌ WebSocket error for {charge_point_id}: {e}")
         await websocket.close()
     finally:
-        # ⚠️ 建議最後 always 清理連線（避免殭屍）
-        connected_charge_points.pop(charge_point_id, None)
+        connected_charge_points.pop(_normalize_cp_id(charge_point_id), None)
+
+# === 相容端點：允許沒有 /ocpp/ 前綴的連線 ===
+@app.websocket("/{charge_point_id:path}")
+async def websocket_endpoint_compat(websocket: WebSocket, charge_point_id: str):
+    await websocket_endpoint(websocket, charge_point_id)
+
 
 
 
