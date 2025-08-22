@@ -654,10 +654,11 @@ class ChargePoint(OcppChargePoint):
                 logging.warning(f"⛔ 無此卡片帳戶資料，StartTransaction 拒絕")
                 return call_result.StartTransactionPayload(transaction_id=0, id_tag_info={"status": "Invalid"})
 
-            balance = card[0]
-            if balance < 0:
+            balance = float(card[0] or 0)
+            if balance <= 0:
                 logging.warning(f"💳 餘額不足：{balance} 元，StartTransaction 拒絕")
                 return call_result.StartTransactionPayload(transaction_id=0, id_tag_info={"status": "Blocked"})
+
 
             if status != "Accepted":
                 logging.warning(f"⛔ StartTransaction 拒絕 | idTag={id_tag} | status={status}")
@@ -861,12 +862,11 @@ async def start_transaction_by_charge_point(charge_point_id: str, data: dict = B
     return {"message": "已送出啟動充電請求", "response": response}
 
 
-
 @app.get("/api/charge-points/{charge_point_id}/latest-power")
 def get_latest_power(charge_point_id: str):
     c = conn.cursor()
 
-    # 0) 優先：總功率（無相別）
+    # 0) 先試總功率（無相別）
     c.execute("""
         SELECT timestamp, value, unit
         FROM meter_values
@@ -879,10 +879,10 @@ def get_latest_power(charge_point_id: str):
     row = c.fetchone()
     if row:
         val = float(row[1]); unit = (row[2] or "").lower()
-        kw = val / 1000.0 if unit == "w" else val
+        kw = val/1000.0 if unit == "w" else val
         return {"timestamp": row[0], "value": round(kw, 3), "unit": "kW"}
 
-    # 1) 次優：分相功率加總（同時支援兩種寫法：phase 欄位或 measurand 後綴）
+    # 1) 再試「同一 timestamp」的三相加總
     c.execute("""
         WITH latest AS (
           SELECT MAX(timestamp) AS ts
@@ -894,182 +894,173 @@ def get_latest_power(charge_point_id: str):
             )
         )
         SELECT m.timestamp,
-               SUM(CASE WHEN LOWER(COALESCE(m.unit,'')) = 'w' THEN m.value/1000.0 ELSE m.value END) AS kw
+               SUM(CASE WHEN LOWER(COALESCE(m.unit,''))='w' THEN m.value/1000.0 ELSE m.value END) AS kw
         FROM meter_values m
         JOIN latest L ON m.timestamp = L.ts
         WHERE m.charge_point_id = ?
           AND (
-            (m.measurand = 'Power.Active.Import' AND m.phase IN ('L1','L2','L3'))
-            OR m.measurand IN ('Power.Active.Import.L1','Power.Active.Import.L2','Power.Active.Import.L3')
+            (m.measurand='Power.Active.Import' AND m.phase IN ('L1','L2','L3')) OR
+            m.measurand IN ('Power.Active.Import.L1','Power.Active.Import.L2','Power.Active.Import.L3')
           )
     """, (charge_point_id, charge_point_id))
     r = c.fetchone()
     if r and r[1] is not None:
         return {"timestamp": r[0], "value": round(float(r[1]), 3), "unit": "kW"}
 
-    # 2) 後備：以分相 V×I 推總功率（支援 phase 欄位 & 後綴兩種）
+    # 2) ★重點：最近 5 秒各相取「最新一筆」的 V 與 I，相乘再加總
     c.execute("""
-        WITH v AS (
-          SELECT timestamp,
-                 CASE
-                   WHEN measurand LIKE 'Voltage.L%' THEN substr(measurand, length('Voltage.')+1)
-                   WHEN measurand = 'Voltage' THEN phase
-                 END AS ph,
-                 value
-          FROM meter_values
-          WHERE charge_point_id = ?
-            AND (
-              (measurand = 'Voltage' AND phase IN ('L1','L2','L3'))
-              OR measurand IN ('Voltage.L1','Voltage.L2','Voltage.L3')
-            )
-        ),
-        a AS (
-          SELECT timestamp,
-                 CASE
-                   WHEN measurand LIKE 'Current.Import.L%' THEN substr(measurand, length('Current.Import.')+1)
-                   WHEN measurand = 'Current.Import' THEN phase
-                 END AS ph,
-                 value
-          FROM meter_values
-          WHERE charge_point_id = ?
-            AND (
-              (measurand = 'Current.Import' AND phase IN ('L1','L2','L3'))
-              OR measurand IN ('Current.Import.L1','Current.Import.L2','Current.Import.L3')
-            )
-        ),
-        joined AS (
-          SELECT v.timestamp, v.ph, v.value AS vv, a.value AS aa
-          FROM v JOIN a
-            ON v.timestamp = a.timestamp
-           AND v.ph IN ('L1','L2','L3') AND v.ph = a.ph
-        ),
-        latest AS (
-          SELECT MAX(timestamp) AS ts FROM joined
-        )
-        SELECT j.timestamp, SUM(j.vv * j.aa)/1000.0 AS kw
-        FROM joined j
-        JOIN latest L ON j.timestamp = L.ts
-        GROUP BY j.timestamp
-    """, (charge_point_id, charge_point_id))
+    WITH latest_ts AS (
+      SELECT MAX(timestamp) AS ts FROM meter_values WHERE charge_point_id = ?
+    ),
+    win AS (
+      SELECT datetime((SELECT ts FROM latest_ts), '-5 seconds') AS from_ts,
+             (SELECT ts FROM latest_ts) AS to_ts
+    ),
+    v AS (
+      SELECT
+        COALESCE(CASE WHEN measurand LIKE 'Voltage.L%' THEN substr(measurand, length('Voltage.')+1) END,
+                 CASE WHEN measurand='Voltage' THEN phase END) AS ph,
+        MAX(timestamp) AS ts
+      FROM meter_values, win
+      WHERE charge_point_id = ?
+        AND ((measurand='Voltage' AND phase IN('L1','L2','L3'))
+             OR measurand IN('Voltage.L1','Voltage.L2','Voltage.L3'))
+        AND timestamp BETWEEN from_ts AND to_ts
+      GROUP BY ph
+    ),
+    v_pick AS (
+      SELECT m.timestamp, m.value AS vv, LOWER(COALESCE(m.unit,'')) AS vu, v.ph
+      FROM meter_values m JOIN v ON m.timestamp=v.ts
+      WHERE m.charge_point_id=? AND (
+        (m.measurand='Voltage' AND m.phase=v.ph) OR m.measurand='Voltage.'||v.ph
+      )
+    ),
+    a AS (
+      SELECT
+        COALESCE(CASE WHEN measurand LIKE 'Current.Import.L%' THEN substr(measurand, length('Current.Import.')+1) END,
+                 CASE WHEN measurand='Current.Import' THEN phase END) AS ph,
+        MAX(timestamp) AS ts
+      FROM meter_values, win
+      WHERE charge_point_id = ?
+        AND ((measurand='Current.Import' AND phase IN('L1','L2','L3'))
+             OR measurand IN('Current.Import.L1','Current.Import.L2','Current.Import.L3'))
+        AND timestamp BETWEEN from_ts AND to_ts
+      GROUP BY ph
+    ),
+    a_pick AS (
+      SELECT m.timestamp, m.value AS aa, LOWER(COALESCE(m.unit,'')) AS au, a.ph
+      FROM meter_values m JOIN a ON m.timestamp=a.ts
+      WHERE m.charge_point_id=? AND (
+        (m.measurand='Current.Import' AND m.phase=a.ph) OR m.measurand='Current.Import.'||a.ph
+      )
+    ),
+    joined AS (
+      SELECT COALESCE(vp.timestamp, ap.timestamp) AS ts, vp.ph, vp.vv, vp.vu, ap.aa, ap.au
+      FROM v_pick vp JOIN a_pick ap ON vp.ph=ap.ph
+    )
+    SELECT ts, SUM((vv)*(aa))/1000.0 AS kw FROM joined GROUP BY ts
+    """, (charge_point_id, charge_point_id, charge_point_id, charge_point_id, charge_point_id))
     r = c.fetchone()
     if r and r[1] is not None:
         return {"timestamp": r[0], "value": round(float(r[1]), 3), "unit": "kW", "derived": True}
 
-    # 3) 最後備：保留原本「同一 timestamp 的 Voltage% × 總電流」作為兜底
+    # 3) 最後備：Voltage% × 總電流
     c.execute("""
         SELECT v.timestamp, v.value AS v, a.value AS a
         FROM meter_values v
         JOIN meter_values a
-          ON v.charge_point_id = a.charge_point_id
-         AND v.timestamp = a.timestamp
-        WHERE v.charge_point_id = ?
-          AND v.measurand LIKE 'Voltage%'
-          AND a.measurand = 'Current.Import'
-        ORDER BY v.timestamp DESC
-        LIMIT 1
+          ON v.charge_point_id=a.charge_point_id AND v.timestamp=a.timestamp
+        WHERE v.charge_point_id=? AND v.measurand LIKE 'Voltage%' AND a.measurand='Current.Import'
+        ORDER BY v.timestamp DESC LIMIT 1
     """, (charge_point_id,))
     r = c.fetchone()
     if r:
-        v = float(r[1]); a = float(r[2])
-        kw = (v * a) / 1000.0
-        return {"timestamp": r[0], "value": round(kw, 3), "unit": "kW", "derived": True}
+        return {"timestamp": r[0], "value": round((float(r[1])*float(r[2]))/1000.0, 3), "unit": "kW", "derived": True}
 
     return {}
-
-
 
 
 @app.get("/api/charge-points/{charge_point_id}/latest-voltage")
 def get_latest_voltage(charge_point_id: str):
     c = conn.cursor()
-
-    # 1) 直接 Voltage（無相別）
+    # 1) 無相別
     c.execute("""
         SELECT timestamp, value, unit
         FROM meter_values
-        WHERE charge_point_id = ?
-          AND measurand = 'Voltage'
-          AND (phase IS NULL OR phase = '')
-        ORDER BY timestamp DESC
-        LIMIT 1
+        WHERE charge_point_id=? AND measurand='Voltage' AND (phase IS NULL OR phase='')
+        ORDER BY timestamp DESC LIMIT 1
     """, (charge_point_id,))
     row = c.fetchone()
     if row:
-        val = float(row[1]); unit = (row[2] or "V")
-        return {"timestamp": row[0], "value": round(val, 1), "unit": unit}
-
-    # 2) 後備：同一 timestamp 的三相平均（同時支援兩種填法）
+        return {"timestamp": row[0], "value": round(float(row[1]), 1), "unit": (row[2] or "V")}
+    # 2) 最近 5 秒各相取最新再平均
     c.execute("""
-    WITH latest AS (
-      SELECT MAX(timestamp) AS ts
-      FROM meter_values
-      WHERE charge_point_id = ?
-        AND (
-          measurand IN ('Voltage.L1','Voltage.L2','Voltage.L3')
-          OR (measurand = 'Voltage' AND phase IN ('L1','L2','L3'))
-        )
+    WITH latest_ts AS (SELECT MAX(timestamp) AS ts FROM meter_values WHERE charge_point_id=?),
+    win AS (SELECT datetime((SELECT ts FROM latest_ts), '-5 seconds') AS from_ts, (SELECT ts FROM latest_ts) AS to_ts),
+    pick AS (
+      SELECT COALESCE(CASE WHEN measurand LIKE 'Voltage.L%' THEN substr(measurand, length('Voltage.')+1) END,
+                      CASE WHEN measurand='Voltage' THEN phase END) AS ph,
+             MAX(timestamp) AS ts
+      FROM meter_values, win
+      WHERE charge_point_id=? AND (
+        measurand IN ('Voltage.L1','Voltage.L2','Voltage.L3')
+        OR (measurand='Voltage' AND phase IN ('L1','L2','L3'))
+      ) AND timestamp BETWEEN from_ts AND to_ts
+      GROUP BY ph
     )
     SELECT m.timestamp, AVG(m.value) AS v_avg
-    FROM meter_values m
-    JOIN latest L ON m.timestamp = L.ts
-    WHERE m.charge_point_id = ?
-      AND (
-        m.measurand IN ('Voltage.L1','Voltage.L2','Voltage.L3')
-        OR (m.measurand = 'Voltage' AND m.phase IN ('L1','L2','L3'))
-      )
-    """, (charge_point_id, charge_point_id))
+    FROM meter_values m JOIN pick p ON m.timestamp=p.ts
+    WHERE m.charge_point_id=? AND (
+      (m.measurand='Voltage' AND m.phase=p.ph) OR m.measurand='Voltage.'||p.ph
+    )
+    """, (charge_point_id, charge_point_id, charge_point_id))
     r = c.fetchone()
     if r and r[1] is not None:
         return {"timestamp": r[0], "value": round(float(r[1]), 1), "unit": "V", "derived": True}
-
     return {}
+
 
 
 
 @app.get("/api/charge-points/{charge_point_id}/latest-current")
 def get_latest_current_api(charge_point_id: str):
     c = conn.cursor()
-
-    # 1) 直接 Current.Import（無相別）
+    # 1) 無相別
     c.execute("""
         SELECT timestamp, value, unit
         FROM meter_values
-        WHERE charge_point_id = ?
-          AND measurand = 'Current.Import'
-          AND (phase IS NULL OR phase = '')
-        ORDER BY timestamp DESC
-        LIMIT 1
+        WHERE charge_point_id=? AND measurand='Current.Import' AND (phase IS NULL OR phase='')
+        ORDER BY timestamp DESC LIMIT 1
     """, (charge_point_id,))
     row = c.fetchone()
     if row:
-        val = float(row[1]); unit = (row[2] or "A")
-        return {"timestamp": row[0], "value": round(val, 2), "unit": unit}
-
-    # 2) 後備：同一 timestamp 的三相相加（同時支援兩種填法）
+        return {"timestamp": row[0], "value": round(float(row[1]), 2), "unit": (row[2] or "A")}
+    # 2) 最近 5 秒各相取最新再相加
     c.execute("""
-    WITH latest AS (
-      SELECT MAX(timestamp) AS ts
-      FROM meter_values
-      WHERE charge_point_id = ?
-        AND (
-          measurand IN ('Current.Import.L1','Current.Import.L2','Current.Import.L3')
-          OR (measurand = 'Current.Import' AND phase IN ('L1','L2','L3'))
-        )
+    WITH latest_ts AS (SELECT MAX(timestamp) AS ts FROM meter_values WHERE charge_point_id=?),
+    win AS (SELECT datetime((SELECT ts FROM latest_ts), '-5 seconds') AS from_ts, (SELECT ts FROM latest_ts) AS to_ts),
+    pick AS (
+      SELECT COALESCE(CASE WHEN measurand LIKE 'Current.Import.L%' THEN substr(measurand, length('Current.Import.')+1) END,
+                      CASE WHEN measurand='Current.Import' THEN phase END) AS ph,
+             MAX(timestamp) AS ts
+      FROM meter_values, win
+      WHERE charge_point_id=? AND (
+        measurand IN ('Current.Import.L1','Current.Import.L2','Current.Import.L3')
+        OR (measurand='Current.Import' AND phase IN ('L1','L2','L3'))
+      ) AND timestamp BETWEEN from_ts AND to_ts
+      GROUP BY ph
     )
     SELECT m.timestamp, SUM(m.value) AS a_sum
-    FROM meter_values m
-    JOIN latest L ON m.timestamp = L.ts
-    WHERE m.charge_point_id = ?
-      AND (
-        m.measurand IN ('Current.Import.L1','Current.Import.L2','Current.Import.L3')
-        OR (m.measurand = 'Current.Import' AND m.phase IN ('L1','L2','L3'))
-      )
-    """, (charge_point_id, charge_point_id))
+    FROM meter_values m JOIN pick p ON m.timestamp=p.ts
+    WHERE m.charge_point_id=? AND (
+      (m.measurand='Current.Import' AND m.phase=p.ph) OR m.measurand='Current.Import.'||p.ph
+    )
+    """, (charge_point_id, charge_point_id, charge_point_id))
     r = c.fetchone()
     if r and r[1] is not None:
         return {"timestamp": r[0], "value": round(float(r[1]), 2), "unit": "A", "derived": True}
-
     return {}
+
 
 
 
