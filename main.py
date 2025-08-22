@@ -573,6 +573,8 @@ class ChargePoint(OcppChargePoint):
 
 
 
+    from ocpp.v16.enums import Action, RegistrationStatus
+
     @on(Action.BootNotification)
     async def on_boot_notification(self, charge_point_model, charge_point_vendor, **kwargs):
         now = datetime.utcnow().replace(tzinfo=timezone.utc)
@@ -580,8 +582,9 @@ class ChargePoint(OcppChargePoint):
         return call_result.BootNotification(
             current_time=now.isoformat(),
             interval=10,
-            status="Accepted"
+            status=RegistrationStatus.accepted   # ← 這裡改用列舉
         )
+
 
     @on(Action.Heartbeat)
     async def on_heartbeat(self):
@@ -691,82 +694,68 @@ class ChargePoint(OcppChargePoint):
 
     @on(Action.MeterValues)
     async def on_meter_values(self, **kwargs):
-        cp_id = getattr(self, "id", None)
-        if cp_id is None:
-            logging.error("❌ 無法識別充電樁 ID")
-            return call_result.MeterValues()
-
         try:
+            cp_id = getattr(self, "id", None)
+            if cp_id is None:
+                logging.error("❌ 無法識別充電樁 ID")
+                return call_result.MeterValues()
+
             connector_id = kwargs.get("connector_id")
             if connector_id is None:
                 connector_id = kwargs.get("connectorId", 0)
+            try:
+                connector_id = int(connector_id or 0)
+            except Exception:
+                connector_id = 0
 
             transaction_id = kwargs.get("transaction_id") or kwargs.get("transactionId") or ""
             meter_value_list = kwargs.get("meter_value") or kwargs.get("meterValue") or []
 
-
-            # 🔍 若 transaction_id 為空，自動補上未結束的交易
+            # 若缺 tx_id，從 DB 補最近未結束的一筆
             if not transaction_id:
-                with sqlite3.connect("ocpp_data.db") as conn:
-                    cursor = conn.cursor()
-                    cursor.execute("""
+                with sqlite3.connect("ocpp_data.db") as _c:
+                    _cur = _c.cursor()
+                    _cur.execute("""
                         SELECT transaction_id FROM transactions
-                        WHERE charge_point_id = ? AND stop_timestamp IS NULL
+                        WHERE charge_point_id=? AND stop_timestamp IS NULL
                         ORDER BY start_timestamp DESC LIMIT 1
                     """, (cp_id,))
-                    row = cursor.fetchone()
+                    row = _cur.fetchone()
                     if row:
                         transaction_id = str(row[0])
-                        logging.warning(f"⚠️ 從 DB 補上 transaction_id = {transaction_id}")
 
-            logging.info(f"📥 收到 MeterValues | cp_id={cp_id} | connector_id={connector_id} | tx_id={transaction_id}")
-            logging.info(f"📦 meterValue 原始內容：{meter_value_list}")
-
-            insert_count = 0  # ✅ 正確初始化
- 
-            with sqlite3.connect("ocpp_data.db") as conn:
-                cursor = conn.cursor()
-
-                for mv in meter_value_list:
-                    timestamp = mv.get("timestamp")
-                    sampled_values = mv.get("sampledValue", [])
-                    logging.info(f"⏱️ timestamp={timestamp}, sampledValue 數量={len(sampled_values)}")
-
-                    for sv in sampled_values:
-
-                        if "value" not in sv:  # ✅ 正確名稱
-                            print(f"⚠️ 遺失 value 欄位：{sv}")
+            insert_count = 0
+            with sqlite3.connect("ocpp_data.db") as _c:
+                _cur = _c.cursor()
+                for mv in meter_value_list or []:
+                    ts = mv.get("timestamp")
+                    for sv in mv.get("sampledValue", []) or []:
+                        if "value" not in sv:
                             continue
-
-                        value = sv.get("value")
-                        measurand = sv.get("measurand", "")
+                        val = sv.get("value")
+                        meas = sv.get("measurand", "")
                         unit = sv.get("unit", "")
-                        phase = sv.get("phase")  # ★ 新增：相別
-
-                        if not value or not measurand:
-                            logging.warning(f"⚠️ 忽略無效測量資料：value={value}, measurand={measurand}, phase={phase}")
+                        phase = sv.get("phase")
+                        if val is None or not meas:
                             continue
-
-                        cursor.execute("""
-                            INSERT INTO meter_values (
-                                charge_point_id, connector_id, transaction_id,
-                                value, measurand, unit, timestamp, phase
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                        """, (
-                            cp_id, connector_id, transaction_id,
-                            value, measurand, unit, timestamp, phase
-                        ))
-                        insert_count += 1  # ✅ 每次成功插入就加一
-
-                conn.commit()
-
+                        _cur.execute("""
+                            INSERT INTO meter_values
+                              (charge_point_id, connector_id, transaction_id,
+                               value, measurand, unit, timestamp, phase)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """, (cp_id, connector_id, transaction_id, val, meas, unit, ts, phase))
+                        insert_count += 1
+                _c.commit()
             logging.info(f"📊 寫入完成，共 {insert_count} 筆測量資料")
-
         except Exception as e:
             logging.exception(f"❌ 處理 MeterValues 時發生錯誤: {e}")
+        finally:
+            # ✅ 無論如何都回應空確認（v1.6 規範）
             return call_result.MeterValues()
 
-        return call_result.MeterValues()
+
+
+
 
 
     @on(Action.RemoteStopTransaction)
