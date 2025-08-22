@@ -1,3 +1,8 @@
+from urllib.parse import unquote  # ← 新增
+
+def _normalize_cp_id(cp_id: str) -> str:
+    return unquote(cp_id).lstrip("/")
+
 connected_charge_points = {}
 live_status_cache = {}
 import sys
@@ -133,31 +138,22 @@ async def _accept_or_reject_ws(websocket: WebSocket, raw_cp_id: str):
 
     return cp_id
 
-# === 正式端點：建議充電樁設定使用這個（有 /ocpp/ 前綴）===
+
+
 @app.websocket("/ocpp/{charge_point_id:path}")
-async def websocket_endpoint(websocket: WebSocket, charge_point_id: str):
+async def ocpp_endpoint(websocket: WebSocket, charge_point_id: str):
+    logging.info(f"New OCPP connection from {charge_point_id}")
     try:
-        cp_id = await _accept_or_reject_ws(websocket, charge_point_id)
-        if not cp_id:
-            return  # 已在函式內關閉
-
-        # 啟動 OCPP handler
-        cp = ChargePoint(cp_id, FastAPIWebSocketAdapter(websocket))
-        connected_charge_points[cp_id] = cp
-        await cp.start()
-
-    except WebSocketDisconnect:
-        logger.warning(f"⚠️ Disconnected: {charge_point_id}")
+        while True:
+            message = await websocket.receive_text()
+            logging.debug(f"Received from {charge_point_id}: {message}")
+            await websocket.send_text(f"ACK: {message}")
     except Exception as e:
-        logger.error(f"❌ WebSocket error for {charge_point_id}: {e}")
-        await websocket.close()
+        logging.error(f"Error in OCPP WebSocket for {charge_point_id}: {e}")
     finally:
-        connected_charge_points.pop(_normalize_cp_id(charge_point_id), None)
+        await websocket.close()
+        logging.info(f"OCPP connection closed: {charge_point_id}")
 
-# === 相容端點：允許沒有 /ocpp/ 前綴的連線 ===
-@app.websocket("/{charge_point_id:path}")
-async def websocket_endpoint_compat(websocket: WebSocket, charge_point_id: str):
-    await websocket_endpoint(websocket, charge_point_id)
 
 
 
@@ -170,12 +166,6 @@ async def websocket_endpoint_compat(websocket: WebSocket, charge_point_id: str):
 async def get_status(cp_id: str):
     return JSONResponse(charging_point_status.get(cp_id, {}))
 
-# 假設的授權 API
-@app.post("/authorize/{cp_id}")
-async def authorize(cp_id: str, badge_id: str = Body(..., embed=True)):
-    # 查 DB，回傳 AuthorizePayload
-    loop = asyncio.get_event_loop()
-    return {"idTagInfo": {"status": "Accepted"}}
 
 
 # 初始化 SQLite 資料庫
@@ -206,6 +196,19 @@ CREATE TABLE IF NOT EXISTS connection_logs (
 )
 """)
 conn.commit()
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS reservations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    charge_point_id TEXT NOT NULL,
+    id_tag TEXT NOT NULL,
+    start_time TEXT NOT NULL,
+    end_time   TEXT NOT NULL,
+    status     TEXT NOT NULL
+)
+""")
+conn.commit()
+
 
 
 
@@ -693,9 +696,13 @@ class ChargePoint(OcppChargePoint):
             return call_result.MeterValuesPayload()
 
         try:
-            connector_id = kwargs.get("connectorId", 0)
-            transaction_id = kwargs.get("transactionId", "")
-            meter_value_list = kwargs.get("meterValue", [])
+            connector_id = kwargs.get("connector_id")
+            if connector_id is None:
+                connector_id = kwargs.get("connectorId", 0)
+
+            transaction_id = kwargs.get("transaction_id") or kwargs.get("transactionId") or ""
+            meter_value_list = kwargs.get("meter_value") or kwargs.get("meterValue") or []
+
 
             # 🔍 若 transaction_id 為空，自動補上未結束的交易
             if not transaction_id:
@@ -862,127 +869,28 @@ async def start_transaction_by_charge_point(charge_point_id: str, data: dict = B
     return {"message": "已送出啟動充電請求", "response": response}
 
 
+from fastapi import FastAPI, HTTPException
+
+# 假設這裡有一個全域變數在存充電樁即時數據
+latest_power_data = {}
+
 @app.get("/api/charge-points/{charge_point_id}/latest-power")
-def get_latest_power(charge_point_id: str):
-    c = conn.cursor()
+async def get_latest_power(charge_point_id: str):
+    """
+    回傳充電樁最新的電壓 / 電流 / 功率 / 電量等即時數據
+    """
+    if charge_point_id not in latest_power_data:
+        raise HTTPException(status_code=404, detail="No power data found for this charge point")
 
-    # 0) 先試總功率（無相別）
-    c.execute("""
-        SELECT timestamp, value, unit
-        FROM meter_values
-        WHERE charge_point_id = ?
-          AND measurand = 'Power.Active.Import'
-          AND (phase IS NULL OR phase = '')
-        ORDER BY timestamp DESC
-        LIMIT 1
-    """, (charge_point_id,))
-    row = c.fetchone()
-    if row:
-        val = float(row[1]); unit = (row[2] or "").lower()
-        kw = val/1000.0 if unit == "w" else val
-        return {"timestamp": row[0], "value": round(kw, 3), "unit": "kW"}
+    return latest_power_data[charge_point_id]
 
-    # 1) 再試「同一 timestamp」的三相加總
-    c.execute("""
-        WITH latest AS (
-          SELECT MAX(timestamp) AS ts
-          FROM meter_values
-          WHERE charge_point_id = ?
-            AND (
-              (measurand = 'Power.Active.Import' AND phase IN ('L1','L2','L3'))
-              OR measurand IN ('Power.Active.Import.L1','Power.Active.Import.L2','Power.Active.Import.L3')
-            )
-        )
-        SELECT m.timestamp,
-               SUM(CASE WHEN LOWER(COALESCE(m.unit,''))='w' THEN m.value/1000.0 ELSE m.value END) AS kw
-        FROM meter_values m
-        JOIN latest L ON m.timestamp = L.ts
-        WHERE m.charge_point_id = ?
-          AND (
-            (m.measurand='Power.Active.Import' AND m.phase IN ('L1','L2','L3')) OR
-            m.measurand IN ('Power.Active.Import.L1','Power.Active.Import.L2','Power.Active.Import.L3')
-          )
-    """, (charge_point_id, charge_point_id))
-    r = c.fetchone()
-    if r and r[1] is not None:
-        return {"timestamp": r[0], "value": round(float(r[1]), 3), "unit": "kW"}
-
-    # 2) ★重點：最近 5 秒各相取「最新一筆」的 V 與 I，相乘再加總
-    c.execute("""
-    WITH latest_ts AS (
-      SELECT MAX(timestamp) AS ts FROM meter_values WHERE charge_point_id = ?
-    ),
-    win AS (
-      SELECT datetime((SELECT ts FROM latest_ts), '-5 seconds') AS from_ts,
-             (SELECT ts FROM latest_ts) AS to_ts
-    ),
-    v AS (
-      SELECT
-        COALESCE(CASE WHEN measurand LIKE 'Voltage.L%' THEN substr(measurand, length('Voltage.')+1) END,
-                 CASE WHEN measurand='Voltage' THEN phase END) AS ph,
-        MAX(timestamp) AS ts
-      FROM meter_values, win
-      WHERE charge_point_id = ?
-        AND ((measurand='Voltage' AND phase IN('L1','L2','L3'))
-             OR measurand IN('Voltage.L1','Voltage.L2','Voltage.L3'))
-        AND timestamp BETWEEN from_ts AND to_ts
-      GROUP BY ph
-    ),
-    v_pick AS (
-      SELECT m.timestamp, m.value AS vv, LOWER(COALESCE(m.unit,'')) AS vu, v.ph
-      FROM meter_values m JOIN v ON m.timestamp=v.ts
-      WHERE m.charge_point_id=? AND (
-        (m.measurand='Voltage' AND m.phase=v.ph) OR m.measurand='Voltage.'||v.ph
-      )
-    ),
-    a AS (
-      SELECT
-        COALESCE(CASE WHEN measurand LIKE 'Current.Import.L%' THEN substr(measurand, length('Current.Import.')+1) END,
-                 CASE WHEN measurand='Current.Import' THEN phase END) AS ph,
-        MAX(timestamp) AS ts
-      FROM meter_values, win
-      WHERE charge_point_id = ?
-        AND ((measurand='Current.Import' AND phase IN('L1','L2','L3'))
-             OR measurand IN('Current.Import.L1','Current.Import.L2','Current.Import.L3'))
-        AND timestamp BETWEEN from_ts AND to_ts
-      GROUP BY ph
-    ),
-    a_pick AS (
-      SELECT m.timestamp, m.value AS aa, LOWER(COALESCE(m.unit,'')) AS au, a.ph
-      FROM meter_values m JOIN a ON m.timestamp=a.ts
-      WHERE m.charge_point_id=? AND (
-        (m.measurand='Current.Import' AND m.phase=a.ph) OR m.measurand='Current.Import.'||a.ph
-      )
-    ),
-    joined AS (
-      SELECT COALESCE(vp.timestamp, ap.timestamp) AS ts, vp.ph, vp.vv, vp.vu, ap.aa, ap.au
-      FROM v_pick vp JOIN a_pick ap ON vp.ph=ap.ph
-    )
-    SELECT ts, SUM((vv)*(aa))/1000.0 AS kw FROM joined GROUP BY ts
-    """, (charge_point_id, charge_point_id, charge_point_id, charge_point_id, charge_point_id))
-    r = c.fetchone()
-    if r and r[1] is not None:
-        return {"timestamp": r[0], "value": round(float(r[1]), 3), "unit": "kW", "derived": True}
-
-    # 3) 最後備：Voltage% × 總電流
-    c.execute("""
-        SELECT v.timestamp, v.value AS v, a.value AS a
-        FROM meter_values v
-        JOIN meter_values a
-          ON v.charge_point_id=a.charge_point_id AND v.timestamp=a.timestamp
-        WHERE v.charge_point_id=? AND v.measurand LIKE 'Voltage%' AND a.measurand='Current.Import'
-        ORDER BY v.timestamp DESC LIMIT 1
-    """, (charge_point_id,))
-    r = c.fetchone()
-    if r:
-        return {"timestamp": r[0], "value": round((float(r[1])*float(r[2]))/1000.0, 3), "unit": "kW", "derived": True}
-
-    return {}
 
 
 @app.get("/api/charge-points/{charge_point_id}/latest-voltage")
 def get_latest_voltage(charge_point_id: str):
+    charge_point_id = _normalize_cp_id(charge_point_id)
     c = conn.cursor()
+
     # 1) 無相別
     c.execute("""
         SELECT timestamp, value, unit
@@ -993,13 +901,16 @@ def get_latest_voltage(charge_point_id: str):
     row = c.fetchone()
     if row:
         return {"timestamp": row[0], "value": round(float(row[1]), 1), "unit": (row[2] or "V")}
+
     # 2) 最近 5 秒各相取最新再平均
     c.execute("""
     WITH latest_ts AS (SELECT MAX(timestamp) AS ts FROM meter_values WHERE charge_point_id=?),
     win AS (SELECT datetime((SELECT ts FROM latest_ts), '-5 seconds') AS from_ts, (SELECT ts FROM latest_ts) AS to_ts),
     pick AS (
-      SELECT COALESCE(CASE WHEN measurand LIKE 'Voltage.L%' THEN substr(measurand, length('Voltage.')+1) END,
-                      CASE WHEN measurand='Voltage' THEN phase END) AS ph,
+      SELECT COALESCE(
+               CASE WHEN measurand LIKE 'Voltage.L%' THEN substr(measurand, length('Voltage.')+1) END,
+               CASE WHEN measurand='Voltage' THEN phase END
+             ) AS ph,
              MAX(timestamp) AS ts
       FROM meter_values, win
       WHERE charge_point_id=? AND (
@@ -1017,14 +928,16 @@ def get_latest_voltage(charge_point_id: str):
     r = c.fetchone()
     if r and r[1] is not None:
         return {"timestamp": r[0], "value": round(float(r[1]), 1), "unit": "V", "derived": True}
-    return {}
 
+    return {}
 
 
 
 @app.get("/api/charge-points/{charge_point_id}/latest-current")
 def get_latest_current_api(charge_point_id: str):
+    charge_point_id = _normalize_cp_id(charge_point_id)
     c = conn.cursor()
+
     # 1) 無相別
     c.execute("""
         SELECT timestamp, value, unit
@@ -1035,13 +948,16 @@ def get_latest_current_api(charge_point_id: str):
     row = c.fetchone()
     if row:
         return {"timestamp": row[0], "value": round(float(row[1]), 2), "unit": (row[2] or "A")}
+
     # 2) 最近 5 秒各相取最新再相加
     c.execute("""
     WITH latest_ts AS (SELECT MAX(timestamp) AS ts FROM meter_values WHERE charge_point_id=?),
     win AS (SELECT datetime((SELECT ts FROM latest_ts), '-5 seconds') AS from_ts, (SELECT ts FROM latest_ts) AS to_ts),
     pick AS (
-      SELECT COALESCE(CASE WHEN measurand LIKE 'Current.Import.L%' THEN substr(measurand, length('Current.Import.')+1) END,
-                      CASE WHEN measurand='Current.Import' THEN phase END) AS ph,
+      SELECT COALESCE(
+               CASE WHEN measurand LIKE 'Current.Import.L%' THEN substr(measurand, length('Current.Import.')+1) END,
+               CASE WHEN measurand='Current.Import' THEN phase END
+             ) AS ph,
              MAX(timestamp) AS ts
       FROM meter_values, win
       WHERE charge_point_id=? AND (
@@ -1059,7 +975,11 @@ def get_latest_current_api(charge_point_id: str):
     r = c.fetchone()
     if r and r[1] is not None:
         return {"timestamp": r[0], "value": round(float(r[1]), 2), "unit": "A", "derived": True}
+
     return {}
+
+
+
 
 
 
@@ -1071,6 +991,7 @@ def get_latest_energy(charge_point_id: str):
     - 來源優先：measurand='Energy.Active.Import.Register'（通常為 Wh 或 kWh）
     - 單位處理：Wh → /1000；kWh → 原值
     """
+    charge_point_id = _normalize_cp_id(charge_point_id)
     c = conn.cursor()
 
     # 1) 讀取最新的 Energy.Active.Import.Register（不分相）
@@ -1154,6 +1075,7 @@ def get_charge_point_status(charge_point_id: str):
 
 @app.get("/api/charge-points/{charge_point_id}/latest-status")
 def get_latest_status(charge_point_id: str):
+    charge_point_id = _normalize_cp_id(charge_point_id)
     c = conn.cursor()
     # 優先取充電樁傳來的最新 StatusNotification 紀錄
     c.execute(
