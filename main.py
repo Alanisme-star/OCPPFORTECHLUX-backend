@@ -560,7 +560,7 @@ class ChargePoint(OcppChargePoint):
 
             if cp_id is None or status is None:
                 logging.error(f"❌ 欄位遺失 | cp_id={cp_id} | connector_id={connector_id} | status={status}")
-                return call_result.StatusNotification()
+                return call_result.StatusNotificationPayload()
 
             # 寫入資料庫
             with sqlite3.connect("ocpp_data.db") as conn:
@@ -580,11 +580,11 @@ class ChargePoint(OcppChargePoint):
             }
 
             logging.info(f"📡 StatusNotification | CP={cp_id} | connector={connector_id} | errorCode={error_code} | status={status}")
-            return call_result.StatusNotification()
+            return call_result.StatusNotificationPayload()
 
         except Exception as e:
             logging.exception(f"❌ StatusNotification 發生未預期錯誤：{e}")
-            return call_result.StatusNotification()
+            return call_result.StatusNotificationPayload()
 
 
 
