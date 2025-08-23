@@ -30,7 +30,7 @@ from websockets.exceptions import ConnectionClosedOK
 from ocpp.v16 import call, call_result, ChargePoint as OcppChargePoint
 from ocpp.v16.enums import Action, RegistrationStatus
 from ocpp.routing import on
-from urllib.parse import urlparse, parse_qsl, unquote
+from urllib.parse import urlparse, parse_qsl
 from reportlab.pdfgen import canvas
 
 app = FastAPI()
@@ -180,9 +180,6 @@ DB_FILE = os.path.join(BASE_DIR, "ocpp_data.db")  # ✅ 固定資料庫絕對路
 conn = sqlite3.connect(DB_FILE, check_same_thread=False)
 cursor = conn.cursor()
 
-
-
-DB_FILE = os.path.join(BASE_DIR, "ocpp_data.db")
 
 def get_conn():
     # 為每次查詢建立新的連線與游標，避免共用全域 cursor 造成並發問題
@@ -469,7 +466,7 @@ class ChargePoint(OcppChargePoint):
 
             if cp_id is None or transaction_id is None:
                 print(f"🔴【OCPP Handler】❌ StopTransaction 欄位缺失 | cp_id={cp_id} | transaction_id={transaction_id}")
-                return call_result.StopTransaction()
+                StopTransactionPayload()
 
             with sqlite3.connect("ocpp_data.db") as _conn:
                 _cur = _conn.cursor()
@@ -522,18 +519,16 @@ class ChargePoint(OcppChargePoint):
 
                 _conn.commit()
 
-            # 6) 喚醒等待 RemoteStop 的 future（若有用到）
+
             fut = pending_stop_transactions.get(str(transaction_id))
             if fut and not fut.done():
-                print(f"StopTransaction | 解除future? {transaction_id} | 現有pending: {list(pending_stop_transactions.keys())}")
                 fut.set_result({"meter_stop": meter_stop, "timestamp": timestamp, "reason": reason})
-            else:
-                print(f"【未找到 future 或已done】transaction_id={transaction_id}，pending={pending_stop_transactions}")
+
+            return call_result.StopTransactionPayload()
 
         except Exception as e:
-            print(f"🔴【OCPP Handler】❌ StopTransaction 儲存/扣款失敗：{e}")
-
-        return call_result.StopTransaction()
+            logging.exception(f"🔴 StopTransaction 儲存/扣款失敗：{e}")
+            return call_result.StopTransactionPayload()
 
 
 
@@ -588,24 +583,22 @@ class ChargePoint(OcppChargePoint):
 
 
 
-
-    from ocpp.v16.enums import Action, RegistrationStatus
+    from ocpp.v16.enums import RegistrationStatus
 
     @on(Action.BootNotification)
     async def on_boot_notification(self, charge_point_model, charge_point_vendor, **kwargs):
         try:
             now = datetime.utcnow().replace(tzinfo=timezone.utc)
             logging.info(f"🔌 BootNotification | 模型={charge_point_model} | 廠商={charge_point_vendor}")
-            return call_result.BootNotification(
+            return call_result.BootNotificationPayload(
                 current_time=now.isoformat(),
                 interval=10,
                 status=RegistrationStatus.accepted
             )
         except Exception as e:
             logging.exception(f"BootNotification handler error: {e}")
-            # 依規範仍要回一個結果，避免 ocpp 套件丟 InternalError
             now = datetime.utcnow().replace(tzinfo=timezone.utc)
-            return call_result.BootNotification(
+            return call_result.BootNotificationPayload(
                 current_time=now.isoformat(),
                 interval=10,
                 status=RegistrationStatus.accepted
@@ -616,7 +609,10 @@ class ChargePoint(OcppChargePoint):
     async def on_heartbeat(self):
         now = datetime.utcnow().replace(tzinfo=timezone.utc)
         logging.info(f"❤️ Heartbeat | CP={self.id}")
-        return call_result.Heartbeat(current_time=now.isoformat())
+        return call_result.HeartbeatPayload(current_time=now.isoformat())
+
+
+
 
     @on(Action.Authorize)
     async def on_authorize(self, id_tag, **kwargs):
@@ -635,13 +631,13 @@ class ChargePoint(OcppChargePoint):
                 logging.warning(f"⚠️ 無法解析 valid_until 格式：{valid_until}")
                 valid_until_dt = datetime.min.replace(tzinfo=timezone.utc)
             now = datetime.utcnow().replace(tzinfo=timezone.utc)
-            logging.info(f"🔎 驗證有效期限valid_until={valid_until_dt.isoformat()} / now={now.isoformat()}")
             status = "Accepted" if status_db == "Accepted" and valid_until_dt > now else "Expired"
-        logging.info(f"🆔 Authorize | idTag: {id_tag} | 查詢結果: {status}")
-        return call_result.Authorize(id_tag_info={"status": status})
+
+        logging.info(f"🆔 Authorize | idTag={id_tag} → {status}")
+        return call_result.AuthorizePayload(id_tag_info={"status": status})
 
 
-    logger = logging.getLogger("ocpp_logger")
+
 
 
 
@@ -651,76 +647,59 @@ class ChargePoint(OcppChargePoint):
         with sqlite3.connect("ocpp_data.db") as conn:
             cursor = conn.cursor()
 
-            # 授權狀態驗證
+            # 驗證 idTag
             with get_conn() as _c:
                 cur = _c.cursor()
                 cur.execute("SELECT status, valid_until FROM id_tags WHERE id_tag = ?", (id_tag,))
                 row = cur.fetchone()
-
             if not row:
-                status = "Invalid"
-            else:
-                status_db, valid_until = row
-                try:
-                    valid_until_dt = datetime.fromisoformat(valid_until).replace(tzinfo=timezone.utc)
-                except ValueError:
-                    logging.warning(f"⚠️ 無法解析 valid_until 格式：{valid_until}")
-                    valid_until_dt = datetime.min.replace(tzinfo=timezone.utc)
-                now = datetime.utcnow().replace(tzinfo=timezone.utc)
-                logging.info(f"🔎 驗證有效期限 valid_until={valid_until_dt.isoformat()} / now={now.isoformat()}")
-                status = "Accepted" if status_db == "Accepted" and valid_until_dt > now else "Expired"
+                return call_result.StartTransactionPayload(transaction_id=0, id_tag_info={"status": "Invalid"})
 
-            # ✅ 預約判斷
+            status_db, valid_until = row
+            try:
+                valid_until_dt = datetime.fromisoformat(valid_until).replace(tzinfo=timezone.utc)
+            except ValueError:
+                logging.warning(f"⚠️ 無法解析 valid_until：{valid_until}")
+                valid_until_dt = datetime.min.replace(tzinfo=timezone.utc)
+            now = datetime.utcnow().replace(tzinfo=timezone.utc)
+            status = "Accepted" if status_db == "Accepted" and valid_until_dt > now else "Expired"
+            if status != "Accepted":
+                return call_result.StartTransactionPayload(transaction_id=0, id_tag_info={"status": status})
+
+            # 預約（可有可無）
             now_str = datetime.utcnow().isoformat()
-            cursor.execute('''
-            SELECT id FROM reservations
-            WHERE charge_point_id = ? AND id_tag = ? AND status = 'active'
-            AND start_time <= ? AND end_time >= ?
-            ''', (self.id, id_tag, now_str, now_str))
+            cursor.execute("""
+                SELECT id FROM reservations
+                WHERE charge_point_id=? AND id_tag=? AND status='active'
+                  AND start_time<=? AND end_time>=?
+            """, (self.id, id_tag, now_str, now_str))
             res = cursor.fetchone()
-
             if res:
-                cursor.execute("UPDATE reservations SET status = 'completed' WHERE id = ?", (res[0],))
+                cursor.execute("UPDATE reservations SET status='completed' WHERE id=?", (res[0],))
                 conn.commit()
-                logging.info(f"🟢 StartTransaction | 有有效預約，啟動充電（預約ID={res[0]}）")
-            else:
-                logging.info(f"🟢 StartTransaction | 無預約，允許自由充電（只檢查卡片授權與餘額）")
 
-            # ✅ 餘額檢查
+            # 餘額檢查
             cursor.execute("SELECT balance FROM cards WHERE card_id = ?", (id_tag,))
             card = cursor.fetchone()
             if not card:
-                logging.warning(f"⛔ 無此卡片帳戶資料，StartTransaction 拒絕")
-                return call_result.StartTransaction(transaction_id=0, id_tag_info={"status": "Invalid"})
-
+                return call_result.StartTransactionPayload(transaction_id=0, id_tag_info={"status": "Invalid"})
             balance = float(card[0] or 0)
             if balance <= 0:
-                logging.warning(f"💳 餘額不足：{balance} 元，StartTransaction 拒絕")
-                return call_result.StartTransaction(transaction_id=0, id_tag_info={"status": "Blocked"})
+                return call_result.StartTransactionPayload(transaction_id=0, id_tag_info={"status": "Blocked"})
 
-
-            if status != "Accepted":
-                logging.warning(f"⛔ StartTransaction 拒絕 | idTag={id_tag} | status={status}")
-                return call_result.StartTransaction(transaction_id=0, id_tag_info={"status": status})
-
-            # ✅ 建立交易記錄
+            # 建立交易
             transaction_id = int(datetime.utcnow().timestamp() * 1000)
-            cursor.execute('''
+            cursor.execute("""
                 INSERT INTO transactions (
                     transaction_id, charge_point_id, connector_id, id_tag,
                     meter_start, start_timestamp, meter_stop, stop_timestamp, reason
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (
-                transaction_id, self.id, connector_id, id_tag,
-                meter_start, timestamp, None, None, None
-            ))
+            """, (transaction_id, self.id, connector_id, id_tag, meter_start, timestamp, None, None, None))
             conn.commit()
             logging.info(f"🚗 StartTransaction 成功 | CP={self.id} | idTag={id_tag} | transactionId={transaction_id}")
 
-            return call_result.StartTransaction(
-                transaction_id=transaction_id,
-                id_tag_info={"status": "Accepted"}
-            )
+            return call_result.StartTransactionPayload(transaction_id=transaction_id, id_tag_info={"status": "Accepted"})
+
 
 
 
@@ -730,7 +709,7 @@ class ChargePoint(OcppChargePoint):
             cp_id = getattr(self, "id", None)
             if cp_id is None:
                 logging.error("❌ 無法識別充電樁 ID")
-                return call_result.MeterValues()
+                return call_result.MeterValuesPayload()
 
             connector_id = kwargs.get("connector_id") or kwargs.get("connectorId") or 0
             try:
@@ -787,12 +766,12 @@ class ChargePoint(OcppChargePoint):
                 _c.commit()
 
             logging.info(f"📊 MeterValues 寫入完成，共 {insert_count} 筆 | tx={transaction_id} | keys={list(kwargs.keys())}")
-            return call_result.MeterValues()
+            return call_result.MeterValuesPayload()
 
         except Exception as e:
             # 把原始 payload 打出來便於追查為何 0 筆
             logging.exception(f"❌ 處理 MeterValues 例外：{e} | payload={kwargs}")
-            return call_result.MeterValues()
+            return call_result.MeterValuesPayload()
 
 
 
@@ -801,10 +780,8 @@ class ChargePoint(OcppChargePoint):
 
     @on(Action.RemoteStopTransaction)
     async def on_remote_stop_transaction(self, transaction_id, **kwargs):
-        # 充電樁端收到後，應立即主動送 StopTransaction
-        # 這裡回應 Central 系統 "Accepted" 表示已處理
-        print(f"✅ 收到遠端停止充電要求，transaction_id={transaction_id}")
-        return call_result.RemoteStopTransaction(status="Accepted")
+        logging.info(f"✅ 收到遠端停止充電要求，transaction_id={transaction_id}")
+        return call_result.RemoteStopTransactionPayload(status="Accepted")
 
 
 @app.get("/api/charge-points/{charge_point_id}/live-status")
