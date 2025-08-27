@@ -160,10 +160,10 @@ async def _accept_or_reject_ws(websocket: WebSocket, raw_cp_id: str):
           #  await websocket.close(code=1008)
            # return None
 
-    if cp_id not in allowed_ids:
-        print(f"❌ 拒絕：{cp_id} 不在白名單 {allowed_ids}")
-        await websocket.close(code=1008)
-        return None
+ #   if cp_id not in allowed_ids:
+      #  print(f"❌ 拒絕：{cp_id} 不在白名單 {allowed_ids}")
+      #  await websocket.close(code=1008)
+      #  return None
 
     # 接受連線（OCPP 1.6 子協定）
     await websocket.accept(subprotocol="ocpp1.6")
