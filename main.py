@@ -150,15 +150,15 @@ async def _accept_or_reject_ws(websocket: WebSocket, raw_cp_id: str):
 
 
     # === 驗證檢查 ===
-    if REQUIRED_TOKEN:
-        if supplied_token is None:
-            print(f"❌ 拒絕：缺少 token；URL={url}")
-            await websocket.close(code=1008)
-            return None
-        if supplied_token != REQUIRED_TOKEN:
-            print(f"❌ 拒絕：token 不正確；給定={supplied_token}")
-            await websocket.close(code=1008)
-            return None
+    #if REQUIRED_TOKEN:
+     #   if supplied_token is None:
+      #      print(f"❌ 拒絕：缺少 token；URL={url}")
+       #     await websocket.close(code=1008)
+        #    return None
+        #if supplied_token != REQUIRED_TOKEN:
+         #   print(f"❌ 拒絕：token 不正確；給定={supplied_token}")
+          #  await websocket.close(code=1008)
+           # return None
 
     if cp_id not in allowed_ids:
         print(f"❌ 拒絕：{cp_id} 不在白名單 {allowed_ids}")
