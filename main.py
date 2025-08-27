@@ -82,6 +82,38 @@ def get_active_connections():
     """
     return [{"charge_point_id": cp_id} for cp_id in connected_charge_points.keys()]
 
+# ==== Live 快取工具 ====
+from time import time
+
+LIVE_TTL = 15  # 秒：視情況調整
+
+def _to_kw(value, unit):
+    try:
+        v = float(value)
+    except Exception:
+        return None
+    u = (unit or "").lower()
+    if u in ("w", "watt", "watts"):
+        return v / 1000.0
+    return v  # 視為 kW（或已是 kW）
+
+def _energy_to_kwh(value, unit):
+    try:
+        v = float(value)
+    except Exception:
+        return None
+    u = (unit or "").lower()
+    if u in ("wh", "w*h", "w_h"):
+        return v / 1000.0
+    return v  # 視為 kWh
+
+def _upsert_live(cp_id: str, **kv):
+    cur = live_status_cache.get(cp_id, {})
+    cur.update(kv)
+    cur["updated_at"] = time()
+    live_status_cache[cp_id] = cur
+# ======================
+
 
 
 from fastapi import WebSocket, WebSocketDisconnect
@@ -718,12 +750,12 @@ class ChargePoint(OcppChargePoint):
                 connector_id = 0
 
             transaction_id = (
-                kwargs.get("transaction_id") or
-                kwargs.get("transactionId") or
-                ""
+                kwargs.get("transaction_id")
+                or kwargs.get("transactionId")
+                or ""
             )
             meter_value_list = kwargs.get("meter_value") or kwargs.get("meterValue") or []
-  
+
             # 若缺 tx_id，從 DB 補最近未結束的一筆
             if not transaction_id:
                 with sqlite3.connect(DB_FILE) as _c:
@@ -742,6 +774,9 @@ class ChargePoint(OcppChargePoint):
                 _cur = _c.cursor()
                 for mv in meter_value_list or []:
                     ts = mv.get("timestamp")
+                    # 當批次可能需要推導功率時的暫存
+                    seen = {}  # e.g. {"voltage": ..., "current": ...}
+
                     for sv in mv.get("sampledValue", []) or []:
                         if "value" not in sv:
                             continue
@@ -753,15 +788,13 @@ class ChargePoint(OcppChargePoint):
                         if val is None or not meas:
                             continue
 
-                        # 轉成 float，避免字串寫入觸發型別/約束異常
                         try:
                             val = float(val)
                         except Exception:
                             logging.warning(f"⚠️ 無法轉換 value 為 float：{val} | measurand={meas}")
                             continue
 
-                        logging.debug(f"📝 插入測值 | {meas}: {val} {unit or ''} @ {ts} | phase={phase}")
- 
+                        # 1) 寫入 DB
                         _cur.execute("""
                             INSERT INTO meter_values
                               (charge_point_id, connector_id, transaction_id,
@@ -769,13 +802,49 @@ class ChargePoint(OcppChargePoint):
                             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                         """, (cp_id, connector_id, transaction_id, val, meas, unit, ts, phase))
                         insert_count += 1
+
+                        # 2) 即時快取（以 kW / A / V / kWh 統一）
+                        m = meas  # 簡寫
+                        if m == "Power.Active.Import":
+                            kw = _to_kw(val, unit)
+                            if kw is not None:
+                                _upsert_live(cp_id, power=round(kw, 3), timestamp=ts, derived=False)
+    
+                        elif m in ("Current.Import", "Current.Import.L1", "Current.Import.L2", "Current.Import.L3"):
+                            try:
+                                _upsert_live(cp_id, current=float(val), timestamp=ts)
+                                seen["current"] = float(val)
+                            except Exception:
+                                pass
+
+                        elif m in ("Voltage", "Voltage.L1", "Voltage.L2", "Voltage.L3"):
+                            try:
+                                _upsert_live(cp_id, voltage=float(val), timestamp=ts)
+                                seen["voltage"] = float(val)
+                            except Exception:
+                                pass
+
+                        elif m in ("Energy.Active.Import.Register", "Energy.Active.Import"):
+                            kwh = _energy_to_kwh(val, unit)
+                            if kwh is not None:
+                                _upsert_live(cp_id, energy=round(kwh, 6), timestamp=ts)
+
+                    # 3) 若本批有看到 V 或 I、但沒有即時功率，就以 V×I 粗估（單相；多相可自行擴充）
+                    live_now = live_status_cache.get(cp_id) or {}
+                    if "power" not in (live_now):
+                        v = seen.get("voltage") or live_now.get("voltage")
+                        i = seen.get("current") or live_now.get("current")
+                        if isinstance(v, (int, float)) and isinstance(i, (int, float)):
+                            vi_kw = max(0.0, (v * i) / 1000.0)
+                            _upsert_live(cp_id, power=round(vi_kw, 3), timestamp=ts, derived=True)
+
                 _c.commit()
 
             logging.info(f"📊 MeterValues 寫入完成，共 {insert_count} 筆 | tx={transaction_id} | keys={list(kwargs.keys())}")
             return call_result.MeterValuesPayload()
 
         except Exception as e:
-            # 把原始 payload 打出來便於追查為何 0 筆
+            # 把原始 payload 打出來便於追查
             logging.exception(f"❌ 處理 MeterValues 例外：{e} | payload={kwargs}")
             return call_result.MeterValuesPayload()
 
@@ -790,17 +859,24 @@ class ChargePoint(OcppChargePoint):
 
 @app.get("/api/charge-points/{charge_point_id}/live-status")
 def get_live_status(charge_point_id: str):
-    data = live_status_cache.get(charge_point_id)
-    if not data:
-        return {"message": "尚無資料", "active": False}
+    cp_id = _normalize_cp_id(charge_point_id)
+    data = live_status_cache.get(cp_id)
+    now = time()
 
+    if (not data) or (now - data.get("updated_at", 0) > LIVE_TTL):
+        return {"message": "尚無資料", "active": False, "status": "stale", "cp_id": cp_id}
+
+    # 為了相容前端既有欄位名稱，維持 power/current/energy/timestamp
     return {
-        "power": data.get("power", 0),
-        "current": data.get("current", 0),
-        "energy": data.get("energy", 0),
+        "power": data.get("power", 0),       # kW
+        "current": data.get("current", 0),   # A
+        "energy": data.get("energy", 0),     # kWh（若有上報）
         "timestamp": data.get("timestamp"),
+        "derived": data.get("derived", False),
         "active": True
     }
+
+
 
 
 
