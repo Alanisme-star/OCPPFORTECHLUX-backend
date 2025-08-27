@@ -412,7 +412,7 @@ class ChargePoint(OcppChargePoint):
         from datetime import datetime, timezone
 
         # 讀取交易資訊
-        with sqlite3.connect("ocpp_data.db") as conn:
+        with sqlite3.connect(DB_FILE) as conn:
             cursor = conn.cursor()
             cursor.execute('''
                 SELECT meter_stop, id_tag FROM transactions WHERE transaction_id = ?
@@ -468,7 +468,7 @@ class ChargePoint(OcppChargePoint):
                 print(f"🔴【OCPP Handler】❌ StopTransaction 欄位缺失 | cp_id={cp_id} | transaction_id={transaction_id}")
                 StopTransactionPayload()
 
-            with sqlite3.connect("ocpp_data.db") as _conn:
+            with sqlite3.connect(DB_FILE) as _conn:
                 _cur = _conn.cursor()
 
                 # 1) 落 StopTransaction 與更新交易紀錄
@@ -558,7 +558,7 @@ class ChargePoint(OcppChargePoint):
                 return call_result.StatusNotificationPayload()
 
             # 寫入資料庫
-            with sqlite3.connect("ocpp_data.db") as conn:
+            with sqlite3.connect(DB_FILE) as conn:
                 cursor = conn.cursor()
                 cursor.execute('''
                     INSERT INTO status_logs (charge_point_id, connector_id, status, timestamp)
@@ -644,7 +644,7 @@ class ChargePoint(OcppChargePoint):
 
     @on(Action.StartTransaction)
     async def on_start_transaction(self, connector_id, id_tag, meter_start, timestamp, **kwargs):
-        with sqlite3.connect("ocpp_data.db") as conn:
+        with sqlite3.connect(DB_FILE) as conn:
             cursor = conn.cursor()
 
             # 驗證 idTag
@@ -726,7 +726,7 @@ class ChargePoint(OcppChargePoint):
   
             # 若缺 tx_id，從 DB 補最近未結束的一筆
             if not transaction_id:
-                with sqlite3.connect("ocpp_data.db") as _c:
+                with sqlite3.connect(DB_FILE) as _c:
                     _cur = _c.cursor()
                     _cur.execute("""
                         SELECT transaction_id FROM transactions
@@ -738,7 +738,7 @@ class ChargePoint(OcppChargePoint):
                         transaction_id = str(row[0])
 
             insert_count = 0
-            with sqlite3.connect("ocpp_data.db") as _c:
+            with sqlite3.connect(DB_FILE) as _c:
                 _cur = _c.cursor()
                 for mv in meter_value_list or []:
                     ts = mv.get("timestamp")
@@ -819,7 +819,7 @@ async def stop_transaction_by_charge_point(charge_point_id: str):
             headers={"X-Connected-CPs": str(list(connected_charge_points.keys()))}
         )
     # 查詢進行中的 transaction_id
-    with sqlite3.connect("ocpp_data.db") as conn:
+    with sqlite3.connect(DB_FILE) as conn:
         cursor = conn.cursor()
         cursor.execute("""
             SELECT transaction_id FROM transactions
@@ -2078,7 +2078,7 @@ async def get_daily_by_chargepoint_range(
     end: str = Query(...)
 ):
     result_map = {}
-    with sqlite3.connect("ocpp_data.db") as conn:
+    with sqlite3.connect(DB_FILE) as conn:
         cursor = conn.cursor()
         cursor.execute("""
             SELECT strftime('%Y-%m-%d', start_timestamp) as day,
@@ -2616,7 +2616,7 @@ async def stop_transaction_by_charge_point(charge_point_id: str):
         )
 
     # 取進行中交易
-    with sqlite3.connect("ocpp_data.db") as lconn:
+    with sqlite3.connect(DB_FILE) as lconn:
         c = lconn.cursor()
         c.execute("""
             SELECT transaction_id FROM transactions
@@ -2681,7 +2681,7 @@ async def stop_transaction_by_charge_point(charge_point_id: str):
             headers={"X-Connected-CPs": str(list(connected_charge_points.keys()))}
         )
     # 查詢進行中的 transaction_id
-    with sqlite3.connect("ocpp_data.db") as conn:
+    with sqlite3.connect(DB_FILE) as conn:
         cursor = conn.cursor()
         cursor.execute("""
             SELECT transaction_id FROM transactions
@@ -2718,10 +2718,50 @@ async def stop_transaction_by_charge_point(charge_point_id: str):
         pending_stop_transactions.pop(str(transaction_id), None)
 
 
+from fastapi import Query
+from fastapi.responses import JSONResponse
+
+@app.get("/api/charging_status")
+async def charging_status(cp_id: str = Query(..., description="Charge Point ID")):
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+
+            # 查詢最新功率 (W)
+            cur.execute("""
+                SELECT value FROM meter_values
+                WHERE charge_point_id=? AND measurand='Power.Active.Import'
+                ORDER BY timestamp DESC LIMIT 1
+            """, (cp_id,))
+            power_row = cur.fetchone()
+
+            # 查詢最新累積電量 (Wh)
+            cur.execute("""
+                SELECT value FROM meter_values
+                WHERE charge_point_id=? AND measurand='Energy.Active.Import.Register'
+                ORDER BY timestamp DESC LIMIT 1
+            """, (cp_id,))
+            energy_row = cur.fetchone()
+
+            return JSONResponse({
+                "power": round(power_row["value"], 2) if power_row else 0.0,
+                "kwh": round(energy_row["value"] / 1000.0, 3) if energy_row else 0.0  # 轉為 kWh
+            })
+
+    except Exception as e:
+        logging.exception(f"❌ 查詢 charging_status 發生錯誤：{e}")
+        return JSONResponse({"power": 0.0, "kwh": 0.0}, status_code=500)
+
+
+
+
+
+
 @app.get("/api/devtools/last-transactions")
 def last_transactions():
     import sqlite3
-    with sqlite3.connect("ocpp_data.db") as conn:
+    with sqlite3.connect(DB_FILE) as conn:
         cursor = conn.cursor()
         cursor.execute("""
             SELECT transaction_id, charge_point_id, id_tag, start_timestamp, meter_start,
