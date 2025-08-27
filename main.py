@@ -203,7 +203,7 @@ async def _accept_or_reject_ws(websocket: WebSocket, raw_cp_id: str):
 
 
 
-@app.websocket("/ocpp/{charge_point_id:path}")
+@app.websocket("/{charge_point_id:path}")
 async def websocket_endpoint(websocket: WebSocket, charge_point_id: str):
     try:
         # 1) 驗證 + accept(subprotocol="ocpp1.6")，並回傳標準化 cp_id
