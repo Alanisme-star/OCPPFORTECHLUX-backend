@@ -71,6 +71,20 @@ class FastAPIWebSocketAdapter:
         return self.websocket.headers.get('sec-websocket-protocol') or "ocpp1.6"
 
 
+# ---- Key 正規化工具：忽略底線與大小寫，回傳第一個匹配鍵的值 ----
+def pick(d: dict, *names, default=None):
+    if not isinstance(d, dict):
+        return default
+    # 建一個 {規範化鍵: 原鍵} 的對照表
+    norm_map = {str(k).replace("_", "").lower(): k for k in d.keys()}
+    for name in names:
+        key_norm = str(name).replace("_", "").lower()
+        if key_norm in norm_map:
+            return d.get(norm_map[key_norm], default)
+    return default
+
+
+
 # ✅ 不再需要 connected_devices
 # ✅ 直接依據 connected_charge_points 來判定目前「已連線」的樁
 
@@ -734,29 +748,31 @@ class ChargePoint(OcppChargePoint):
 
 
 
-
     @on(Action.MeterValues)
     async def on_meter_values(self, **kwargs):
+        """
+        相容多種鍵名風格：
+        - connectorId / connector_id
+        - transactionId / transaction_id
+        - meterValue / meter_value
+        - sampledValue / sampled_value
+        並在寫 DB 的同時，更新 live_status_cache（power/current/voltage/energy）
+        """
         try:
             cp_id = getattr(self, "id", None)
-            if cp_id is None:
-                logging.error("❌ 無法識別充電樁 ID")
+            if not cp_id:
+                logging.error("❌ 無法識別充電樁 ID（self.id 為空）")
                 return call_result.MeterValuesPayload()
 
-            connector_id = kwargs.get("connector_id") or kwargs.get("connectorId") or 0
+            # 取 connector_id
+            connector_id = pick(kwargs, "connectorId", "connector_id", default=0)
             try:
-                connector_id = int(connector_id)
+                connector_id = int(connector_id or 0)
             except Exception:
                 connector_id = 0
 
-            transaction_id = (
-                kwargs.get("transaction_id")
-                or kwargs.get("transactionId")
-                or ""
-            )
-            meter_value_list = kwargs.get("meter_value") or kwargs.get("meterValue") or []
-
-            # 若缺 tx_id，從 DB 補最近未結束的一筆
+            # 取 transaction_id（若沒有就到 DB 補最近一筆未結束）
+            transaction_id = pick(kwargs, "transactionId", "transaction_id", "TransactionId", default="")
             if not transaction_id:
                 with sqlite3.connect(DB_FILE) as _c:
                     _cur = _c.cursor()
@@ -769,32 +785,47 @@ class ChargePoint(OcppChargePoint):
                     if row:
                         transaction_id = str(row[0])
 
+            # 取 meter_value list（相容多種命名）
+            meter_value_list = pick(kwargs, "meterValue", "meter_value", "MeterValue", default=[]) or []
+            if not isinstance(meter_value_list, list):
+                # 假如某些裝置送單一物件，轉成 list
+                meter_value_list = [meter_value_list]
+
             insert_count = 0
             with sqlite3.connect(DB_FILE) as _c:
                 _cur = _c.cursor()
-                for mv in meter_value_list or []:
-                    ts = mv.get("timestamp")
-                    # 當批次可能需要推導功率時的暫存
-                    seen = {}  # e.g. {"voltage": ..., "current": ...}
 
-                    for sv in mv.get("sampledValue", []) or []:
-                        if "value" not in sv:
+                for mv in meter_value_list:
+                    # timestamp 也相容 TimeStamp 之類的大小寫差異
+                    ts = pick(mv, "timestamp", "timeStamp", "Timestamp")
+
+                    # 取 sampledValue list（相容多種命名）
+                    sampled_list = pick(mv, "sampledValue", "sampled_value", "SampledValue", default=[]) or []
+                    if not isinstance(sampled_list, list):
+                        sampled_list = [sampled_list]
+
+                    # 本批暫存（用於 V×I 推估功率）
+                    seen = {}
+   
+                    for sv in sampled_list:
+                        if not isinstance(sv, dict):
                             continue
-                        val = sv.get("value")
-                        meas = sv.get("measurand", "")
-                        unit = sv.get("unit", "")
-                        phase = sv.get("phase")
 
-                        if val is None or not meas:
+                        raw_val = pick(sv, "value", "Value")
+                        meas = pick(sv, "measurand", "Measurand", default="")
+                        unit = pick(sv, "unit", "Unit", default="")
+                        phase = pick(sv, "phase", "Phase")
+
+                        if raw_val is None or not meas:
                             continue
 
                         try:
-                            val = float(val)
+                            val = float(raw_val)
                         except Exception:
-                            logging.warning(f"⚠️ 無法轉換 value 為 float：{val} | measurand={meas}")
+                            logging.warning(f"⚠️ 無法轉換 value 為 float：{raw_val} | measurand={meas}")
                             continue
-
-                        # 1) 寫入 DB
+  
+                        # 1) 寫 DB
                         _cur.execute("""
                             INSERT INTO meter_values
                               (charge_point_id, connector_id, transaction_id,
@@ -803,24 +834,26 @@ class ChargePoint(OcppChargePoint):
                         """, (cp_id, connector_id, transaction_id, val, meas, unit, ts, phase))
                         insert_count += 1
 
-                        # 2) 即時快取（以 kW / A / V / kWh 統一）
-                        m = meas  # 簡寫
+                        # 2) 即時快取（統一單位：功率 kW、電壓 V、電流 A、能量 kWh）
+                        m = str(meas)
                         if m == "Power.Active.Import":
                             kw = _to_kw(val, unit)
                             if kw is not None:
                                 _upsert_live(cp_id, power=round(kw, 3), timestamp=ts, derived=False)
-    
+
                         elif m in ("Current.Import", "Current.Import.L1", "Current.Import.L2", "Current.Import.L3"):
                             try:
-                                _upsert_live(cp_id, current=float(val), timestamp=ts)
-                                seen["current"] = float(val)
+                                cur_a = float(val)
+                                _upsert_live(cp_id, current=cur_a, timestamp=ts)
+                                seen["current"] = cur_a
                             except Exception:
                                 pass
 
                         elif m in ("Voltage", "Voltage.L1", "Voltage.L2", "Voltage.L3"):
                             try:
-                                _upsert_live(cp_id, voltage=float(val), timestamp=ts)
-                                seen["voltage"] = float(val)
+                                vv = float(val)
+                                _upsert_live(cp_id, voltage=vv, timestamp=ts)
+                                seen["voltage"] = vv
                             except Exception:
                                 pass
 
@@ -829,9 +862,9 @@ class ChargePoint(OcppChargePoint):
                             if kwh is not None:
                                 _upsert_live(cp_id, energy=round(kwh, 6), timestamp=ts)
 
-                    # 3) 若本批有看到 V 或 I、但沒有即時功率，就以 V×I 粗估（單相；多相可自行擴充）
+                    # 3) 若本批沒有功率，但有 V 或 I，嘗試以 V×I 推估（單相；多相可擴充）
                     live_now = live_status_cache.get(cp_id) or {}
-                    if "power" not in (live_now):
+                    if "power" not in live_now:
                         v = seen.get("voltage") or live_now.get("voltage")
                         i = seen.get("current") or live_now.get("current")
                         if isinstance(v, (int, float)) and isinstance(i, (int, float)):
@@ -844,8 +877,7 @@ class ChargePoint(OcppChargePoint):
             return call_result.MeterValuesPayload()
 
         except Exception as e:
-            # 把原始 payload 打出來便於追查
-            logging.exception(f"❌ 處理 MeterValues 例外：{e} | payload={kwargs}")
+            logging.exception(f"❌ 處理 MeterValues 例外：{e} | payload keys={list(kwargs.keys())}")
             return call_result.MeterValuesPayload()
 
 
@@ -861,20 +893,19 @@ class ChargePoint(OcppChargePoint):
 def get_live_status(charge_point_id: str):
     cp_id = _normalize_cp_id(charge_point_id)
     data = live_status_cache.get(cp_id)
-    now = time.time()
-
+    now = time.time()  # ✅ 正確
     if (not data) or (now - data.get("updated_at", 0) > LIVE_TTL):
         return {"message": "尚無資料", "active": False, "status": "stale", "cp_id": cp_id}
-
     return {
-        "power": data.get("power", 0),       # kW
-        "current": data.get("current", 0),   # A
-        "voltage": data.get("voltage", 0),   # ★ 加上這行
-        "energy": data.get("energy", 0),     # kWh
+        "power": data.get("power", 0),
+        "current": data.get("current", 0),
+        "voltage": data.get("voltage", 0),
+        "energy": data.get("energy", 0),
         "timestamp": data.get("timestamp"),
         "derived": data.get("derived", False),
-        "active": True
+        "active": True,
     }
+
 
 
 
