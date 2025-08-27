@@ -96,6 +96,26 @@ def get_active_connections():
     """
     return [{"charge_point_id": cp_id} for cp_id in connected_charge_points.keys()]
 
+
+@app.get("/api/debug/whitelist")
+def get_whitelist():
+    """
+    Debug 用 API：回傳目前允許的 charge_point_id 清單
+    """
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT charge_point_id, name FROM charge_points")
+        rows = cur.fetchall()
+
+    return {
+        "whitelist": [
+            {"charge_point_id": row[0], "name": row[1]} for row in rows
+        ]
+    }
+
+
+
+
 # ==== Live 快取工具 ====
 import time
 
@@ -159,11 +179,11 @@ async def _accept_or_reject_ws(websocket: WebSocket, raw_cp_id: str):
          #   print(f"❌ 拒絕：token 不正確；給定={supplied_token}")
           #  await websocket.close(code=1008)
            # return None
-
- #   if cp_id not in allowed_ids:
-      #  print(f"❌ 拒絕：{cp_id} 不在白名單 {allowed_ids}")
-      #  await websocket.close(code=1008)
-      #  return None
+    print(f"📝 白名單允許={allowed_ids}, 本次連線={cp_id}")
+    if cp_id not in allowed_ids:
+        print(f"❌ 拒絕：{cp_id} 不在白名單 {allowed_ids}")
+        await websocket.close(code=1008)
+        return None
 
     # 接受連線（OCPP 1.6 子協定）
     await websocket.accept(subprotocol="ocpp1.6")
