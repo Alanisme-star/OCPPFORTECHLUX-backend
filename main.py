@@ -866,15 +866,16 @@ def get_live_status(charge_point_id: str):
     if (not data) or (now - data.get("updated_at", 0) > LIVE_TTL):
         return {"message": "尚無資料", "active": False, "status": "stale", "cp_id": cp_id}
 
-    # 為了相容前端既有欄位名稱，維持 power/current/energy/timestamp
     return {
         "power": data.get("power", 0),       # kW
         "current": data.get("current", 0),   # A
-        "energy": data.get("energy", 0),     # kWh（若有上報）
+        "voltage": data.get("voltage", 0),   # ★ 加上這行
+        "energy": data.get("energy", 0),     # kWh
         "timestamp": data.get("timestamp"),
         "derived": data.get("derived", False),
         "active": True
     }
+
 
 
 
