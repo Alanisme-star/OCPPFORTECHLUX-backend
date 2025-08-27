@@ -723,7 +723,7 @@ class ChargePoint(OcppChargePoint):
                 ""
             )
             meter_value_list = kwargs.get("meter_value") or kwargs.get("meterValue") or []
-
+  
             # 若缺 tx_id，從 DB 補最近未結束的一筆
             if not transaction_id:
                 with sqlite3.connect("ocpp_data.db") as _c:
@@ -749,13 +749,19 @@ class ChargePoint(OcppChargePoint):
                         meas = sv.get("measurand", "")
                         unit = sv.get("unit", "")
                         phase = sv.get("phase")
+
                         if val is None or not meas:
                             continue
+
                         # 轉成 float，避免字串寫入觸發型別/約束異常
                         try:
                             val = float(val)
                         except Exception:
+                            logging.warning(f"⚠️ 無法轉換 value 為 float：{val} | measurand={meas}")
                             continue
+
+                        logging.debug(f"📝 插入測值 | {meas}: {val} {unit or ''} @ {ts} | phase={phase}")
+ 
                         _cur.execute("""
                             INSERT INTO meter_values
                               (charge_point_id, connector_id, transaction_id,
@@ -772,8 +778,6 @@ class ChargePoint(OcppChargePoint):
             # 把原始 payload 打出來便於追查為何 0 筆
             logging.exception(f"❌ 處理 MeterValues 例外：{e} | payload={kwargs}")
             return call_result.MeterValuesPayload()
-
-
 
 
 
