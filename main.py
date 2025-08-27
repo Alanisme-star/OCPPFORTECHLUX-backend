@@ -927,6 +927,30 @@ def get_live_status(charge_point_id: str):
     }
 
 
+@app.post("/api/debug/force-add-charge-point")
+def force_add_charge_point(
+    charge_point_id: str = "TW*MSI*E000100",
+    name: str = "MSI充電樁"
+):
+    """
+    Debug 用 API：強制新增一個充電樁到白名單 (charge_points 資料表)
+    """
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT OR IGNORE INTO charge_points (charge_point_id, name, status)
+            VALUES (?, ?, 'enabled')
+            """,
+            (charge_point_id, name),
+        )
+        conn.commit()
+
+    return {
+        "message": f"已新增或存在白名單: {charge_point_id}",
+        "charge_point_id": charge_point_id,
+        "name": name
+    }
 
 
 
