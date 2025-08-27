@@ -1266,14 +1266,19 @@ def get_card_balance(id_tag: str):
 
 @app.get("/api/charge-points/{charge_point_id}/status")
 def get_charge_point_status(charge_point_id: str):
-    cp = _normalize_cp_id(charge_point_id)  # 統一 key
+    cp = _normalize_cp_id(charge_point_id)          # ← 先正規化 key
     status = charging_point_status.get(cp)
+
+    # 沒有快取 → 統一回英文 Unknown
     if not status:
         return {"status": "Unknown"}
-    # 萬一快取裡不小心有中文，也轉成英文
+
+    # 快取裡萬一混入中文，也強制轉英文
     if status.get("status") == "未知":
         status = {**status, "status": "Unknown"}
+
     return status
+
 
 
 
