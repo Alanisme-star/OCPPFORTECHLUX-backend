@@ -83,7 +83,7 @@ def get_active_connections():
     return [{"charge_point_id": cp_id} for cp_id in connected_charge_points.keys()]
 
 # ==== Live 快取工具 ====
-from time import time
+import time
 
 LIVE_TTL = 15  # 秒：視情況調整
 
@@ -110,7 +110,7 @@ def _energy_to_kwh(value, unit):
 def _upsert_live(cp_id: str, **kv):
     cur = live_status_cache.get(cp_id, {})
     cur.update(kv)
-    cur["updated_at"] = time()
+    cur["updated_at"] = time.time()
     live_status_cache[cp_id] = cur
 # ======================
 
@@ -861,7 +861,7 @@ class ChargePoint(OcppChargePoint):
 def get_live_status(charge_point_id: str):
     cp_id = _normalize_cp_id(charge_point_id)
     data = live_status_cache.get(cp_id)
-    now = time()
+    now = time.time()
 
     if (not data) or (now - data.get("updated_at", 0) > LIVE_TTL):
         return {"message": "尚無資料", "active": False, "status": "stale", "cp_id": cp_id}
