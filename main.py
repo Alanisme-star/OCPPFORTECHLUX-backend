@@ -951,7 +951,7 @@ class ChargePoint(OcppChargePoint):
                                             pending_stop_transactions[tx_key] = fut
                                             logging.warning(f"⛔ 餘額不足：已用 {cost_so_far} / 餘額 {balance}，送出 RemoteStopTransaction | tx={tx_key} | cp={cp_id}")
                                             try:
-                                                req = call.RemoteStopTransaction(transaction_id=int(transaction_id))
+                                                req = call.RemoteStopTransactionPayload(transaction_id=int(transaction_id))
                                                 # 等回覆即可，StopTransaction 會由樁端回送
                                                 await self.call(req)
                                             except Exception as e:
