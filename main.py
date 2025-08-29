@@ -974,10 +974,8 @@ class ChargePoint(OcppChargePoint):
                                                         stop_requested.discard(tx_key)      # 允許下次重試
 
                                                 asyncio.create_task(_fire_and_log())
-                                                logging.info(f"RemoteStopTransaction 回應：{getattr(resp, 'status', None)}")
-                                                if getattr(resp, "status", None) != "Accepted":
-                                                    # 樁端拒絕就允許下次重試
-                                                    stop_requested.discard(tx_key)
+    
+                                    
                                             except Exception as e:
                                                 logging.exception(f"❌ 送出 RemoteStopTransaction 失敗: {e}")
                                                 # 若送失敗，允許下一次重試
