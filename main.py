@@ -18,6 +18,8 @@ import sqlite3
 import uvicorn
 import asyncio
 pending_stop_transactions = {}
+# 針對每筆交易做「已送停充」去重，避免前端/後端重複送
+stop_requested = set()
 
 logger = logging.getLogger(__name__)
 
@@ -586,9 +588,15 @@ class ChargePoint(OcppChargePoint):
                 _conn.commit()
 
 
-            fut = pending_stop_transactions.get(str(transaction_id))
+            # 若 /stop API 有在等，回傳結果
+            tx_key = str(transaction_id)
+            fut = pending_stop_transactions.get(tx_key)
             if fut and not fut.done():
                 fut.set_result({"meter_stop": meter_stop, "timestamp": timestamp, "reason": reason})
+
+            # ✅ 清掉已送停充去重旗標，避免殘留影響下一筆交易
+            stop_requested.discard(tx_key)
+            pending_stop_transactions.pop(tx_key, None)
 
             return call_result.StopTransactionPayload()
 
@@ -939,25 +947,29 @@ class ChargePoint(OcppChargePoint):
                                 # 查卡片餘額
                                 _cur.execute("SELECT balance FROM cards WHERE card_id = ?", (id_tag,))
                                 cr = _cur.fetchone()
+
+
                                 if cr is not None:
                                     balance = float(cr[0] or 0.0)
 
-                                    # 若已經沒有餘額，且尚未有 pending future，就送停充
+                                    # 若已經沒有餘額 → 送停充（去重，避免重覆送）
                                     if cost_so_far >= balance:
                                         tx_key = str(transaction_id)
-                                        if tx_key not in pending_stop_transactions:
-                                            loop = asyncio.get_event_loop()
-                                            fut = loop.create_future()
-                                            pending_stop_transactions[tx_key] = fut
-                                            logging.warning(f"⛔ 餘額不足：已用 {cost_so_far} / 餘額 {balance}，送出 RemoteStopTransaction | tx={tx_key} | cp={cp_id}")
+                                        if tx_key not in stop_requested:
+                                            stop_requested.add(tx_key)
+                                            logging.warning(
+                                                f"⛔ 餘額不足：已用 {cost_so_far} / 餘額 {balance}，送出 RemoteStopTransaction | tx={tx_key} | cp={cp_id}"
+                                            )
                                             try:
-                                                req = call.RemoteStopTransactionPayload(transaction_id=int(transaction_id))
-                                                # 等回覆即可，StopTransaction 會由樁端回送
+                                                # ✅ 這裡要用「call.RemoteStopTransaction」（CALL），不是 Payload
+                                                req = call.RemoteStopTransaction(transaction_id=int(transaction_id))
                                                 await self.call(req)
                                             except Exception as e:
                                                 logging.exception(f"❌ 送出 RemoteStopTransaction 失敗: {e}")
-                                                # 若送失敗，移除 pending future，避免占用
-                                                pending_stop_transactions.pop(tx_key, None)
+                                                # 若送失敗，允許下一次重試
+                                                stop_requested.discard(tx_key)
+
+
 
             return call_result.MeterValuesPayload()
 
@@ -1026,6 +1038,8 @@ from fastapi import HTTPException
 
 @app.post("/api/charge-points/{charge_point_id}/stop")
 async def stop_transaction_by_charge_point(charge_point_id: str):
+    # ← 先正規化，處理星號與 URL 編碼
+    cp_id = _normalize_cp_id(charge_point_id)
     print(f"🟢【API呼叫】收到停止充電API請求, charge_point_id = {charge_point_id}")
     cp = connected_charge_points.get(charge_point_id)
 
