@@ -961,9 +961,13 @@ class ChargePoint(OcppChargePoint):
                                                 f"⛔ 餘額不足：已用 {cost_so_far} / 餘額 {balance}，送出 RemoteStopTransaction | tx={tx_key} | cp={cp_id}"
                                             )
                                             try:
-                                                # ✅ 這裡要用「call.RemoteStopTransaction」（CALL），不是 Payload
-                                                req = call.RemoteStopTransaction(transaction_id=int(transaction_id))
-                                                await self.call(req)
+                                                # ✅ 正確：用 Payload 物件建立 CALL
+                                                req = call.RemoteStopTransactionPayload(transaction_id=int(transaction_id))
+                                                resp = await self.call(req)
+                                                logging.info(f"RemoteStopTransaction 回應：{getattr(resp, 'status', None)}")
+                                                if getattr(resp, "status", None) != "Accepted":
+                                                    # 樁端拒絕就允許下次重試
+                                                    stop_requested.discard(tx_key)
                                             except Exception as e:
                                                 logging.exception(f"❌ 送出 RemoteStopTransaction 失敗: {e}")
                                                 # 若送失敗，允許下一次重試
@@ -1041,7 +1045,7 @@ async def stop_transaction_by_charge_point(charge_point_id: str):
     # ← 先正規化，處理星號與 URL 編碼
     cp_id = _normalize_cp_id(charge_point_id)
     print(f"🟢【API呼叫】收到停止充電API請求, charge_point_id = {charge_point_id}")
-    cp = connected_charge_points.get(charge_point_id)
+    cp = connected_charge_points.get(cp_id)
 
     if not cp:
         print(f"🔴【API異常】找不到連線中的充電樁：{charge_point_id}")
@@ -1057,7 +1061,7 @@ async def stop_transaction_by_charge_point(charge_point_id: str):
             SELECT transaction_id FROM transactions
             WHERE charge_point_id = ? AND stop_timestamp IS NULL
             ORDER BY start_timestamp DESC LIMIT 1
-        """, (charge_point_id,))
+        """, (cp_id,))
         row = cursor.fetchone()
         if not row:
             print(f"🔴【API異常】無進行中交易 charge_point_id={charge_point_id}")
@@ -1074,7 +1078,8 @@ async def stop_transaction_by_charge_point(charge_point_id: str):
     # 發送 RemoteStopTransaction
     print(f"🟢【API呼叫】發送 RemoteStopTransaction 給充電樁")
     print(f"🟢【API呼叫】即將送出 RemoteStopTransaction | charge_point_id={charge_point_id} | transaction_id={transaction_id}")
-    req = call.RemoteStopTransaction(transaction_id=transaction_id)
+    # 送 RemoteStopTransaction（使用 Payload）
+    req = call.RemoteStopTransactionPayload(transaction_id=int(transaction_id))
     resp = await cp.call(req)
     print(f"🟢【API回應】呼叫 RemoteStopTransaction 完成，resp={resp}")
 
