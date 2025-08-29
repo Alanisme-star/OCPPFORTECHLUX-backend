@@ -963,7 +963,17 @@ class ChargePoint(OcppChargePoint):
                                             try:
                                                 # ✅ 正確：用 Payload 物件建立 CALL
                                                 req = call.RemoteStopTransactionPayload(transaction_id=int(transaction_id))
-                                                resp = await self.call(req)
+                                                async def _fire_and_log():
+                                                    try:
+                                                        resp = await self.call(req)
+                                                        logging.info(f"[AutoStop] RemoteStopTransaction 回應: {getattr(resp, 'status', None)}")
+                                                        if getattr(resp, "status", None) != "Accepted":
+                                                            stop_requested.discard(tx_key)  # 允許下次重試
+                                                    except Exception as e:
+                                                        logging.exception(f"[AutoStop] RemoteStopTransaction 送出失敗: {e}")
+                                                        stop_requested.discard(tx_key)      # 允許下次重試
+
+                                                asyncio.create_task(_fire_and_log())
                                                 logging.info(f"RemoteStopTransaction 回應：{getattr(resp, 'status', None)}")
                                                 if getattr(resp, "status", None) != "Accepted":
                                                     # 樁端拒絕就允許下次重試
