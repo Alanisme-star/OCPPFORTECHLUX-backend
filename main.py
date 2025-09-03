@@ -1440,6 +1440,68 @@ def get_latest_status(charge_point_id: str):
     # 找不到就回 Unknown
     return {"status": "Unknown"}
 
+@app.get("/api/charge-points/{charge_point_id}/last-transaction/summary")
+def get_last_tx_summary_by_cp(charge_point_id: str):
+    cp_id = _normalize_cp_id(charge_point_id)
+    with get_conn() as conn:
+        cur = conn.cursor()
+        # 找最近「已結束」的交易
+        cur.execute("""
+            SELECT t.transaction_id, t.id_tag
+            FROM transactions t
+            WHERE t.charge_point_id = ? AND t.stop_timestamp IS NOT NULL
+            ORDER BY t.stop_timestamp DESC
+            LIMIT 1
+        """, (cp_id,))
+        row = cur.fetchone()
+        if not row:
+            return {"found": False}
+
+        tx_id, id_tag = row
+        # 查 payments 總額
+        cur.execute("SELECT total_amount FROM payments WHERE transaction_id = ?", (tx_id,))
+        pay = cur.fetchone()
+        total_amount = float(pay[0]) if pay else 0.0
+        # 查卡片目前餘額
+        cur.execute("SELECT balance FROM cards WHERE card_id = ?", (id_tag,))
+        c = cur.fetchone()
+        balance = float(c[0]) if c else 0.0
+
+        return {
+            "found": True,
+            "transaction_id": tx_id,
+            "id_tag": id_tag,
+            "total_amount": round(total_amount, 2),
+            "balance": round(balance, 2),
+        }
+
+
+@app.get("/api/transactions/{transaction_id}/summary")
+def get_transaction_summary(transaction_id: str):
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT t.id_tag, p.total_amount
+            FROM transactions t
+            LEFT JOIN payments p ON p.transaction_id = t.transaction_id
+            WHERE t.transaction_id = ?
+        """, (transaction_id,))
+        row = cur.fetchone()
+        if not row:
+            return {"found": False}
+
+        id_tag, total_amount = row[0], float(row[1] or 0.0)
+        cur.execute("SELECT balance FROM cards WHERE card_id = ?", (id_tag,))
+        c = cur.fetchone()
+        balance = float(c[0]) if c else 0.0
+
+        return {
+            "found": True,
+            "transaction_id": transaction_id,
+            "id_tag": id_tag,
+            "total_amount": round(total_amount, 2),
+            "balance": round(balance, 2),
+        }
 
 
 
