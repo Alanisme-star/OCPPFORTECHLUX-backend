@@ -953,7 +953,7 @@ class ChargePoint(OcppChargePoint):
                                     balance = float(cr[0] or 0.0)
 
                                     # 若已經沒有餘額 → 送停充（去重，避免重覆送）
-                                    if cost_so_far > balance:
+                                    if balance <= 0:
                                         tx_key = str(transaction_id)
                                         if tx_key not in stop_requested:
                                             stop_requested.add(tx_key)
