@@ -890,6 +890,28 @@ class ChargePoint(OcppChargePoint):
                             if kwh is not None:
                                 _upsert_live(cp_id, energy=round(kwh, 6), timestamp=ts)
 
+
+
+                        # ★ Debug Log：印出原始資料與交易起始值
+                        try:
+                            with sqlite3.connect(DB_FILE) as _dbg:
+                                _cur_dbg = _dbg.cursor()
+                                _cur_dbg.execute("""
+                                    SELECT meter_start FROM transactions
+                                    WHERE transaction_id = ?
+                            """, (transaction_id,))
+                            row_dbg = _cur_dbg.fetchone()
+                            meter_start_dbg = row_dbg[0] if row_dbg else None
+                  except Exception as e:
+                      meter_start_dbg = None
+
+                  logging.info(
+                      f"[DEBUG][MeterValues] tx={transaction_id} | measurand={m} | "
+                      f"value={val} {unit} | after_conv={kwh} kWh | meter_start={meter_start_dbg}"
+                  )
+
+
+
                     # (3) 若本批沒有功率，但有 V 或 I，嘗試以 V×I 推估（單相）
                     live_now = live_status_cache.get(cp_id) or {}
                     if "power" not in live_now:
