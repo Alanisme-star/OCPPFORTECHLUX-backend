@@ -892,6 +892,7 @@ class ChargePoint(OcppChargePoint):
 
 
 
+
                         # ★ Debug Log：印出原始資料與交易起始值
                         try:
                             with sqlite3.connect(DB_FILE) as _dbg:
@@ -905,9 +906,17 @@ class ChargePoint(OcppChargePoint):
                         except Exception as e:
                             meter_start_dbg = None
 
-                        logging.info(
-                            f"[DEBUG][MeterValues] tx={transaction_id} | measurand={m} | "
-                            f"value={val} {unit} | after_conv={kwh} kWh | meter_start={meter_start_dbg}"
+                        # 只針對 energy 類型做 kWh 換算，其餘只顯示原始值
+                        if m in ("Energy.Active.Import.Register", "Energy.Active.Import"):
+                            kwh = _energy_to_kwh(val, unit)
+                            logging.info(
+                                f"[DEBUG][MeterValues] tx={transaction_id} | measurand={m} | "
+                                f"value={val} {unit} | after_conv={kwh} kWh | meter_start={meter_start_dbg}"
+                            )
+                        else:
+                            logging.info(
+                                f"[DEBUG][MeterValues] tx={transaction_id} | measurand={m} | "
+                                f"value={val} {unit} | (非 energy 測項，無需換算) | meter_start={meter_start_dbg}"
                         )
 
 
