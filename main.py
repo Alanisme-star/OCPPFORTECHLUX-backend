@@ -899,16 +899,16 @@ class ChargePoint(OcppChargePoint):
                                 _cur_dbg.execute("""
                                     SELECT meter_start FROM transactions
                                     WHERE transaction_id = ?
-                            """, (transaction_id,))
-                            row_dbg = _cur_dbg.fetchone()
-                            meter_start_dbg = row_dbg[0] if row_dbg else None
-                  except Exception as e:
-                      meter_start_dbg = None
+                                """, (transaction_id,))
+                                row_dbg = _cur_dbg.fetchone()
+                                meter_start_dbg = row_dbg[0] if row_dbg else None
+                        except Exception as e:
+                            meter_start_dbg = None
 
-                  logging.info(
-                      f"[DEBUG][MeterValues] tx={transaction_id} | measurand={m} | "
-                      f"value={val} {unit} | after_conv={kwh} kWh | meter_start={meter_start_dbg}"
-                  )
+                        logging.info(
+                            f"[DEBUG][MeterValues] tx={transaction_id} | measurand={m} | "
+                            f"value={val} {unit} | after_conv={kwh} kWh | meter_start={meter_start_dbg}"
+                        )
 
 
 
