@@ -607,6 +607,13 @@ class ChargePoint(OcppChargePoint):
         try:
             cp_id = getattr(self, "id", None)
  
+
+
+            # Debug: 收到的原始 payload
+            logging.info(f"🟢【DEBUG】收到 StatusNotification | cp_id={cp_id} | kwargs={kwargs} | "
+                         f"connector_id={connector_id} | status={status} | error_code={error_code} | ts={timestamp}")
+
+
             # 強制轉為 int 並防止 None 造成錯誤
             try:
                 connector_id = int(connector_id) if connector_id is not None else 0
@@ -621,6 +628,12 @@ class ChargePoint(OcppChargePoint):
                 logging.error(f"❌ 欄位遺失 | cp_id={cp_id} | connector_id={connector_id} | status={status}")
                 return call_result.StatusNotificationPayload()
 
+
+
+            # Debug: 準備寫入 DB
+            logging.info(f"🟡【DEBUG】寫入 DB: cp_id={cp_id}, connector_id={connector_id}, status={status}, ts={timestamp}")
+
+
             # 寫入資料庫
             with sqlite3.connect(DB_FILE) as conn:
                 cursor = conn.cursor()
@@ -629,6 +642,11 @@ class ChargePoint(OcppChargePoint):
                     VALUES (?, ?, ?, ?)
                 ''', (cp_id, connector_id, status, timestamp))
                 conn.commit()
+
+
+            # Debug: DB 寫入完成
+            logging.info(f"✅【DEBUG】DB 已寫入 StatusNotification (cp_id={cp_id}, status={status})")
+
 
             # 儲存至記憶體
             charging_point_status[cp_id] = {
