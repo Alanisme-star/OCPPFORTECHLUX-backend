@@ -753,9 +753,9 @@ class ChargePoint(OcppChargePoint):
 
             # 🔧 修正：確保 meter_start 有效
             try:
-                meter_start_val = int(meter_start or 0)
+                meter_start_val = float(meter_start or 0) / 1000.0
             except Exception:
-                meter_start_val = 0
+                meter_start_val = 0.0
 
             # 建立交易
             transaction_id = int(datetime.utcnow().timestamp() * 1000)
@@ -766,7 +766,7 @@ class ChargePoint(OcppChargePoint):
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (transaction_id, self.id, connector_id, id_tag, meter_start, timestamp, None, None, None))
             conn.commit()
-            logging.info(f"🚗 StartTransaction 成功 | CP={self.id} | idTag={id_tag} | transactionId={transaction_id}")
+            logging.info(f"🚗 StartTransaction 成功 | CP={self.id} | idTag={id_tag} | transactionId={transaction_id} | meter_start={meter_start_val} kWh")
 
             return call_result.StartTransactionPayload(transaction_id=transaction_id, id_tag_info={"status": "Accepted"})
 
