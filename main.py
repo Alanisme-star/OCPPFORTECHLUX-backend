@@ -38,7 +38,7 @@ from reportlab.pdfgen import canvas
 app = FastAPI()
 
 # === WebSocket 連線驗證設定（可選）===
-REQUIRED_TOKEN = os.getenv("OCPP_WS_TOKEN", None)  # 例：設成 "abc123"；不設就不驗證
+REQUIRED_TOKEN = os.getenv("OCPP_WS_TOKEN", None)  
 
 
 
@@ -356,12 +356,6 @@ cursor.execute("""
 conn.commit()
 
 
-# 測試卡片初始資料（可選）
-cursor.execute('INSERT OR IGNORE INTO cards (card_id, balance) VALUES (?, ?)', ("ABC123", 200))
-cursor.execute('INSERT OR IGNORE INTO cards (card_id, balance) VALUES (?, ?)', ("TAG001", 50))
-cursor.execute('INSERT OR IGNORE INTO cards (card_id, balance) VALUES (?, ?)', ("USER999", 500))
-conn.commit()
-
 cursor.execute('''
 CREATE TABLE IF NOT EXISTS transactions (
     transaction_id INTEGER PRIMARY KEY,
@@ -385,10 +379,6 @@ CREATE TABLE IF NOT EXISTS id_tags (
 )
 ''')
 
-# 測試資料（可移除）：預設三張卡片
-cursor.execute('INSERT OR IGNORE INTO id_tags (id_tag, status, valid_until) VALUES (?, ?, ?)', ("ABC123", "Accepted", "2099-12-31T23:59:59"))
-cursor.execute('INSERT OR IGNORE INTO id_tags (id_tag, status, valid_until) VALUES (?, ?, ?)', ("TAG001", "Expired", "2022-01-01T00:00:00"))
-cursor.execute('INSERT OR IGNORE INTO id_tags (id_tag, status, valid_until) VALUES (?, ?, ?)', ("USER999", "Blocked", "2099-12-31T23:59:59"))
 
 
 # ✅ 請插入這段
