@@ -751,6 +751,12 @@ class ChargePoint(OcppChargePoint):
             if balance <= 0:
                 return call_result.StartTransactionPayload(transaction_id=0, id_tag_info={"status": "Blocked"})
 
+            # 🔧 修正：確保 meter_start 有效
+            try:
+                meter_start_val = int(meter_start or 0)
+            except Exception:
+                meter_start_val = 0
+
             # 建立交易
             transaction_id = int(datetime.utcnow().timestamp() * 1000)
             cursor.execute("""
