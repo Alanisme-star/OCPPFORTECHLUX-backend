@@ -1384,6 +1384,11 @@ def get_latest_energy(charge_point_id: str):
         # 預設已是 kWh（或未知單位時依 kWh 解讀）
         total_kwh = raw_val
 
+
+    # === 新增 Debug ===
+    print(f"[DEBUG latest-energy] cp={charge_point_id} | total_kwh={total_kwh} | raw={raw_val}{unit}")
+
+
     result = {
         "timestamp": ts,
         "totalEnergyKWh": round(total_kwh, 6),  # 累積表值（從樁的電表來）
@@ -1410,6 +1415,10 @@ def get_latest_energy(charge_point_id: str):
                 session_wh = (total_kwh * 1000.0) - float(meter_start)
                 session_kwh = max(0.0, session_wh / 1000.0)
                 result["sessionEnergyKWh"] = round(session_kwh, 6)
+
+                # === 新增 Debug ===
+                print(f"[DEBUG latest-energy] cp={charge_point_id} | meter_start={meter_start}Wh | session={session_kwh}kWh")
+
         except Exception:
             # 若有例外就略過 session 欄位
             pass
