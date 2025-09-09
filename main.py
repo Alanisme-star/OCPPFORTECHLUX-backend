@@ -811,11 +811,8 @@ class ChargePoint(OcppChargePoint):
         - transactionId / transaction_id
         - meterValue / meter_value
         - sampledValue / sampled_value
-        並在寫 DB 的同時，更新 live_status_cache（power/current/voltage/energy）
-<<<<<<< HEAD
-=======
+
         ＊新增：根據本交易累積電費 vs 卡片餘額，自動觸發 RemoteStopTransaction
->>>>>>> de4b9b5d0ffbbdc8f2ebd49db9e62be255cdc559
         """
         try:
             cp_id = getattr(self, "id", None)
@@ -850,31 +847,22 @@ class ChargePoint(OcppChargePoint):
                 meter_value_list = [meter_value_list]
 
             insert_count = 0
-<<<<<<< HEAD
-=======
             last_ts_in_batch = None  # 用於定價時間點
->>>>>>> de4b9b5d0ffbbdc8f2ebd49db9e62be255cdc559
+
             with sqlite3.connect(DB_FILE) as _c:
                 _cur = _c.cursor()
 
                 for mv in meter_value_list:
                     ts = pick(mv, "timestamp", "timeStamp", "Timestamp")
-<<<<<<< HEAD
-=======
                     if ts:
                         last_ts_in_batch = ts
->>>>>>> de4b9b5d0ffbbdc8f2ebd49db9e62be255cdc559
 
                     sampled_list = pick(mv, "sampledValue", "sampled_value", "SampledValue", default=[]) or []
                     if not isinstance(sampled_list, list):
                         sampled_list = [sampled_list]
 
                     seen = {}
-<<<<<<< HEAD
-   
-=======
 
->>>>>>> de4b9b5d0ffbbdc8f2ebd49db9e62be255cdc559
                     for sv in sampled_list:
                         if not isinstance(sv, dict):
                             continue
@@ -892,13 +880,8 @@ class ChargePoint(OcppChargePoint):
                         except Exception:
                             logging.warning(f"⚠️ 無法轉換 value 為 float：{raw_val} | measurand={meas}")
                             continue
-<<<<<<< HEAD
-  
-                        # 1) 寫 DB
-=======
 
                         # (1) 寫 DB
->>>>>>> de4b9b5d0ffbbdc8f2ebd49db9e62be255cdc559
                         _cur.execute("""
                             INSERT INTO meter_values
                               (charge_point_id, connector_id, transaction_id,
@@ -936,9 +919,6 @@ class ChargePoint(OcppChargePoint):
                             if kwh is not None:
                                 _upsert_live(cp_id, energy=round(kwh, 6), timestamp=ts)
 
-
-
-
                         # ★ Debug Log：印出原始資料與交易起始值
                         try:
                             with sqlite3.connect(DB_FILE) as _dbg:
@@ -952,7 +932,6 @@ class ChargePoint(OcppChargePoint):
                         except Exception as e:
                             meter_start_dbg = None
 
-                        # 只針對 energy 類型做 kWh 換算，其餘只顯示原始值
                         if m in ("Energy.Active.Import.Register", "Energy.Active.Import"):
                             kwh = _energy_to_kwh(val, unit)
                             logging.info(
@@ -963,9 +942,7 @@ class ChargePoint(OcppChargePoint):
                             logging.info(
                                 f"[DEBUG][MeterValues] tx={transaction_id} | measurand={m} | "
                                 f"value={val} {unit} | (非 energy 測項，無需換算) | meter_start={meter_start_dbg}"
-                        )
-
-
+                            )
 
                     # (3) 若本批沒有功率，但有 V 或 I，嘗試以 V×I 推估（單相）
                     live_now = live_status_cache.get(cp_id) or {}
@@ -979,15 +956,11 @@ class ChargePoint(OcppChargePoint):
                 _c.commit()
 
             logging.info(f"📊 MeterValues 寫入完成，共 {insert_count} 筆 | tx={transaction_id} | keys={list(kwargs.keys())}")
-<<<<<<< HEAD
-=======
 
             # === 新增：餘額與累計費用檢查 → 需要時自動下遠端停充 ===
-            # 只在有進行中交易時才檢查
             if transaction_id:
                 with sqlite3.connect(DB_FILE) as _c:
                     _cur = _c.cursor()
-                    # 取得交易起點與 id_tag、是否已結束
                     _cur.execute("""
                         SELECT meter_start, id_tag, stop_timestamp
                         FROM transactions
@@ -998,7 +971,6 @@ class ChargePoint(OcppChargePoint):
                     if tr:
                         meter_start_wh, id_tag, stop_ts = tr
                         if stop_ts is None and id_tag:
-                            # 取最新能量值（優先使用 Energy.Active.Import.Register / Import）
                             _cur.execute("""
                                 SELECT timestamp, value, unit
                                 FROM meter_values
@@ -1011,30 +983,22 @@ class ChargePoint(OcppChargePoint):
 
                             if ev:
                                 ts_last, val, unit = ev
-                                # 轉成 kWh
                                 cur_kwh = _energy_to_kwh(val, unit)
-                                # 起始表碼是 Wh（你的 transactions.meter_start 即是 Wh）
                                 used_kwh = max(0.0, (cur_kwh - (float(meter_start_wh or 0) / 1000.0))) if cur_kwh is not None else 0.0
 
-                                # 依最後一筆時間戳定價（找不到就回 6.0）
                                 try:
                                     unit_price = float(_price_for_timestamp(ts_last or last_ts_in_batch or datetime.utcnow().isoformat()))
                                 except Exception:
-                                    unit_price = 6.0  # 後備價
+                                    unit_price = 6.0
                                 cost_so_far = round(used_kwh * unit_price, 2)
 
-                                # 查卡片餘額
                                 _cur.execute("SELECT balance FROM cards WHERE card_id = ?", (id_tag,))
                                 cr = _cur.fetchone()
 
-
                                 if cr is not None:
                                     balance = float(cr[0] or 0.0)
-
-                                    # 計算剩餘餘額（卡片餘額 - 已累積花費）
                                     remaining_balance = balance - cost_so_far
 
-                                    # 若已經沒有餘額 → 送停充（去重，避免重覆送）
                                     if remaining_balance <= 0:
                                         tx_key = str(transaction_id)
                                         if tx_key not in stop_requested:
@@ -1043,34 +1007,30 @@ class ChargePoint(OcppChargePoint):
                                                 f"⛔ 餘額不足：已用 {cost_so_far} / 餘額 {balance}，送出 RemoteStopTransaction | tx={tx_key} | cp={cp_id}"
                                             )
                                             try:
-                                                # ✅ 正確：用 Payload 物件建立 CALL
                                                 req = call.RemoteStopTransactionPayload(transaction_id=int(transaction_id))
+
                                                 async def _fire_and_log():
                                                     try:
                                                         resp = await self.call(req)
                                                         logging.info(f"[AutoStop] RemoteStopTransaction 回應: {getattr(resp, 'status', None)}")
                                                         if getattr(resp, "status", None) != "Accepted":
-                                                            stop_requested.discard(tx_key)  # 允許下次重試
+                                                            stop_requested.discard(tx_key)
                                                     except Exception as e:
                                                         logging.exception(f"[AutoStop] RemoteStopTransaction 送出失敗: {e}")
-                                                        stop_requested.discard(tx_key)      # 允許下次重試
+                                                        stop_requested.discard(tx_key)
 
                                                 asyncio.create_task(_fire_and_log())
-    
-                                    
+
                                             except Exception as e:
                                                 logging.exception(f"❌ 送出 RemoteStopTransaction 失敗: {e}")
-                                                # 若送失敗，允許下一次重試
                                                 stop_requested.discard(tx_key)
 
-
-
->>>>>>> de4b9b5d0ffbbdc8f2ebd49db9e62be255cdc559
             return call_result.MeterValuesPayload()
 
         except Exception as e:
             logging.exception(f"❌ 處理 MeterValues 例外：{e} | payload keys={list(kwargs.keys())}")
             return call_result.MeterValuesPayload()
+
 
 
 
