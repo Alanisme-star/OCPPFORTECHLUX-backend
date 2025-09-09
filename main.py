@@ -760,14 +760,23 @@ class ChargePoint(OcppChargePoint):
                 cursor.execute("UPDATE reservations SET status='completed' WHERE id=?", (res[0],))
                 conn.commit()
 
-            # 餘額檢查
+
+            # === 修改點開始 ===
+            # 餘額檢查（若卡片不存在 → 自動新增，初始餘額 0）
             cursor.execute("SELECT balance FROM cards WHERE card_id = ?", (id_tag,))
             card = cursor.fetchone()
             if not card:
-                return call_result.StartTransactionPayload(transaction_id=0, id_tag_info={"status": "Invalid"})
-            balance = float(card[0] or 0)
+                logging.info(f"🟢【修正】卡片 {id_tag} 不存在，系統自動建立（餘額=0）")
+                cursor.execute("INSERT INTO cards (card_id, balance) VALUES (?, ?)", (id_tag, 0.0))
+                conn.commit()
+                balance = 0.0
+            else:
+                balance = float(card[0] or 0)
+
             if balance <= 0:
                 return call_result.StartTransactionPayload(transaction_id=0, id_tag_info={"status": "Blocked"})
+            # === 修改點結束 ===
+
 
             # 🔧 修正：確保 meter_start 有效
             try:
