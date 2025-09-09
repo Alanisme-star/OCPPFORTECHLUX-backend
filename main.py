@@ -774,7 +774,11 @@ class ChargePoint(OcppChargePoint):
                 balance = float(card[0] or 0)
 
             if balance <= 0:
+                logging.warning(f"🔴 StartTransaction 被擋下：idTag={id_tag} | balance={balance}")
                 return call_result.StartTransactionPayload(transaction_id=0, id_tag_info={"status": "Blocked"})
+
+            logging.info(f"🟢 StartTransaction Accepted：idTag={id_tag} | balance={balance}")
+
             # === 修改點結束 ===
 
 
@@ -891,6 +895,7 @@ class ChargePoint(OcppChargePoint):
                             kw = _to_kw(val, unit)
                             if kw is not None:
                                 _upsert_live(cp_id, power=round(kw, 3), timestamp=ts, derived=False)
+                                logging.info(f"⚡ 更新快取：cp={cp_id} power={kw:.3f}kW ts={ts}")
 
                         elif m in ("Current.Import", "Current.Import.L1", "Current.Import.L2", "Current.Import.L3"):
                             try:
@@ -1062,7 +1067,12 @@ def get_live_status(charge_point_id: str):
     data = live_status_cache.get(cp_id)
     now = time.time()  # ✅ 正確
     if (not data) or (now - data.get("updated_at", 0) > LIVE_TTL):
+        logging.warning(f"🟡 /live-status | cp_id={cp_id} → stale (無資料或逾時)")
         return {"message": "尚無資料", "active": False, "status": "stale", "cp_id": cp_id}
+
+    age = now - data.get("updated_at", 0)
+    logging.info(f"🟢 /live-status | cp_id={cp_id} | 最新更新距離 {age:.1f} 秒 | data={data}")
+
     return {
         "power": data.get("power", 0),
         "current": data.get("current", 0),
