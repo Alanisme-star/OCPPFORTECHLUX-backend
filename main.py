@@ -1077,9 +1077,9 @@ def get_live_status(charge_point_id: str):
 @app.post("/api/debug/force-add-charge-point")
 def force_add_charge_point(
     charge_point_id: str = "TW*MSI*E000100",
-    name: str = "MSI充電樁"
-    card_id: str = "6678B3EB",       # ★ 新增：可指定卡片 ID（預設模擬器用的卡）
-    initial_balance: float = 100.0   # ★ 新增：可指定初始餘額（預設 100 元）
+    name: str = "MSI充電樁",           # ← 補上逗號
+    card_id: str = "6678B3EB",        # ★ 新增：可指定卡片 ID（預設模擬器用的卡）
+    initial_balance: float = 100.0    # ★ 新增：可指定初始餘額（預設 100 元）
 ):
     """
     Debug 用 API：強制新增一個充電樁到白名單 (charge_points 資料表)，
