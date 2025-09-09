@@ -1532,11 +1532,16 @@ def get_last_tx_summary_by_cp(charge_point_id: str):
         if not row:
             return {"found": False}
 
-        tx_id, id_tag = row
+
+        # ★ 修改：多 unpack start/stop
+        tx_id, id_tag, start_ts, stop_ts = row
+
+
         # 查 payments 總額
         cur.execute("SELECT total_amount FROM payments WHERE transaction_id = ?", (tx_id,))
         pay = cur.fetchone()
         total_amount = float(pay[0]) if pay else 0.0
+
         # 查卡片目前餘額
         cur.execute("SELECT balance FROM cards WHERE card_id = ?", (id_tag,))
         c = cur.fetchone()
@@ -1548,6 +1553,8 @@ def get_last_tx_summary_by_cp(charge_point_id: str):
             "id_tag": id_tag,
             "total_amount": round(total_amount, 2),
             "balance": round(balance, 2),
+            "start_timestamp": start_ts,   # ★ 修改：新增起始時間
+            "stop_timestamp": stop_ts      # ★ 修改：新增結束時間
         }
 
 
