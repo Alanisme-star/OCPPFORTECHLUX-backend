@@ -3152,6 +3152,28 @@ async def charging_status(cp_id: str = Query(..., description="Charge Point ID")
         return JSONResponse({"power": 0.0, "kwh": 0.0}, status_code=500)
 
 
+@app.get("/api/charge-points/{charge_point_id}/last-transaction/summary")
+def get_last_transaction_summary(charge_point_id: str):
+    cp_id = _normalize_cp_id(charge_point_id)
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT transaction_id, start_timestamp, stop_timestamp
+            FROM transactions
+            WHERE charge_point_id = ?
+            ORDER BY start_timestamp DESC
+            LIMIT 1
+        """, (cp_id,))
+        row = cur.fetchone()
+        if not row:
+            return {"found": False}
+
+        return {
+            "found": True,
+            "transaction_id": row[0],
+            "start_timestamp": row[1],
+            "stop_timestamp": row[2]
+        }
 
 
 
