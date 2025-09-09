@@ -1078,12 +1078,16 @@ def get_live_status(charge_point_id: str):
 def force_add_charge_point(
     charge_point_id: str = "TW*MSI*E000100",
     name: str = "MSI充電樁"
+    card_id: str = "6678B3EB",       # ★ 新增：可指定卡片 ID（預設模擬器用的卡）
+    initial_balance: float = 100.0   # ★ 新增：可指定初始餘額（預設 100 元）
 ):
     """
-    Debug 用 API：強制新增一個充電樁到白名單 (charge_points 資料表)
+    Debug 用 API：強制新增一個充電樁到白名單 (charge_points 資料表)，
+    並同步建立測試卡片 (cards 表)，避免沒有卡片餘額資料。
     """
     with get_conn() as conn:
         cur = conn.cursor()
+        # === 原本的充電樁白名單建立 ===
         cur.execute(
             """
             INSERT OR IGNORE INTO charge_points (charge_point_id, name, status)
@@ -1091,12 +1095,26 @@ def force_add_charge_point(
             """,
             (charge_point_id, name),
         )
+
+
+
+        # === 新增：同步建立卡片（如果不存在就建立） ===
+        cur.execute(
+            "INSERT OR IGNORE INTO cards (card_id, balance) VALUES (?, ?)",
+            (card_id, initial_balance)
+        )
+
+
         conn.commit()
+
+
 
     return {
         "message": f"已新增或存在白名單: {charge_point_id}",
         "charge_point_id": charge_point_id,
-        "name": name
+        "name": name,
+        "card_id": card_id,
+        "balance": initial_balance
     }
 
 
