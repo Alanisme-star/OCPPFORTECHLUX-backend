@@ -524,7 +524,7 @@ class ChargePoint(OcppChargePoint):
 
             if cp_id is None or transaction_id is None:
                 print(f"🔴【OCPP Handler】❌ StopTransaction 欄位缺失 | cp_id={cp_id} | transaction_id={transaction_id}")
-                StopTransactionPayload()
+                return call_result.StopTransactionPayload()
 
             with sqlite3.connect(DB_FILE) as _conn:
                 _cur = _conn.cursor()
