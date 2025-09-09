@@ -1520,9 +1520,9 @@ def get_last_tx_summary_by_cp(charge_point_id: str):
     cp_id = _normalize_cp_id(charge_point_id)
     with get_conn() as conn:
         cur = conn.cursor()
-        # 找最近「已結束」的交易
+        # 找最近「已結束」的交易，取起始與結束時間
         cur.execute("""
-            SELECT t.transaction_id, t.id_tag
+            SELECT t.transaction_id, t.id_tag, t.start_timestamp, t.stop_timestamp
             FROM transactions t
             WHERE t.charge_point_id = ? AND t.stop_timestamp IS NOT NULL
             ORDER BY t.stop_timestamp DESC
@@ -1532,10 +1532,8 @@ def get_last_tx_summary_by_cp(charge_point_id: str):
         if not row:
             return {"found": False}
 
-
-        # ★ 修改：多 unpack start/stop
+        # 正確 unpack 四個欄位
         tx_id, id_tag, start_ts, stop_ts = row
-
 
         # 查 payments 總額
         cur.execute("SELECT total_amount FROM payments WHERE transaction_id = ?", (tx_id,))
@@ -1553,10 +1551,9 @@ def get_last_tx_summary_by_cp(charge_point_id: str):
             "id_tag": id_tag,
             "total_amount": round(total_amount, 2),
             "balance": round(balance, 2),
-            "start_timestamp": start_ts,   # ★ 修改：新增起始時間
-            "stop_timestamp": stop_ts      # ★ 修改：新增結束時間
+            "start_timestamp": start_ts,   # ✅ 現在有值了
+            "stop_timestamp": stop_ts      # ✅ 現在有值了
         }
-
 
 @app.get("/api/transactions/{transaction_id}/summary")
 def get_transaction_summary(transaction_id: str):
