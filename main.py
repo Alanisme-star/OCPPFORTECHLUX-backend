@@ -777,7 +777,6 @@ class ChargePoint(OcppChargePoint):
         - meterValue / meter_value
         - sampledValue / sampled_value
         並在寫 DB 的同時，更新 live_status_cache（power/current/voltage/energy）
-        並於結尾加入：餘額 <= 0（或推估剩餘額度 <= 0）→ 自動送 RemoteStopTransaction
         """
         try:
             cp_id = getattr(self, "id", None)
@@ -813,14 +812,12 @@ class ChargePoint(OcppChargePoint):
                 meter_value_list = [meter_value_list]
 
             insert_count = 0
-            last_ts_for_batch = None
             with sqlite3.connect(DB_FILE) as _c:
                 _cur = _c.cursor()
 
                 for mv in meter_value_list:
                     # timestamp 也相容 TimeStamp 之類的大小寫差異
                     ts = pick(mv, "timestamp", "timeStamp", "Timestamp")
-                    last_ts_for_batch = ts or last_ts_for_batch
 
                     # 取 sampledValue list（相容多種命名）
                     sampled_list = pick(mv, "sampledValue", "sampled_value", "SampledValue", default=[]) or []
@@ -829,7 +826,7 @@ class ChargePoint(OcppChargePoint):
 
                     # 本批暫存（用於 V×I 推估功率）
                     seen = {}
-  
+   
                     for sv in sampled_list:
                         if not isinstance(sv, dict):
                             continue
@@ -841,13 +838,13 @@ class ChargePoint(OcppChargePoint):
 
                         if raw_val is None or not meas:
                             continue
- 
+
                         try:
                             val = float(raw_val)
                         except Exception:
                             logging.warning(f"⚠️ 無法轉換 value 為 float：{raw_val} | measurand={meas}")
                             continue
-
+  
                         # 1) 寫 DB
                         _cur.execute("""
                             INSERT INTO meter_values
@@ -897,94 +894,6 @@ class ChargePoint(OcppChargePoint):
                 _c.commit()
 
             logging.info(f"📊 MeterValues 寫入完成，共 {insert_count} 筆 | tx={transaction_id} | keys={list(kwargs.keys())}")
-
-            # =========================
-            # 🔴 自動停充邏輯（NEW）
-            # 條件：找到進行中交易，且卡片餘額 <= 0，或以目前 session 用電 × 單價 推估可用額度 <= 0
-            # 另加 8 秒節流，避免重複狂送 RemoteStopTransaction
-            # =========================
-            try:
-                if transaction_id:
-                    with sqlite3.connect(DB_FILE) as _c:
-                        _cur = _c.cursor()
-
-                        # 進行中交易？
-                        _cur.execute("""
-                            SELECT id_tag, meter_start
-                            FROM transactions
-                            WHERE transaction_id=? AND stop_timestamp IS NULL
-                        """, (transaction_id,))
-                        row = _cur.fetchone()
-
-                        if row:
-                            id_tag, meter_start = row[0], float(row[1] or 0.0)
-
-                            # 讀取卡片餘額
-                            _cur.execute("SELECT balance FROM cards WHERE card_id = ?", (id_tag,))
-                            card_row = _cur.fetchone()
-                            balance_now = float(card_row[0] or 0.0) if card_row else 0.0
-
-                            # 取「最新總表」kWh（若 live 快取已有 energy 亦可用）
-                            total_kwh = None
-                            live_e = (live_status_cache.get(cp_id) or {}).get("energy")
-                            if isinstance(live_e, (int, float)):
-                                total_kwh = float(live_e)
-                            else:
-                                _cur.execute("""
-                                    SELECT value, unit FROM meter_values
-                                    WHERE charge_point_id=? AND measurand='Energy.Active.Import.Register'
-                                      AND (phase IS NULL OR phase='')
-                                    ORDER BY timestamp DESC LIMIT 1
-                                """, (cp_id,))
-                                erow = _cur.fetchone()
-                                if erow:
-                                    ev, eu = float(erow[0]), (erow[1] or "").lower()
-                                    total_kwh = (ev / 1000.0) if eu in ("wh", "w*h", "w_h") else ev
-
-                            # 推估本次 session 用電量
-                            session_kwh = None
-                            if total_kwh is not None:
-                                # meter_start 大多為 Wh，需轉 kWh 再相減
-                                session_kwh = max(0.0, total_kwh - (meter_start / 1000.0))
-
-                            # 取得單價
-                            try:
-                                unit_price = float(_price_for_timestamp(
-                                    (last_ts_for_batch or datetime.utcnow().isoformat())
-                                ))
-                            except Exception:
-                                unit_price = 6.0  # fallback 單價
-
-                            # 計算「推估剩餘金額」
-                            est_remaining = balance_now
-                            if session_kwh is not None:
-                                est_remaining = balance_now - (session_kwh * unit_price)
-
-                            # 觸發條件
-                            if balance_now <= 0.0 or est_remaining <= 0.0:
-                                # 8 秒節流（以 transaction_id 為 key）
-                                sent_map = getattr(self, "_auto_stop_sent", {})
-                                now_ts = time.time()
-                                last_sent = sent_map.get(str(transaction_id), 0)
-                                if now_ts - last_sent >= 8.0:
-                                    logging.info(
-                                        f"⚠️ 餘額不足 → 自動停止 | idTag={id_tag} | balance={balance_now:.2f} | "
-                                        f"session_kWh={session_kwh if session_kwh is not None else 'NA'} | "
-                                        f"price={unit_price:.2f} | est_remaining={est_remaining:.2f} | tx={transaction_id}"
-                                    )
-                                    cp = connected_charge_points.get(cp_id)
-                                    if cp:
-                                        # 非阻塞送出，並讓 /api/.../stop 的同步等待仍可運作
-                                        req = call.RemoteStopTransaction(transaction_id=int(transaction_id))
-                                        asyncio.create_task(cp.call(req))
-                                        # 記錄節流時間
-                                        sent_map[str(transaction_id)] = now_ts
-                                        setattr(self, "_auto_stop_sent", sent_map)
-                                else:
-                                    logging.debug(f"⏳ 自動停充已在 {now_ts - last_sent:.1f}s 前觸發過，略過重送 | tx={transaction_id}")
-            except Exception as e:
-                logging.error(f"❌ 自動停充檢查失敗: {e}")
-
             return call_result.MeterValuesPayload()
 
         except Exception as e:
