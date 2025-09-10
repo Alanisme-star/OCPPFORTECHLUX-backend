@@ -3162,26 +3162,43 @@ async def charging_status(cp_id: str = Query(..., description="Charge Point ID")
 
 
 @app.get("/api/charge-points/{charge_point_id}/last-transaction/summary")
-def get_last_transaction_summary(charge_point_id: str):
+def get_last_tx_summary_by_cp(charge_point_id: str):   # ★ 修改：改名稱更清楚（可不改）
     cp_id = _normalize_cp_id(charge_point_id)
     with get_conn() as conn:
         cur = conn.cursor()
+        # ★ 修改：多選 id_tag，排序依 transaction_id
         cur.execute("""
-            SELECT transaction_id, start_timestamp, stop_timestamp
-            FROM transactions
-            WHERE charge_point_id = ?
-            ORDER BY start_timestamp DESC
+            SELECT t.transaction_id, t.id_tag, t.start_timestamp, t.stop_timestamp
+            FROM transactions t
+            WHERE t.charge_point_id = ?
+            ORDER BY t.transaction_id DESC
             LIMIT 1
         """, (cp_id,))
         row = cur.fetchone()
+        print(f"[DEBUG last-transaction] cp_id={cp_id} | row={row}")  # ★ 新增 Debug
         if not row:
             return {"found": False}
 
+        tx_id, id_tag, start_ts, stop_ts = row
+
+        # ★ 修改：查 payments 總額
+        cur.execute("SELECT total_amount FROM payments WHERE transaction_id = ?", (tx_id,))
+        pay = cur.fetchone()
+        total_amount = float(pay[0]) if pay else 0.0
+
+        # ★ 修改：查卡片餘額
+        cur.execute("SELECT balance FROM cards WHERE card_id = ?", (id_tag,))
+        c = cur.fetchone()
+        balance = float(c[0]) if c else 0.0
+
         return {
             "found": True,
-            "transaction_id": row[0],
-            "start_timestamp": row[1],
-            "stop_timestamp": row[2]
+            "transaction_id": tx_id,
+            "id_tag": id_tag,                 # ★ 新增：卡片 ID
+            "total_amount": round(total_amount, 2),   # ★ 新增：本次交易金額
+            "balance": round(balance, 2),     # ★ 新增：卡片剩餘餘額
+            "start_timestamp": start_ts,      # ★ 保留原本
+            "stop_timestamp": stop_ts or ""   # ★ 修改：避免回傳 None
         }
 
 
