@@ -3176,6 +3176,82 @@ def get_last_transaction_summary(charge_point_id: str):
 
 
 
+# ==============================
+# 🔌 Charge Point - Transaction APIs
+# ==============================
+
+# 抓最新「進行中」的交易 (只有 start_timestamp)
+@app.get("/api/charge-points/{charge_point_id}/current-transaction")
+def get_current_tx_by_cp(charge_point_id: str):
+    cp_id = _normalize_cp_id(charge_point_id)
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT transaction_id, id_tag, start_timestamp
+            FROM transactions
+            WHERE charge_point_id = ? AND stop_timestamp IS NULL
+            ORDER BY transaction_id DESC
+            LIMIT 1
+        """, (cp_id,))
+        row = cur.fetchone()
+        print(f"[DEBUG current-transaction] cp_id={cp_id} | row={row}")  # ★ Debug
+        if not row:
+            return {"found": False}
+
+        tx_id, id_tag, start_ts = row
+        return {
+            "found": True,
+            "transaction_id": tx_id,
+            "id_tag": id_tag,
+            "start_timestamp": start_ts
+        }
+
+
+# 抓最新「已結束」的交易 (包含 start_timestamp + stop_timestamp)
+@app.get("/api/charge-points/{charge_point_id}/last-transaction/summary")
+def get_last_tx_summary_by_cp(charge_point_id: str):
+    cp_id = _normalize_cp_id(charge_point_id)
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT transaction_id, id_tag, start_timestamp, stop_timestamp
+            FROM transactions
+            WHERE charge_point_id = ? AND stop_timestamp IS NOT NULL
+            ORDER BY transaction_id DESC
+            LIMIT 1
+        """, (cp_id,))
+        row = cur.fetchone()
+        print(f"[DEBUG last-transaction] cp_id={cp_id} | row={row}")  # ★ Debug
+        if not row:
+            return {"found": False}
+
+        tx_id, id_tag, start_ts, stop_ts = row
+
+        # 查 payments 總額
+        cur.execute("SELECT total_amount FROM payments WHERE transaction_id = ?", (tx_id,))
+        pay = cur.fetchone()
+        total_amount = float(pay[0]) if pay else 0.0
+
+        # 查卡片目前餘額
+        cur.execute("SELECT balance FROM cards WHERE card_id = ?", (id_tag,))
+        c = cur.fetchone()
+        balance = float(c[0]) if c else 0.0
+
+        return {
+            "found": True,
+            "transaction_id": tx_id,
+            "id_tag": id_tag,
+            "total_amount": round(total_amount, 2),
+            "balance": round(balance, 2),
+            "start_timestamp": start_ts,
+            "stop_timestamp": stop_ts
+        }
+
+
+
+
+
+
 @app.get("/api/devtools/last-transactions")
 def last_transactions():
     import sqlite3
