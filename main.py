@@ -1525,7 +1525,7 @@ def get_last_tx_summary_by_cp(charge_point_id: str):
             SELECT t.transaction_id, t.id_tag, t.start_timestamp, t.stop_timestamp
             FROM transactions t
             WHERE t.charge_point_id = ?
-            ORDER BY t.stop_timestamp DESC
+            ORDER BY t.start_timestamp DESC
             LIMIT 1
         """, (cp_id,))
         row = cur.fetchone()
