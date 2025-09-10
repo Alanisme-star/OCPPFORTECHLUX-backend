@@ -519,7 +519,14 @@ class ChargePoint(OcppChargePoint):
             # 正規化傳入欄位
             transaction_id = str(kwargs.get("transaction_id") or kwargs.get("transactionId"))
             meter_stop = kwargs.get("meter_stop")
-            timestamp = kwargs.get("timestamp") or datetime.utcnow().isoformat()
+
+            # === 最小改動：正規化 stop_timestamp ===
+            raw_ts = kwargs.get("timestamp")
+            try:
+                stop_ts = datetime.fromisoformat(raw_ts).astimezone(timezone.utc).isoformat() if raw_ts else datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
+            except Exception:
+                stop_ts = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
+
             reason = kwargs.get("reason")
 
             if cp_id is None or transaction_id is None:
@@ -533,13 +540,13 @@ class ChargePoint(OcppChargePoint):
                 _cur.execute('''
                     INSERT INTO stop_transactions (transaction_id, meter_stop, timestamp, reason)
                     VALUES (?, ?, ?, ?)
-                ''', (transaction_id, meter_stop, timestamp, reason))
+                ''', (transaction_id, meter_stop, stop_ts, reason))   # ← 改為 stop_ts
 
                 _cur.execute('''
                     UPDATE transactions
                     SET meter_stop = ?, stop_timestamp = ?, reason = ?
                     WHERE transaction_id = ?
-                ''', (meter_stop, timestamp, reason, transaction_id))
+                ''', (meter_stop, stop_ts, reason, transaction_id))   # ← 改為 stop_ts
 
                 # 2) 取交易起始資料 → 算本次用電（Wh→kWh）
                 _cur.execute('''
@@ -552,10 +559,10 @@ class ChargePoint(OcppChargePoint):
                     meter_start, id_tag = row
                     energy_kwh = max(0.0, ((meter_stop or 0) - (meter_start or 0)) / 1000.0)
 
-                    # 3) 依「停止時間」求單價（用你 daily_pricing_rules 的規則；找不到時預設 6 元）
-                    unit_price = float(_price_for_timestamp(timestamp))
+                    # 3) 依「停止時間」求單價
+                    unit_price = float(_price_for_timestamp(stop_ts))
 
-                    # 4) 記 payments（可視需求調整 base/overuse）
+                    # 4) 記 payments
                     base_fee = 0.0
                     energy_fee = round(energy_kwh * unit_price, 2)
                     overuse_fee = 0.0
@@ -564,9 +571,9 @@ class ChargePoint(OcppChargePoint):
                     _cur.execute('''
                         INSERT INTO payments (transaction_id, base_fee, energy_fee, overuse_fee, total_amount, paid_at)
                         VALUES (?, ?, ?, ?, ?, ?)
-                    ''', (transaction_id, base_fee, energy_fee, overuse_fee, total, timestamp))
+                    ''', (transaction_id, base_fee, energy_fee, overuse_fee, total, stop_ts))   # ← 改為 stop_ts
 
-                    # 5) 扣卡片餘額（不足則扣到 0）
+                    # 5) 扣卡片餘額
                     _cur.execute("SELECT balance FROM cards WHERE card_id = ?", (id_tag,))
                     card_row = _cur.fetchone()
                     if card_row is not None:
@@ -577,14 +584,13 @@ class ChargePoint(OcppChargePoint):
 
                 _conn.commit()
 
-
             # 若 /stop API 有在等，回傳結果
             tx_key = str(transaction_id)
             fut = pending_stop_transactions.get(tx_key)
             if fut and not fut.done():
-                fut.set_result({"meter_stop": meter_stop, "timestamp": timestamp, "reason": reason})
+                fut.set_result({"meter_stop": meter_stop, "timestamp": stop_ts, "reason": reason})  # ← 改為 stop_ts
 
-            # ✅ 清掉已送停充去重旗標，避免殘留影響下一筆交易
+            # ✅ 清掉已送停充去重旗標
             stop_requested.discard(tx_key)
             pending_stop_transactions.pop(tx_key, None)
 
@@ -760,9 +766,7 @@ class ChargePoint(OcppChargePoint):
                 cursor.execute("UPDATE reservations SET status='completed' WHERE id=?", (res[0],))
                 conn.commit()
 
-
-            # === 修改點開始 ===
-            # 餘額檢查（若卡片不存在 → 自動新增，初始餘額 0）
+            # 餘額檢查
             cursor.execute("SELECT balance FROM cards WHERE card_id = ?", (id_tag,))
             card = cursor.fetchone()
             if not card:
@@ -779,27 +783,34 @@ class ChargePoint(OcppChargePoint):
 
             logging.info(f"🟢 StartTransaction Accepted：idTag={id_tag} | balance={balance}")
 
-            # === 修改點結束 ===
-
-
-            # 🔧 修正：確保 meter_start 有效
+            # 確保 meter_start 有效
             try:
                 meter_start_val = float(meter_start or 0) / 1000.0
             except Exception:
                 meter_start_val = 0.0
 
-            # 建立交易
+            # 建立交易 ID
             transaction_id = int(datetime.utcnow().timestamp() * 1000)
+
+            # === 最小改動：正規化 start_timestamp ===
+            try:
+                start_ts = datetime.fromisoformat(timestamp).astimezone(timezone.utc).isoformat()
+            except Exception:
+                start_ts = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
+
+            # 寫入交易紀錄
             cursor.execute("""
                 INSERT INTO transactions (
                     transaction_id, charge_point_id, connector_id, id_tag,
                     meter_start, start_timestamp, meter_stop, stop_timestamp, reason
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (transaction_id, self.id, connector_id, id_tag, meter_start, timestamp, None, None, None))
+            """, (transaction_id, self.id, connector_id, id_tag, meter_start, start_ts, None, None, None))
+
             conn.commit()
             logging.info(f"🚗 StartTransaction 成功 | CP={self.id} | idTag={id_tag} | transactionId={transaction_id} | meter_start={meter_start_val} kWh")
 
             return call_result.StartTransactionPayload(transaction_id=transaction_id, id_tag_info={"status": "Accepted"})
+
 
 
 
