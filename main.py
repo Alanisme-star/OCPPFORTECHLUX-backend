@@ -1524,11 +1524,12 @@ def get_last_tx_summary_by_cp(charge_point_id: str):
         cur.execute("""
             SELECT t.transaction_id, t.id_tag, t.start_timestamp, t.stop_timestamp
             FROM transactions t
-            WHERE t.charge_point_id = ? AND t.stop_timestamp IS NOT NULL
+            WHERE t.charge_point_id = ?
             ORDER BY t.stop_timestamp DESC
             LIMIT 1
         """, (cp_id,))
         row = cur.fetchone()
+        print(f"[DEBUG last-transaction] cp_id={cp_id} | row={row}")
         if not row:
             return {"found": False}
 
