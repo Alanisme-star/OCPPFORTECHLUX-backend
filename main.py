@@ -1451,6 +1451,40 @@ def get_last_transaction_summary(charge_point_id: str):
 
 
 
+@app.get("/api/charge-points/{charge_point_id}/current-transaction")
+def get_current_transaction(charge_point_id: str):
+    """
+    回傳該充電樁進行中的交易（尚未結束）。
+    - 若有，會包含 start_timestamp。
+    - 若無，回傳 found=False。
+    """
+    cp_id = _normalize_cp_id(charge_point_id)
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT transaction_id, id_tag, start_timestamp
+            FROM transactions
+            WHERE charge_point_id = ? AND stop_timestamp IS NULL
+            ORDER BY transaction_id DESC
+            LIMIT 1
+        """, (cp_id,))
+        row = cur.fetchone()
+        if not row:
+            return {"found": False}
+
+        tx_id, id_tag, start_ts = row
+        return {
+            "found": True,
+            "transaction_id": tx_id,
+            "id_tag": id_tag,
+            "start_timestamp": start_ts
+        }
+
+
+
+
+
+
 @app.get("/api/charge-points/{charge_point_id}/latest-energy")
 def get_latest_energy(charge_point_id: str):
     """
