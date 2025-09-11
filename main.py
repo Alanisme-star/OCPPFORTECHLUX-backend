@@ -938,6 +938,40 @@ class ChargePoint(OcppChargePoint):
                             if kwh is not None:
                                 _upsert_live(cp_id, energy=round(kwh, 6), timestamp=ts)
 
+
+
+
+                                # === [修改新增] 計算預估用電量與金額 ===
+                                try:
+                                    with sqlite3.connect(DB_FILE) as _c2:
+                                        _cur2 = _c2.cursor()
+                                        _cur2.execute("SELECT meter_start FROM transactions WHERE transaction_id = ?", (transaction_id,))
+                                        row_tx = _cur2.fetchone()
+                                        if row_tx:
+                                            meter_start_wh = float(row_tx[0] or 0)
+                                            used_kwh = max(0.0, (kwh - (meter_start_wh / 1000.0)))  # 累積用電量(kWh)
+                                            # 查單價（若失敗則 fallback 6 元）
+                                            try:
+                                                unit_price = float(_price_for_timestamp(ts))
+                                            except Exception:
+                                                unit_price = 6.0
+                                            est_amount = round(used_kwh * unit_price, 2)
+
+                                            # 更新 live_status_cache，讓 /live-status API 能取用
+                                            _upsert_live(cp_id,
+                                                         estimated_energy=round(used_kwh, 6),
+                                                         estimated_amount=est_amount,
+                                                         price_per_kwh=unit_price,
+                                                         timestamp=ts)
+                                except Exception as e:
+                                    logging.warning(f"⚠️ 預估金額計算失敗: {e}")
+
+
+
+
+
+
+
                         # ★ Debug Log：印出原始資料與交易起始值
                         try:
                             with sqlite3.connect(DB_FILE) as _dbg:
@@ -1065,7 +1099,7 @@ class ChargePoint(OcppChargePoint):
 def get_live_status(charge_point_id: str):
     cp_id = _normalize_cp_id(charge_point_id)
     data = live_status_cache.get(cp_id)
-    now = time.time()  # ✅ 正確
+    now = time.time()
     if (not data) or (now - data.get("updated_at", 0) > LIVE_TTL):
         logging.warning(f"🟡 /live-status | cp_id={cp_id} → stale (無資料或逾時)")
         return {"message": "尚無資料", "active": False, "status": "stale", "cp_id": cp_id}
@@ -1078,10 +1112,16 @@ def get_live_status(charge_point_id: str):
         "current": data.get("current", 0),
         "voltage": data.get("voltage", 0),
         "energy": data.get("energy", 0),
+        # === [修改新增] 回傳預估值 ===
+        "estimated_energy": data.get("estimated_energy", 0),
+        "estimated_amount": data.get("estimated_amount", 0),
+        "price_per_kwh": data.get("price_per_kwh", None),
+        # === 原本的 ===
         "timestamp": data.get("timestamp"),
         "derived": data.get("derived", False),
         "active": True,
     }
+
 
 
 @app.post("/api/debug/force-add-charge-point")
