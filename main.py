@@ -1310,7 +1310,7 @@ def get_latest_current_api(charge_point_id: str):
 
 
 
-# ✅ 原本 API（加上最終電量 / 電費，不動結構）
+# ✅ 原本 API（只加 warning log，不動結構）
 @app.get("/api/charge-points/{charge_point_id}/last-transaction/summary")
 def get_last_tx_summary_by_cp(charge_point_id: str):
     print("[WARN] /last-transaction/summary 已過時，建議改用 /current-transaction/summary 或 /last-finished-transaction/summary")
@@ -1319,8 +1319,7 @@ def get_last_tx_summary_by_cp(charge_point_id: str):
         cur = conn.cursor()
         # 找最近「最後一筆交易」(可能是進行中，也可能是已結束)
         cur.execute("""
-            SELECT t.transaction_id, t.id_tag, t.start_timestamp, t.stop_timestamp,
-                   t.meter_start, t.meter_stop
+            SELECT t.transaction_id, t.id_tag, t.start_timestamp, t.stop_timestamp
             FROM transactions t
             WHERE t.charge_point_id = ?
             ORDER BY t.transaction_id DESC
@@ -1331,21 +1330,13 @@ def get_last_tx_summary_by_cp(charge_point_id: str):
         if not row:
             return {"found": False}
 
-        # unpack 六個欄位
-        tx_id, id_tag, start_ts, stop_ts, meter_start, meter_stop = row
+        # 正確 unpack 四個欄位
+        tx_id, id_tag, start_ts, stop_ts = row
 
         # 查 payments 總額
         cur.execute("SELECT total_amount FROM payments WHERE transaction_id = ?", (tx_id,))
         pay = cur.fetchone()
-        total_amount = float(pay[0]) if pay else 0.0
-
-        # 計算最終電量（kWh）
-        final_energy = None
-        if meter_start is not None and meter_stop is not None:
-            try:
-                final_energy = max(0.0, (float(meter_stop) - float(meter_start)) / 1000.0)
-            except Exception:
-                final_energy = None
+        total_amount = pay[0] if pay else 0.0
 
         return {
             "found": True,
@@ -1353,11 +1344,8 @@ def get_last_tx_summary_by_cp(charge_point_id: str):
             "id_tag": id_tag,
             "start_timestamp": start_ts,
             "stop_timestamp": stop_ts,
-            "total_amount": total_amount,
-            "final_energy_kwh": final_energy,
-            "final_cost": total_amount  # final_cost 與 total_amount 相同
+            "total_amount": total_amount
         }
-
 
 
 # ✅ 新增：查詢最近一筆「進行中」交易
