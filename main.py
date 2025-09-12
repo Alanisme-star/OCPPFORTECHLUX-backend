@@ -825,13 +825,7 @@ class ChargePoint(OcppChargePoint):
     @on(Action.MeterValues)
     async def on_meter_values(self, **kwargs):
         """
-        相容多種鍵名風格：
-        - connectorId / connector_id
-        - transactionId / transaction_id
-        - meterValue / meter_value
-        - sampledValue / sampled_value
-
-        ＊新增：根據本交易累積電費 vs 卡片餘額，自動觸發 RemoteStopTransaction
+        相容多種鍵名風格，並加入異常值過濾，避免電量/電費暴增。
         """
         try:
             cp_id = getattr(self, "id", None)
@@ -839,14 +833,12 @@ class ChargePoint(OcppChargePoint):
                 logging.error("❌ 無法識別充電樁 ID（self.id 為空）")
                 return call_result.MeterValuesPayload()
 
-            # 取 connector_id
             connector_id = pick(kwargs, "connectorId", "connector_id", default=0)
             try:
                 connector_id = int(connector_id or 0)
             except Exception:
                 connector_id = 0
 
-            # 取 transaction_id（若沒有就到 DB 補最近一筆未結束）
             transaction_id = pick(kwargs, "transactionId", "transaction_id", "TransactionId", default="")
             if not transaction_id:
                 with sqlite3.connect(DB_FILE) as _c:
@@ -860,13 +852,12 @@ class ChargePoint(OcppChargePoint):
                     if row:
                         transaction_id = str(row[0])
 
-            # 取 meter_value list（相容多種命名）
             meter_value_list = pick(kwargs, "meterValue", "meter_value", "MeterValue", default=[]) or []
             if not isinstance(meter_value_list, list):
                 meter_value_list = [meter_value_list]
 
             insert_count = 0
-            last_ts_in_batch = None  # 用於定價時間點
+            last_ts_in_batch = None
 
             with sqlite3.connect(DB_FILE) as _c:
                 _cur = _c.cursor()
@@ -900,7 +891,7 @@ class ChargePoint(OcppChargePoint):
                             logging.warning(f"⚠️ 無法轉換 value 為 float：{raw_val} | measurand={meas}")
                             continue
 
-                        # (1) 寫 DB
+                        # === 存入 DB ===
                         _cur.execute("""
                             INSERT INTO meter_values
                               (charge_point_id, connector_id, transaction_id,
@@ -909,15 +900,13 @@ class ChargePoint(OcppChargePoint):
                         """, (cp_id, connector_id, transaction_id, val, meas, unit, ts, phase))
                         insert_count += 1
 
-                        # (2) 更新 live cache
-                        m = str(meas)
-                        if m == "Power.Active.Import":
+                        # === 更新快取 ===
+                        if meas == "Power.Active.Import":
                             kw = _to_kw(val, unit)
                             if kw is not None:
                                 _upsert_live(cp_id, power=round(kw, 3), timestamp=ts, derived=False)
-                                logging.info(f"⚡ 更新快取：cp={cp_id} power={kw:.3f}kW ts={ts}")
 
-                        elif m in ("Current.Import", "Current.Import.L1", "Current.Import.L2", "Current.Import.L3"):
+                        elif meas.startswith("Current.Import"):
                             try:
                                 cur_a = float(val)
                                 _upsert_live(cp_id, current=cur_a, timestamp=ts)
@@ -925,7 +914,7 @@ class ChargePoint(OcppChargePoint):
                             except Exception:
                                 pass
 
-                        elif m in ("Voltage", "Voltage.L1", "Voltage.L2", "Voltage.L3"):
+                        elif meas.startswith("Voltage"):
                             try:
                                 vv = float(val)
                                 _upsert_live(cp_id, voltage=vv, timestamp=ts)
@@ -933,15 +922,22 @@ class ChargePoint(OcppChargePoint):
                             except Exception:
                                 pass
 
-                        elif m in ("Energy.Active.Import.Register", "Energy.Active.Import"):
+                        elif meas in ("Energy.Active.Import.Register", "Energy.Active.Import"):
                             kwh = _energy_to_kwh(val, unit)
                             if kwh is not None:
+                                # === 過濾異常值：和上一筆比較 ===
+                                prev_energy = (live_status_cache.get(cp_id) or {}).get("energy")
+                                if prev_energy is not None:
+                                    diff = kwh - prev_energy
+                                    if diff < 0 or diff > 10:  # 閾值可調整
+                                        logging.warning(
+                                            f"⚠️ 棄用異常能量值：{kwh} kWh (diff={diff}，prev={prev_energy})"
+                                        )
+                                        continue
+
                                 _upsert_live(cp_id, energy=round(kwh, 6), timestamp=ts)
 
-
-
-
-                                # === [修改新增] 計算預估用電量與金額 ===
+                                # 計算用電量與金額
                                 try:
                                     with sqlite3.connect(DB_FILE) as _c2:
                                         _cur2 = _c2.cursor()
@@ -949,15 +945,9 @@ class ChargePoint(OcppChargePoint):
                                         row_tx = _cur2.fetchone()
                                         if row_tx:
                                             meter_start_wh = float(row_tx[0] or 0)
-                                            used_kwh = max(0.0, (kwh - (meter_start_wh / 1000.0)))  # 累積用電量(kWh)
-                                            # 查單價（若失敗則 fallback 6 元）
-                                            try:
-                                                unit_price = float(_price_for_timestamp(ts))
-                                            except Exception:
-                                                unit_price = 6.0
+                                            used_kwh = max(0.0, (kwh - (meter_start_wh / 1000.0)))
+                                            unit_price = float(_price_for_timestamp(ts)) if ts else 6.0
                                             est_amount = round(used_kwh * unit_price, 2)
-
-                                            # 更新 live_status_cache，讓 /live-status API 能取用
                                             _upsert_live(cp_id,
                                                          estimated_energy=round(used_kwh, 6),
                                                          estimated_amount=est_amount,
@@ -966,38 +956,10 @@ class ChargePoint(OcppChargePoint):
                                 except Exception as e:
                                     logging.warning(f"⚠️ 預估金額計算失敗: {e}")
 
+                        # Debug log
+                        logging.info(f"[DEBUG][MeterValues] tx={transaction_id} | measurand={meas} | value={val}{unit} | ts={ts}")
 
-
-
-
-
-
-                        # ★ Debug Log：印出原始資料與交易起始值
-                        try:
-                            with sqlite3.connect(DB_FILE) as _dbg:
-                                _cur_dbg = _dbg.cursor()
-                                _cur_dbg.execute("""
-                                    SELECT meter_start FROM transactions
-                                    WHERE transaction_id = ?
-                                """, (transaction_id,))
-                                row_dbg = _cur_dbg.fetchone()
-                                meter_start_dbg = row_dbg[0] if row_dbg else None
-                        except Exception as e:
-                            meter_start_dbg = None
-
-                        if m in ("Energy.Active.Import.Register", "Energy.Active.Import"):
-                            kwh = _energy_to_kwh(val, unit)
-                            logging.info(
-                                f"[DEBUG][MeterValues] tx={transaction_id} | measurand={m} | "
-                                f"value={val} {unit} | after_conv={kwh} kWh | meter_start={meter_start_dbg}"
-                            )
-                        else:
-                            logging.info(
-                                f"[DEBUG][MeterValues] tx={transaction_id} | measurand={m} | "
-                                f"value={val} {unit} | (非 energy 測項，無需換算) | meter_start={meter_start_dbg}"
-                            )
-
-                    # (3) 若本批沒有功率，但有 V 或 I，嘗試以 V×I 推估（單相）
+                    # (推算功率)
                     live_now = live_status_cache.get(cp_id) or {}
                     if "power" not in live_now:
                         v = seen.get("voltage") or live_now.get("voltage")
@@ -1008,82 +970,13 @@ class ChargePoint(OcppChargePoint):
 
                 _c.commit()
 
-            logging.info(f"📊 MeterValues 寫入完成，共 {insert_count} 筆 | tx={transaction_id} | keys={list(kwargs.keys())}")
-
-            # === 新增：餘額與累計費用檢查 → 需要時自動下遠端停充 ===
-            if transaction_id:
-                with sqlite3.connect(DB_FILE) as _c:
-                    _cur = _c.cursor()
-                    _cur.execute("""
-                        SELECT meter_start, id_tag, stop_timestamp
-                        FROM transactions
-                        WHERE transaction_id = ?
-                    """, (transaction_id,))
-                    tr = _cur.fetchone()
-
-                    if tr:
-                        meter_start_wh, id_tag, stop_ts = tr
-                        if stop_ts is None and id_tag:
-                            _cur.execute("""
-                                SELECT timestamp, value, unit
-                                FROM meter_values
-                                WHERE transaction_id = ?
-                                  AND measurand IN ('Energy.Active.Import.Register','Energy.Active.Import')
-                                ORDER BY timestamp DESC
-                                LIMIT 1
-                            """, (transaction_id,))
-                            ev = _cur.fetchone()
-
-                            if ev:
-                                ts_last, val, unit = ev
-                                cur_kwh = _energy_to_kwh(val, unit)
-                                used_kwh = max(0.0, (cur_kwh - (float(meter_start_wh or 0) / 1000.0))) if cur_kwh is not None else 0.0
-
-                                try:
-                                    unit_price = float(_price_for_timestamp(ts_last or last_ts_in_batch or datetime.utcnow().isoformat()))
-                                except Exception:
-                                    unit_price = 6.0
-                                cost_so_far = round(used_kwh * unit_price, 2)
-
-                                _cur.execute("SELECT balance FROM cards WHERE card_id = ?", (id_tag,))
-                                cr = _cur.fetchone()
-
-                                if cr is not None:
-                                    balance = float(cr[0] or 0.0)
-                                    remaining_balance = balance - cost_so_far
-
-                                    if remaining_balance <= 0:
-                                        tx_key = str(transaction_id)
-                                        if tx_key not in stop_requested:
-                                            stop_requested.add(tx_key)
-                                            logging.warning(
-                                                f"⛔ 餘額不足：已用 {cost_so_far} / 餘額 {balance}，送出 RemoteStopTransaction | tx={tx_key} | cp={cp_id}"
-                                            )
-                                            try:
-                                                req = call.RemoteStopTransactionPayload(transaction_id=int(transaction_id))
-
-                                                async def _fire_and_log():
-                                                    try:
-                                                        resp = await self.call(req)
-                                                        logging.info(f"[AutoStop] RemoteStopTransaction 回應: {getattr(resp, 'status', None)}")
-                                                        if getattr(resp, "status", None) != "Accepted":
-                                                            stop_requested.discard(tx_key)
-                                                    except Exception as e:
-                                                        logging.exception(f"[AutoStop] RemoteStopTransaction 送出失敗: {e}")
-                                                        stop_requested.discard(tx_key)
-
-                                                asyncio.create_task(_fire_and_log())
-
-                                            except Exception as e:
-                                                logging.exception(f"❌ 送出 RemoteStopTransaction 失敗: {e}")
-                                                stop_requested.discard(tx_key)
+            logging.info(f"📊 MeterValues 寫入完成，共 {insert_count} 筆 | tx={transaction_id}")
 
             return call_result.MeterValuesPayload()
 
         except Exception as e:
-            logging.exception(f"❌ 處理 MeterValues 例外：{e} | payload keys={list(kwargs.keys())}")
+            logging.exception(f"❌ 處理 MeterValues 例外：{e}")
             return call_result.MeterValuesPayload()
-
 
 
 
@@ -1095,32 +988,6 @@ class ChargePoint(OcppChargePoint):
         return call_result.RemoteStopTransactionPayload(status="Accepted")
 
 
-@app.get("/api/charge-points/{charge_point_id}/live-status")
-def get_live_status(charge_point_id: str):
-    cp_id = _normalize_cp_id(charge_point_id)
-    data = live_status_cache.get(cp_id)
-    now = time.time()
-    if (not data) or (now - data.get("updated_at", 0) > LIVE_TTL):
-        logging.warning(f"🟡 /live-status | cp_id={cp_id} → stale (無資料或逾時)")
-        return {"message": "尚無資料", "active": False, "status": "stale", "cp_id": cp_id}
-
-    age = now - data.get("updated_at", 0)
-    logging.info(f"🟢 /live-status | cp_id={cp_id} | 最新更新距離 {age:.1f} 秒 | data={data}")
-
-    return {
-        "power": data.get("power", 0),
-        "current": data.get("current", 0),
-        "voltage": data.get("voltage", 0),
-        "energy": data.get("energy", 0),
-        # === [修改新增] 回傳預估值 ===
-        "estimated_energy": data.get("estimated_energy", 0),
-        "estimated_amount": data.get("estimated_amount", 0),
-        "price_per_kwh": data.get("price_per_kwh", None),
-        # === 原本的 ===
-        "timestamp": data.get("timestamp"),
-        "derived": data.get("derived", False),
-        "active": True,
-    }
 
 
 
@@ -1442,23 +1309,21 @@ def get_latest_current_api(charge_point_id: str):
 
 
 
+
+# ✅ 原本 API（加上最終電量 / 電費，不動結構）
 @app.get("/api/charge-points/{charge_point_id}/last-transaction/summary")
-def get_last_transaction_summary(charge_point_id: str):
-    """
-    回傳該充電樁最近一筆交易的摘要。
-    - 若交易進行中，會回傳 start_timestamp，stop_timestamp = ""。
-    - 若交易已結束，會回傳 start_timestamp 與 stop_timestamp。
-    - 另外附帶交易金額與卡片餘額。
-    """
+def get_last_tx_summary_by_cp(charge_point_id: str):
+    print("[WARN] /last-transaction/summary 已過時，建議改用 /current-transaction/summary 或 /last-finished-transaction/summary")
     cp_id = _normalize_cp_id(charge_point_id)
     with get_conn() as conn:
         cur = conn.cursor()
-        # 抓最近一筆（無論是否已結束）
+        # 找最近「最後一筆交易」(可能是進行中，也可能是已結束)
         cur.execute("""
-            SELECT transaction_id, id_tag, start_timestamp, stop_timestamp
-            FROM transactions
-            WHERE charge_point_id = ?
-            ORDER BY transaction_id DESC
+            SELECT t.transaction_id, t.id_tag, t.start_timestamp, t.stop_timestamp,
+                   t.meter_start, t.meter_stop
+            FROM transactions t
+            WHERE t.charge_point_id = ?
+            ORDER BY t.transaction_id DESC
             LIMIT 1
         """, (cp_id,))
         row = cur.fetchone()
@@ -1466,27 +1331,105 @@ def get_last_transaction_summary(charge_point_id: str):
         if not row:
             return {"found": False}
 
-        tx_id, id_tag, start_ts, stop_ts = row
+        # unpack 六個欄位
+        tx_id, id_tag, start_ts, stop_ts, meter_start, meter_stop = row
 
-        # 查交易金額
+        # 查 payments 總額
         cur.execute("SELECT total_amount FROM payments WHERE transaction_id = ?", (tx_id,))
         pay = cur.fetchone()
         total_amount = float(pay[0]) if pay else 0.0
 
-        # 查卡片餘額
-        cur.execute("SELECT balance FROM cards WHERE card_id = ?", (id_tag,))
-        c = cur.fetchone()
-        balance = float(c[0]) if c else 0.0
+        # 計算最終電量（kWh）
+        final_energy = None
+        if meter_start is not None and meter_stop is not None:
+            try:
+                final_energy = max(0.0, (float(meter_stop) - float(meter_start)) / 1000.0)
+            except Exception:
+                final_energy = None
 
         return {
             "found": True,
             "transaction_id": tx_id,
             "id_tag": id_tag,
-            "total_amount": round(total_amount, 2),
-            "balance": round(balance, 2),
             "start_timestamp": start_ts,
-            "stop_timestamp": stop_ts or ""   # ⚡ 進行中時回空字串
+            "stop_timestamp": stop_ts,
+            "total_amount": total_amount,
+            "final_energy_kwh": final_energy,
+            "final_cost": total_amount  # final_cost 與 total_amount 相同
         }
+
+
+
+# ✅ 新增：查詢最近一筆「進行中」交易
+@app.get("/api/charge-points/{charge_point_id}/current-transaction/summary")
+def get_current_tx_summary_by_cp(charge_point_id: str):
+    cp_id = _normalize_cp_id(charge_point_id)
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT t.transaction_id, t.id_tag, t.start_timestamp, t.stop_timestamp
+            FROM transactions t
+            WHERE t.charge_point_id = ?
+              AND t.stop_timestamp IS NULL
+            ORDER BY t.transaction_id DESC
+            LIMIT 1
+        """, (cp_id,))
+        row = cur.fetchone()
+        print(f"[DEBUG current-transaction] cp_id={cp_id} | row={row}")
+        if not row:
+            return {"found": False}
+
+        tx_id, id_tag, start_ts, stop_ts = row
+
+        cur.execute("SELECT total_amount FROM payments WHERE transaction_id = ?", (tx_id,))
+        pay = cur.fetchone()
+        total_amount = pay[0] if pay else 0.0
+
+        return {
+            "found": True,
+            "transaction_id": tx_id,
+            "id_tag": id_tag,
+            "start_timestamp": start_ts,
+            "stop_timestamp": stop_ts,  # 通常是 None，代表尚未結束
+            "total_amount": total_amount
+        }
+
+
+# ✅ 新增：查詢最近一筆「已結束」交易
+@app.get("/api/charge-points/{charge_point_id}/last-finished-transaction/summary")
+def get_last_finished_tx_summary_by_cp(charge_point_id: str):
+    cp_id = _normalize_cp_id(charge_point_id)
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT t.transaction_id, t.id_tag, t.start_timestamp, t.stop_timestamp
+            FROM transactions t
+            WHERE t.charge_point_id = ?
+              AND t.stop_timestamp IS NOT NULL
+            ORDER BY t.transaction_id DESC
+            LIMIT 1
+        """, (cp_id,))
+        row = cur.fetchone()
+        print(f"[DEBUG last-finished-transaction] cp_id={cp_id} | row={row}")
+        if not row:
+            return {"found": False}
+
+        tx_id, id_tag, start_ts, stop_ts = row
+
+        cur.execute("SELECT total_amount FROM payments WHERE transaction_id = ?", (tx_id,))
+        pay = cur.fetchone()
+        total_amount = pay[0] if pay else 0.0
+
+        return {
+            "found": True,
+            "transaction_id": tx_id,
+            "id_tag": id_tag,
+            "start_timestamp": start_ts,
+            "stop_timestamp": stop_ts,  # 已結束 → 一定有值
+            "total_amount": total_amount
+        }
+
+
 
 
 
