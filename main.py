@@ -1309,23 +1309,21 @@ def get_latest_current_api(charge_point_id: str):
 
 
 
+
+# ✅ 原本 API（加上最終電量 / 電費，不動結構）
 @app.get("/api/charge-points/{charge_point_id}/last-transaction/summary")
-def get_last_transaction_summary(charge_point_id: str):
-    """
-    回傳該充電樁最近一筆交易的摘要。
-    - 若交易進行中，會回傳 start_timestamp，stop_timestamp = ""。
-    - 若交易已結束，會回傳 start_timestamp 與 stop_timestamp。
-    - 另外附帶交易金額與卡片餘額。
-    """
+def get_last_tx_summary_by_cp(charge_point_id: str):
+    print("[WARN] /last-transaction/summary 已過時，建議改用 /current-transaction/summary 或 /last-finished-transaction/summary")
     cp_id = _normalize_cp_id(charge_point_id)
     with get_conn() as conn:
         cur = conn.cursor()
-        # 抓最近一筆（無論是否已結束）
+        # 找最近「最後一筆交易」(可能是進行中，也可能是已結束)
         cur.execute("""
-            SELECT transaction_id, id_tag, start_timestamp, stop_timestamp
-            FROM transactions
-            WHERE charge_point_id = ?
-            ORDER BY transaction_id DESC
+            SELECT t.transaction_id, t.id_tag, t.start_timestamp, t.stop_timestamp,
+                   t.meter_start, t.meter_stop
+            FROM transactions t
+            WHERE t.charge_point_id = ?
+            ORDER BY t.transaction_id DESC
             LIMIT 1
         """, (cp_id,))
         row = cur.fetchone()
@@ -1333,27 +1331,105 @@ def get_last_transaction_summary(charge_point_id: str):
         if not row:
             return {"found": False}
 
-        tx_id, id_tag, start_ts, stop_ts = row
+        # unpack 六個欄位
+        tx_id, id_tag, start_ts, stop_ts, meter_start, meter_stop = row
 
-        # 查交易金額
+        # 查 payments 總額
         cur.execute("SELECT total_amount FROM payments WHERE transaction_id = ?", (tx_id,))
         pay = cur.fetchone()
         total_amount = float(pay[0]) if pay else 0.0
 
-        # 查卡片餘額
-        cur.execute("SELECT balance FROM cards WHERE card_id = ?", (id_tag,))
-        c = cur.fetchone()
-        balance = float(c[0]) if c else 0.0
+        # 計算最終電量（kWh）
+        final_energy = None
+        if meter_start is not None and meter_stop is not None:
+            try:
+                final_energy = max(0.0, (float(meter_stop) - float(meter_start)) / 1000.0)
+            except Exception:
+                final_energy = None
 
         return {
             "found": True,
             "transaction_id": tx_id,
             "id_tag": id_tag,
-            "total_amount": round(total_amount, 2),
-            "balance": round(balance, 2),
             "start_timestamp": start_ts,
-            "stop_timestamp": stop_ts or ""   # ⚡ 進行中時回空字串
+            "stop_timestamp": stop_ts,
+            "total_amount": total_amount,
+            "final_energy_kwh": final_energy,
+            "final_cost": total_amount  # final_cost 與 total_amount 相同
         }
+
+
+
+# ✅ 新增：查詢最近一筆「進行中」交易
+@app.get("/api/charge-points/{charge_point_id}/current-transaction/summary")
+def get_current_tx_summary_by_cp(charge_point_id: str):
+    cp_id = _normalize_cp_id(charge_point_id)
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT t.transaction_id, t.id_tag, t.start_timestamp, t.stop_timestamp
+            FROM transactions t
+            WHERE t.charge_point_id = ?
+              AND t.stop_timestamp IS NULL
+            ORDER BY t.transaction_id DESC
+            LIMIT 1
+        """, (cp_id,))
+        row = cur.fetchone()
+        print(f"[DEBUG current-transaction] cp_id={cp_id} | row={row}")
+        if not row:
+            return {"found": False}
+
+        tx_id, id_tag, start_ts, stop_ts = row
+
+        cur.execute("SELECT total_amount FROM payments WHERE transaction_id = ?", (tx_id,))
+        pay = cur.fetchone()
+        total_amount = pay[0] if pay else 0.0
+
+        return {
+            "found": True,
+            "transaction_id": tx_id,
+            "id_tag": id_tag,
+            "start_timestamp": start_ts,
+            "stop_timestamp": stop_ts,  # 通常是 None，代表尚未結束
+            "total_amount": total_amount
+        }
+
+
+# ✅ 新增：查詢最近一筆「已結束」交易
+@app.get("/api/charge-points/{charge_point_id}/last-finished-transaction/summary")
+def get_last_finished_tx_summary_by_cp(charge_point_id: str):
+    cp_id = _normalize_cp_id(charge_point_id)
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT t.transaction_id, t.id_tag, t.start_timestamp, t.stop_timestamp
+            FROM transactions t
+            WHERE t.charge_point_id = ?
+              AND t.stop_timestamp IS NOT NULL
+            ORDER BY t.transaction_id DESC
+            LIMIT 1
+        """, (cp_id,))
+        row = cur.fetchone()
+        print(f"[DEBUG last-finished-transaction] cp_id={cp_id} | row={row}")
+        if not row:
+            return {"found": False}
+
+        tx_id, id_tag, start_ts, stop_ts = row
+
+        cur.execute("SELECT total_amount FROM payments WHERE transaction_id = ?", (tx_id,))
+        pay = cur.fetchone()
+        total_amount = pay[0] if pay else 0.0
+
+        return {
+            "found": True,
+            "transaction_id": tx_id,
+            "id_tag": id_tag,
+            "start_timestamp": start_ts,
+            "stop_timestamp": stop_ts,  # 已結束 → 一定有值
+            "total_amount": total_amount
+        }
+
+
 
 
 
