@@ -1360,76 +1360,93 @@ def get_last_tx_summary_by_cp(charge_point_id: str):
 
 
 
-# ✅ 新增：查詢最近一筆「進行中」交易
 @app.get("/api/charge-points/{charge_point_id}/current-transaction/summary")
 def get_current_tx_summary_by_cp(charge_point_id: str):
     cp_id = _normalize_cp_id(charge_point_id)
     with get_conn() as conn:
         cur = conn.cursor()
         cur.execute("""
-            SELECT t.transaction_id, t.id_tag, t.start_timestamp, t.stop_timestamp
+            SELECT t.transaction_id, t.id_tag, t.start_timestamp, t.stop_timestamp,
+                   t.meter_start, t.meter_stop
             FROM transactions t
-            WHERE t.charge_point_id = ?
-              AND t.stop_timestamp IS NULL
+            WHERE t.charge_point_id = ? AND t.stop_timestamp IS NULL
             ORDER BY t.transaction_id DESC
             LIMIT 1
         """, (cp_id,))
         row = cur.fetchone()
-        print(f"[DEBUG current-transaction] cp_id={cp_id} | row={row}")
         if not row:
             return {"found": False}
 
-        tx_id, id_tag, start_ts, stop_ts = row
+        tx_id, id_tag, start_ts, stop_ts, meter_start, meter_stop = row
 
+        # 查 payments 總額
         cur.execute("SELECT total_amount FROM payments WHERE transaction_id = ?", (tx_id,))
         pay = cur.fetchone()
-        total_amount = pay[0] if pay else 0.0
+        total_amount = float(pay[0]) if pay else 0.0
+
+        # 計算最終電量（進行中可能還在增加）
+        final_energy = None
+        if meter_start is not None and meter_stop is not None:
+            try:
+                final_energy = max(0.0, (float(meter_stop) - float(meter_start)) / 1000.0)
+            except Exception:
+                final_energy = None
 
         return {
             "found": True,
             "transaction_id": tx_id,
             "id_tag": id_tag,
             "start_timestamp": start_ts,
-            "stop_timestamp": stop_ts,  # 通常是 None，代表尚未結束
-            "total_amount": total_amount
+            "stop_timestamp": stop_ts,
+            "total_amount": total_amount,
+            "final_energy_kwh": final_energy,
+            "final_cost": total_amount
         }
 
 
-# ✅ 新增：查詢最近一筆「已結束」交易
+
 @app.get("/api/charge-points/{charge_point_id}/last-finished-transaction/summary")
 def get_last_finished_tx_summary_by_cp(charge_point_id: str):
     cp_id = _normalize_cp_id(charge_point_id)
     with get_conn() as conn:
         cur = conn.cursor()
         cur.execute("""
-            SELECT t.transaction_id, t.id_tag, t.start_timestamp, t.stop_timestamp
+            SELECT t.transaction_id, t.id_tag, t.start_timestamp, t.stop_timestamp,
+                   t.meter_start, t.meter_stop
             FROM transactions t
-            WHERE t.charge_point_id = ?
-              AND t.stop_timestamp IS NOT NULL
+            WHERE t.charge_point_id = ? AND t.stop_timestamp IS NOT NULL
             ORDER BY t.transaction_id DESC
             LIMIT 1
         """, (cp_id,))
         row = cur.fetchone()
-        print(f"[DEBUG last-finished-transaction] cp_id={cp_id} | row={row}")
         if not row:
             return {"found": False}
 
-        tx_id, id_tag, start_ts, stop_ts = row
+        tx_id, id_tag, start_ts, stop_ts, meter_start, meter_stop = row
 
+        # 查 payments 總額
         cur.execute("SELECT total_amount FROM payments WHERE transaction_id = ?", (tx_id,))
         pay = cur.fetchone()
-        total_amount = pay[0] if pay else 0.0
+        total_amount = float(pay[0]) if pay else 0.0
+
+        # 計算最終電量（已結束交易必定有完整值）
+        final_energy = None
+        if meter_start is not None and meter_stop is not None:
+            try:
+                final_energy = max(0.0, (float(meter_stop) - float(meter_start)) / 1000.0)
+            except Exception:
+                final_energy = None
 
         return {
             "found": True,
             "transaction_id": tx_id,
             "id_tag": id_tag,
             "start_timestamp": start_ts,
-            "stop_timestamp": stop_ts,  # 已結束 → 一定有值
-            "total_amount": total_amount
+            "stop_timestamp": stop_ts,
+            "total_amount": total_amount,
+            "final_energy_kwh": final_energy,
+            "final_cost": total_amount
         }
-
-
 
 
 
@@ -1462,6 +1479,31 @@ def get_current_transaction(charge_point_id: str):
             "id_tag": id_tag,
             "start_timestamp": start_ts
         }
+
+
+
+
+@app.get("/api/charge-points/{charge_point_id}/live-status")
+def get_live_status(charge_point_id: str):
+    """
+    回傳該充電樁最新的即時量測資訊。
+    來源：live_status_cache（由 on_meter_values 持續更新）
+    """
+    cp_id = _normalize_cp_id(charge_point_id)
+    live = live_status_cache.get(cp_id, {})
+
+    # 組合回傳格式
+    return {
+        "timestamp": live.get("timestamp"),
+        "power": live.get("power", 0),              # kW
+        "voltage": live.get("voltage", 0),          # V
+        "current": live.get("current", 0),          # A
+        "energy": live.get("energy", 0),            # kWh (樁上總表)
+        "estimated_energy": live.get("estimated_energy", 0),  # 本次充電累積 kWh
+        "estimated_amount": live.get("estimated_amount", 0),  # 預估電費
+        "price_per_kwh": live.get("price_per_kwh", 0),        # 單價
+        "derived": live.get("derived", False)       # 是否由 V×I 推算功率
+    }
 
 
 
