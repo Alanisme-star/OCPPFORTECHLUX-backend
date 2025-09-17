@@ -509,105 +509,7 @@ class ChargePoint(OcppChargePoint):
 
 
 
-    @on(Action.StopTransaction)
-    async def on_stop_transaction(self, **kwargs):
-        try:
-            print(f"🟢【OCPP Handler】StopTransaction kwargs: {kwargs}")
-            cp_id = getattr(self, "id", None)
-            print(f"🟢【OCPP Handler】StopTransaction self.id: {cp_id}")
-
-            # 正規化傳入欄位
-            transaction_id = str(kwargs.get("transaction_id") or kwargs.get("transactionId"))
-            meter_stop = kwargs.get("meter_stop")
-
-            # === 修正：確保 stop_timestamp 永遠正確 ===
-            raw_ts = kwargs.get("timestamp")
-            try:
-                if raw_ts:
-                    stop_ts = datetime.fromisoformat(raw_ts).astimezone(timezone.utc).isoformat()
-                else:
-                    raise ValueError("Empty timestamp")
-            except Exception:
-                stop_ts = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
-
-            reason = kwargs.get("reason")
-
-            if cp_id is None or transaction_id is None:
-                print(f"🔴【OCPP Handler】❌ StopTransaction 欄位缺失 | cp_id={cp_id} | transaction_id={transaction_id}")
-                return call_result.StopTransactionPayload()
-
-            with sqlite3.connect(DB_FILE) as _conn:
-                _cur = _conn.cursor()
-
-                # 1) 落 StopTransaction 與更新交易紀錄
-                _cur.execute('''
-                    INSERT INTO stop_transactions (transaction_id, meter_stop, timestamp, reason)
-                    VALUES (?, ?, ?, ?)
-                ''', (transaction_id, meter_stop, stop_ts, reason))
-
-                _cur.execute('''
-                    UPDATE transactions
-                    SET meter_stop = ?, stop_timestamp = ?, reason = ?
-                    WHERE transaction_id = ?
-                ''', (meter_stop, stop_ts, reason, transaction_id))
-
-                # 2) 取交易起始資料 → 算本次用電（Wh→kWh）
-                _cur.execute('''
-                    SELECT meter_start, id_tag FROM transactions
-                    WHERE transaction_id = ?
-                ''', (transaction_id,))
-                row = _cur.fetchone()
-
-                if row:
-                    meter_start, id_tag = row
-                    energy_kwh = max(0.0, ((meter_stop or 0) - (meter_start or 0)) / 1000.0)
-
-                    # 3) 依「停止時間」求單價
-                    unit_price = float(_price_for_timestamp(stop_ts))
-
-                    # 4) 記 payments
-                    base_fee = 0.0
-                    energy_fee = round(energy_kwh * unit_price, 2)
-                    overuse_fee = 0.0
-                    total = round(base_fee + energy_fee + overuse_fee, 2)
-
-                    _cur.execute('''
-                        INSERT INTO payments (transaction_id, base_fee, energy_fee, overuse_fee, total_amount, paid_at)
-                        VALUES (?, ?, ?, ?, ?, ?)
-                    ''', (transaction_id, base_fee, energy_fee, overuse_fee, total, stop_ts))
-
-                    # 5) 扣卡片餘額
-                    _cur.execute("SELECT balance FROM cards WHERE card_id = ?", (id_tag,))
-                    card_row = _cur.fetchone()
-                    if card_row is not None:
-                        old_balance = float(card_row[0] or 0)
-                        new_balance = max(0.0, round(old_balance - total, 2))
-                        _cur.execute("UPDATE cards SET balance = ? WHERE card_id = ?", (new_balance, id_tag))
-                        print(f"💳 扣款：{id_tag} | {old_balance} → {new_balance} 元 | txn={transaction_id} | kWh={energy_kwh:.3f} | 單價={unit_price}")
-
-                _conn.commit()
-
-            # 若 /stop API 有在等，回傳結果
-            tx_key = str(transaction_id)
-            fut = pending_stop_transactions.get(tx_key)
-            if fut and not fut.done():
-                fut.set_result({"meter_stop": meter_stop, "timestamp": stop_ts, "reason": reason})
-
-            # ✅ 清掉已送停充去重旗標
-            stop_requested.discard(tx_key)
-            pending_stop_transactions.pop(tx_key, None)
-
-            return call_result.StopTransactionPayload()
-
-        except Exception as e:
-            logging.exception(f"🔴 StopTransaction 儲存/扣款失敗：{e}")
-            return call_result.StopTransactionPayload()
-
-
-
-
-
-
+   
 
 
     @on(Action.StatusNotification)
@@ -732,7 +634,6 @@ class ChargePoint(OcppChargePoint):
 
 
 
-
     @on(Action.StartTransaction)
     async def on_start_transaction(self, connector_id, id_tag, meter_start, timestamp, **kwargs):
         with sqlite3.connect(DB_FILE) as conn:
@@ -815,9 +716,125 @@ class ChargePoint(OcppChargePoint):
             conn.commit()
             logging.info(f"🚗 StartTransaction 成功 | CP={self.id} | idTag={id_tag} | transactionId={transaction_id} | start_ts={start_ts} | meter_start={meter_start_val} kWh")
 
-            return call_result.StartTransactionPayload(transaction_id=transaction_id, id_tag_info={"status": "Accepted"})
+            # ⭐ 重置快取，避免沿用上一筆交易的電費/電量
+            live_status_cache[self.id] = {
+                "power": 0,
+                "voltage": 0,
+                "current": 0,
+                "energy": 0,
+                "estimated_energy": 0,
+                "estimated_amount": 0,
+                "price_per_kwh": 0,
+                "timestamp": datetime.utcnow().isoformat()
+            }
+            logging.debug(f"🔄 [DEBUG] live_status_cache reset at StartTransaction | CP={self.id} | cache={live_status_cache[self.id]}")
+
+            return call_result.StartTransactionPayload(
+                transaction_id=transaction_id,
+                id_tag_info={"status": "Accepted"}
+            )
 
 
+    @on(Action.StopTransaction)
+    async def on_stop_transaction(self, **kwargs):
+        try:
+            print(f"🟢【OCPP Handler】StopTransaction kwargs: {kwargs}")
+            cp_id = getattr(self, "id", None)
+            print(f"🟢【OCPP Handler】StopTransaction self.id: {cp_id}")
+
+            # 正規化傳入欄位
+            transaction_id = str(kwargs.get("transaction_id") or kwargs.get("transactionId"))
+            meter_stop = kwargs.get("meter_stop")
+
+            # === 修正：確保 stop_timestamp 永遠正確 ===
+            raw_ts = kwargs.get("timestamp")
+            try:
+                if raw_ts:
+                    stop_ts = datetime.fromisoformat(raw_ts).astimezone(timezone.utc).isoformat()
+                else:
+                    raise ValueError("Empty timestamp")
+            except Exception:
+                stop_ts = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
+
+            reason = kwargs.get("reason")
+
+            if cp_id is None or transaction_id is None:
+                print(f"🔴【OCPP Handler】❌ StopTransaction 欄位缺失 | cp_id={cp_id} | transaction_id={transaction_id}")
+                return call_result.StopTransactionPayload()
+
+            with sqlite3.connect(DB_FILE) as _conn:
+                _cur = _conn.cursor()
+
+                # 1) 落 StopTransaction 與更新交易紀錄
+                _cur.execute('''
+                    INSERT INTO stop_transactions (transaction_id, meter_stop, timestamp, reason)
+                    VALUES (?, ?, ?, ?)
+                ''', (transaction_id, meter_stop, stop_ts, reason))
+
+                _cur.execute('''
+                    UPDATE transactions
+                    SET meter_stop = ?, stop_timestamp = ?, reason = ?
+                    WHERE transaction_id = ?
+                ''', (meter_stop, stop_ts, reason, transaction_id))
+
+                # 2) 取交易起始資料 → 算本次用電（Wh→kWh）
+                _cur.execute('''
+                    SELECT meter_start, id_tag FROM transactions
+                    WHERE transaction_id = ?
+                ''', (transaction_id,))
+                row = _cur.fetchone()
+
+                if row:
+                    meter_start, id_tag = row
+                    energy_kwh = max(0.0, ((meter_stop or 0) - (meter_start or 0)) / 1000.0)
+
+                    # 3) 依「停止時間」求單價
+                    unit_price = float(_price_for_timestamp(stop_ts))
+
+                    # 4) 記 payments
+                    base_fee = 0.0
+                    energy_fee = round(energy_kwh * unit_price, 2)
+                    overuse_fee = 0.0
+                    total = round(base_fee + energy_fee + overuse_fee, 2)
+
+                    _cur.execute('''
+                        INSERT INTO payments (transaction_id, base_fee, energy_fee, overuse_fee, total_amount, paid_at)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                    ''', (transaction_id, base_fee, energy_fee, overuse_fee, total, stop_ts))
+
+                    # 5) 扣卡片餘額
+                    _cur.execute("SELECT balance FROM cards WHERE card_id = ?", (id_tag,))
+                    card_row = _cur.fetchone()
+                    if card_row is not None:
+                        old_balance = float(card_row[0] or 0)
+                        new_balance = max(0.0, round(old_balance - total, 2))
+                        _cur.execute("UPDATE cards SET balance = ? WHERE card_id = ?", (new_balance, id_tag))
+                        print(f"💳 扣款：{id_tag} | {old_balance} → {new_balance} 元 | txn={transaction_id} | kWh={energy_kwh:.3f} | 單價={unit_price}")
+
+                _conn.commit()
+
+            # 若 /stop API 有在等，回傳結果
+            tx_key = str(transaction_id)
+            fut = pending_stop_transactions.get(tx_key)
+            if fut and not fut.done():
+                fut.set_result({"meter_stop": meter_stop, "timestamp": stop_ts, "reason": reason})
+
+            # ✅ 清掉已送停充去重旗標
+            stop_requested.discard(tx_key)
+            pending_stop_transactions.pop(tx_key, None)
+
+            # ⭐ 結束時清除該充電樁的快取，避免舊金額卡住
+            if cp_id in live_status_cache:
+                live_status_cache.pop(cp_id, None)
+                logging.debug(f"🗑️ [DEBUG] live_status_cache cleared at StopTransaction | CP={cp_id}")
+
+            return call_result.StopTransactionPayload()
+
+        except Exception as e:
+            logging.exception(f"🔴 StopTransaction 儲存/扣款失敗：{e}")
+            return call_result.StopTransactionPayload()
+
+    
 
 
 
