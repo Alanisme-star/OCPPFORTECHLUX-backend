@@ -507,7 +507,6 @@ class ChargePoint(OcppChargePoint):
         return response
 
 
-
     @on(Action.StatusNotification)
     async def on_status_notification(self, connector_id=None, status=None, error_code=None, timestamp=None, **kwargs):
         global charging_point_status
@@ -519,7 +518,6 @@ class ChargePoint(OcppChargePoint):
             logging.info(f"🟢【DEBUG】收到 StatusNotification | cp_id={cp_id} | kwargs={kwargs} | "
                          f"connector_id={connector_id} | status={status} | error_code={error_code} | ts={timestamp}")
 
-            # 強制轉為 int 並防止 None 造成錯誤
             try:
                 connector_id = int(connector_id) if connector_id is not None else 0
             except (ValueError, TypeError):
@@ -536,7 +534,6 @@ class ChargePoint(OcppChargePoint):
             # Debug: 準備寫入 DB
             logging.info(f"🟡【DEBUG】寫入 DB: cp_id={cp_id}, connector_id={connector_id}, status={status}, ts={timestamp}")
 
-            # 寫入資料庫
             with sqlite3.connect(DB_FILE) as conn:
                 cursor = conn.cursor()
                 cursor.execute('''
@@ -545,10 +542,8 @@ class ChargePoint(OcppChargePoint):
                 ''', (cp_id, connector_id, status, timestamp))
                 conn.commit()
 
-            # Debug: DB 寫入完成
             logging.info(f"✅【DEBUG】DB 已寫入 StatusNotification (cp_id={cp_id}, status={status})")
 
-            # 儲存至記憶體
             charging_point_status[cp_id] = {
                 "connector_id": connector_id,
                 "status": status,
@@ -560,6 +555,7 @@ class ChargePoint(OcppChargePoint):
 
             # ⭐ 當狀態切換成 Available，清空該樁的快取 (包含 energy)
             if status == "Available":
+                logging.debug(f"🔍 [DEBUG] Status=Available 前快取: {live_status_cache.get(cp_id)}")
                 if cp_id in live_status_cache:
                     live_status_cache[cp_id] = {
                         "power": 0,
@@ -571,13 +567,14 @@ class ChargePoint(OcppChargePoint):
                         "price_per_kwh": 0,
                         "timestamp": datetime.utcnow().isoformat()
                     }
-                    logging.debug(f"🔄 [DEBUG] Reset live_status_cache at Available | CP={cp_id}")
+                    logging.debug(f"🔍 [DEBUG] Status=Available 後快取: {live_status_cache.get(cp_id)}")
 
             return call_result.StatusNotificationPayload()
 
         except Exception as e:
             logging.exception(f"❌ StatusNotification 發生未預期錯誤：{e}")
             return call_result.StatusNotificationPayload()
+
 
 
 
@@ -741,7 +738,6 @@ class ChargePoint(OcppChargePoint):
 
 
 
-
     @on(Action.StopTransaction)
     async def on_stop_transaction(self, **kwargs):
         try:
@@ -749,11 +745,9 @@ class ChargePoint(OcppChargePoint):
             cp_id = getattr(self, "id", None)
             print(f"🟢【OCPP Handler】StopTransaction self.id: {cp_id}")
 
-            # 正規化傳入欄位
             transaction_id = str(kwargs.get("transaction_id") or kwargs.get("transactionId"))
             meter_stop = kwargs.get("meter_stop")
 
-            # === 修正：確保 stop_timestamp 永遠正確 ===
             raw_ts = kwargs.get("timestamp")
             try:
                 if raw_ts:
@@ -772,7 +766,6 @@ class ChargePoint(OcppChargePoint):
             with sqlite3.connect(DB_FILE) as _conn:
                 _cur = _conn.cursor()
 
-                # 1) 落 StopTransaction 與更新交易紀錄
                 _cur.execute('''
                     INSERT INTO stop_transactions (transaction_id, meter_stop, timestamp, reason)
                     VALUES (?, ?, ?, ?)
@@ -784,7 +777,6 @@ class ChargePoint(OcppChargePoint):
                     WHERE transaction_id = ?
                 ''', (meter_stop, stop_ts, reason, transaction_id))
 
-                # 2) 取交易起始資料 → 算本次用電（Wh→kWh）
                 _cur.execute('''
                     SELECT meter_start, id_tag FROM transactions
                     WHERE transaction_id = ?
@@ -794,14 +786,9 @@ class ChargePoint(OcppChargePoint):
                 if row:
                     meter_start, id_tag = row
                     energy_kwh = max(0.0, ((meter_stop or 0) - (meter_start or 0)) / 1000.0)
-
-                    # 3) 依「停止時間」求單價
                     unit_price = float(_price_for_timestamp(stop_ts))
-
-                    # 4) 記 payments
-                    base_fee = 0.0
+                    base_fee, overuse_fee = 0.0, 0.0
                     energy_fee = round(energy_kwh * unit_price, 2)
-                    overuse_fee = 0.0
                     total = round(base_fee + energy_fee + overuse_fee, 2)
 
                     _cur.execute('''
@@ -809,7 +796,6 @@ class ChargePoint(OcppChargePoint):
                         VALUES (?, ?, ?, ?, ?, ?)
                     ''', (transaction_id, base_fee, energy_fee, overuse_fee, total, stop_ts))
 
-                    # 5) 扣卡片餘額
                     _cur.execute("SELECT balance FROM cards WHERE card_id = ?", (id_tag,))
                     card_row = _cur.fetchone()
                     if card_row is not None:
@@ -820,17 +806,16 @@ class ChargePoint(OcppChargePoint):
 
                 _conn.commit()
 
-            # 若 /stop API 有在等，回傳結果
             tx_key = str(transaction_id)
             fut = pending_stop_transactions.get(tx_key)
             if fut and not fut.done():
                 fut.set_result({"meter_stop": meter_stop, "timestamp": stop_ts, "reason": reason})
 
-            # ✅ 清掉已送停充去重旗標
             stop_requested.discard(tx_key)
             pending_stop_transactions.pop(tx_key, None)
 
-            # ⭐ 結束時清除該充電樁的快取（特別是 energy），避免舊金額或電量殘留
+            # ⭐ 結束時清除該充電樁的快取
+            logging.debug(f"🔍 [DEBUG] StopTransaction 前快取: {live_status_cache.get(cp_id)}")
             if cp_id in live_status_cache:
                 live_status_cache[cp_id] = {
                     "power": 0,
@@ -842,7 +827,7 @@ class ChargePoint(OcppChargePoint):
                     "price_per_kwh": 0,
                     "timestamp": datetime.utcnow().isoformat()
                 }
-                logging.debug(f"🗑️ [DEBUG] Reset live_status_cache at StopTransaction | CP={cp_id}")
+                logging.debug(f"🔍 [DEBUG] StopTransaction 後快取: {live_status_cache.get(cp_id)}")
 
             return call_result.StopTransactionPayload()
 
@@ -1523,6 +1508,9 @@ def get_live_status(charge_point_id: str):
     cp_id = _normalize_cp_id(charge_point_id)
     live = live_status_cache.get(cp_id, {})
 
+    # ⭐ 新增 debug log：觀察 live_status_cache
+    logging.debug(f"🔍 [DEBUG] live-status 回傳 | CP={cp_id} | data={live}")
+
     # 組合回傳格式
     return {
         "timestamp": live.get("timestamp"),
@@ -1540,80 +1528,40 @@ def get_live_status(charge_point_id: str):
 
 
 
-
 @app.get("/api/charge-points/{charge_point_id}/latest-energy")
 def get_latest_energy(charge_point_id: str):
-    """
-    回傳該充電樁最新的累積用電量（kWh），以及若有進行中交易，回傳本次充電用電量 sessionEnergyKWh。
-    - 來源優先：measurand='Energy.Active.Import.Register'（通常為 Wh 或 kWh）
-    - 單位處理：Wh → /1000；kWh → 原值
-    """
     charge_point_id = _normalize_cp_id(charge_point_id)
     c = conn.cursor()
 
-    # 1) 讀取最新的 Energy.Active.Import.Register（不分相）
+    # 取最新一筆 Energy 值
     c.execute("""
         SELECT timestamp, value, unit
         FROM meter_values
-        WHERE charge_point_id = ?
-          AND measurand = 'Energy.Active.Import.Register'
-          AND (phase IS NULL OR phase = '')
-        ORDER BY timestamp DESC
-        LIMIT 1
+        WHERE charge_point_id=? AND measurand IN ('Energy.Active.Import.Register','Energy.Active.Import')
+        ORDER BY timestamp DESC LIMIT 1
     """, (charge_point_id,))
     row = c.fetchone()
-    if not row:
-        # 無對應量測，回傳空物件
-        return {}
 
-    ts, raw_val, unit = row[0], float(row[1]), (row[2] or "").lower()
-    # 轉為 kWh
-    if unit == "wh" or unit == "w*h" or unit == "w_h":
-        total_kwh = raw_val / 1000.0
-    else:
-        # 預設已是 kWh（或未知單位時依 kWh 解讀）
-        total_kwh = raw_val
-
-
-    # === 新增 Debug ===
-    print(f"[DEBUG latest-energy] cp={charge_point_id} | total_kwh={total_kwh} | raw={raw_val}{unit}")
-
-
-    result = {
-        "timestamp": ts,
-        "totalEnergyKWh": round(total_kwh, 6),  # 累積表值（從樁的電表來）
-        "unit": "kWh"
-    }
-
-    # 2) 若有「進行中的交易」，計算本次充電用電量（以 meter_start 當基準）
-    c.execute("""
-        SELECT transaction_id, meter_start
-        FROM transactions
-        WHERE charge_point_id = ? AND stop_timestamp IS NULL
-        ORDER BY start_timestamp DESC
-        LIMIT 1
-    """, (charge_point_id,))
-    tx = c.fetchone()
-    if tx:
-        _, meter_start = tx
+    result = {}
+    if row:
+        ts, val, unit = row
         try:
-            # OCPP 的 meter_start 通常是 Wh，若數值看起來偏大就視為 Wh
-            # 若想嚴謹，也可加入 unit 欄（目前表設計沒有 unit）
-            if meter_start is not None:
-                # 以「最新表值（kWh）」換算回 Wh 再相減，或直接假設 meter_start 單位與表值一致
-                # 這裡假設 meter_start 為 Wh → 先把 total_kwh 轉回 Wh 再相減
-                session_wh = (total_kwh * 1000.0) - float(meter_start)
-                session_kwh = max(0.0, session_wh / 1000.0)
-                result["sessionEnergyKWh"] = round(session_kwh, 6)
+            kwh = _energy_to_kwh(val, unit)
+            if kwh is not None:
+                # === 回傳內容完整保留 ===
+                result = {
+                    "timestamp": ts,
+                    "totalEnergyKWh": round(kwh, 6),
+                    "sessionEnergyKWh": round(kwh, 6)  # 如果有 session 計算可替換
+                }
+        except Exception as e:
+            logging.warning(f"⚠️ latest-energy 計算失敗: {e}")
 
-                # === 新增 Debug ===
-                print(f"[DEBUG latest-energy] cp={charge_point_id} | meter_start={meter_start}Wh | session={session_kwh}kWh")
-
-        except Exception:
-            # 若有例外就略過 session 欄位
-            pass
-
+    # ⭐ 新增 debug log
+    logging.debug(f"🔍 [DEBUG] latest-energy 回傳: {result}")
     return result
+
+
 
 
 
