@@ -508,23 +508,16 @@ class ChargePoint(OcppChargePoint):
 
 
 
-
-   
-
-
     @on(Action.StatusNotification)
     async def on_status_notification(self, connector_id=None, status=None, error_code=None, timestamp=None, **kwargs):
         global charging_point_status
 
         try:
             cp_id = getattr(self, "id", None)
- 
-
 
             # Debug: 收到的原始 payload
             logging.info(f"🟢【DEBUG】收到 StatusNotification | cp_id={cp_id} | kwargs={kwargs} | "
                          f"connector_id={connector_id} | status={status} | error_code={error_code} | ts={timestamp}")
-
 
             # 強制轉為 int 並防止 None 造成錯誤
             try:
@@ -540,11 +533,8 @@ class ChargePoint(OcppChargePoint):
                 logging.error(f"❌ 欄位遺失 | cp_id={cp_id} | connector_id={connector_id} | status={status}")
                 return call_result.StatusNotificationPayload()
 
-
-
             # Debug: 準備寫入 DB
             logging.info(f"🟡【DEBUG】寫入 DB: cp_id={cp_id}, connector_id={connector_id}, status={status}, ts={timestamp}")
-
 
             # 寫入資料庫
             with sqlite3.connect(DB_FILE) as conn:
@@ -555,10 +545,8 @@ class ChargePoint(OcppChargePoint):
                 ''', (cp_id, connector_id, status, timestamp))
                 conn.commit()
 
-
             # Debug: DB 寫入完成
             logging.info(f"✅【DEBUG】DB 已寫入 StatusNotification (cp_id={cp_id}, status={status})")
-
 
             # 儲存至記憶體
             charging_point_status[cp_id] = {
@@ -569,11 +557,28 @@ class ChargePoint(OcppChargePoint):
             }
 
             logging.info(f"📡 StatusNotification | CP={cp_id} | connector={connector_id} | errorCode={error_code} | status={status}")
+
+            # ⭐ 當狀態切換成 Available，清空該樁的快取 (包含 energy)
+            if status == "Available":
+                if cp_id in live_status_cache:
+                    live_status_cache[cp_id] = {
+                        "power": 0,
+                        "voltage": 0,
+                        "current": 0,
+                        "energy": 0,
+                        "estimated_energy": 0,
+                        "estimated_amount": 0,
+                        "price_per_kwh": 0,
+                        "timestamp": datetime.utcnow().isoformat()
+                    }
+                    logging.debug(f"🔄 [DEBUG] Reset live_status_cache at Available | CP={cp_id}")
+
             return call_result.StatusNotificationPayload()
 
         except Exception as e:
             logging.exception(f"❌ StatusNotification 發生未預期錯誤：{e}")
             return call_result.StatusNotificationPayload()
+
 
 
 
@@ -735,6 +740,8 @@ class ChargePoint(OcppChargePoint):
             )
 
 
+
+
     @on(Action.StopTransaction)
     async def on_stop_transaction(self, **kwargs):
         try:
@@ -823,18 +830,25 @@ class ChargePoint(OcppChargePoint):
             stop_requested.discard(tx_key)
             pending_stop_transactions.pop(tx_key, None)
 
-            # ⭐ 結束時清除該充電樁的快取，避免舊金額卡住
+            # ⭐ 結束時清除該充電樁的快取（特別是 energy），避免舊金額或電量殘留
             if cp_id in live_status_cache:
-                live_status_cache.pop(cp_id, None)
-                logging.debug(f"🗑️ [DEBUG] live_status_cache cleared at StopTransaction | CP={cp_id}")
+                live_status_cache[cp_id] = {
+                    "power": 0,
+                    "voltage": 0,
+                    "current": 0,
+                    "energy": 0,
+                    "estimated_energy": 0,
+                    "estimated_amount": 0,
+                    "price_per_kwh": 0,
+                    "timestamp": datetime.utcnow().isoformat()
+                }
+                logging.debug(f"🗑️ [DEBUG] Reset live_status_cache at StopTransaction | CP={cp_id}")
 
             return call_result.StopTransactionPayload()
 
         except Exception as e:
             logging.exception(f"🔴 StopTransaction 儲存/扣款失敗：{e}")
             return call_result.StopTransactionPayload()
-
-    
 
 
 
