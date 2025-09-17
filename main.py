@@ -1934,42 +1934,6 @@ async def export_transactions_csv(
 async def get_status():
     return JSONResponse(content=charging_point_status)
 
-@app.get("/api/status/logs")
-async def get_status_logs(
-    chargePointId: str = Query(None),
-    start: str = Query(None),
-    end: str = Query(None),
-    limit: int = Query(100)
-):
-    query = "SELECT charge_point_id, connector_id, status, timestamp FROM status_logs WHERE 1=1"
-    params = []
-
-    if chargePointId:
-        query += " AND charge_point_id = ?"
-        params.append(chargePointId)
-    if start:
-        query += " AND timestamp >= ?"
-        params.append(start)
-    if end:
-        query += " AND timestamp <= ?"
-        params.append(end)
-
-    query += " ORDER BY timestamp DESC LIMIT ?"
-    params.append(limit)
-
-    cursor.execute(query, params)
-    rows = cursor.fetchall()
-
-    return JSONResponse(content=[
-        {
-            "chargePointId": row[0],
-            "connectorId": row[1],
-            "status": row[2],
-            "timestamp": row[3]
-        } for row in rows
-    ])
-
-
 
 @app.get("/api/id_tags")
 async def list_id_tags():
