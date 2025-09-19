@@ -743,7 +743,6 @@ class ChargePoint(OcppChargePoint):
 
 
 
-
     @on(Action.StopTransaction)
     async def on_stop_transaction(self, **kwargs):
         try:
@@ -764,6 +763,8 @@ class ChargePoint(OcppChargePoint):
 
             with sqlite3.connect(DB_FILE) as _conn:
                 _cur = _conn.cursor()
+
+                # 更新 stop_transactions & transactions
                 _cur.execute('''
                     INSERT INTO stop_transactions (transaction_id, meter_stop, timestamp, reason)
                     VALUES (?, ?, ?, ?)
@@ -782,7 +783,39 @@ class ChargePoint(OcppChargePoint):
                 ''', (cp_id, 0, transaction_id, 0.0,
                       "Energy.Active.Import.Register", "kWh", stop_ts))
 
+                # ====== ⭐ 新增：計算電量與扣款 ======
+                _cur.execute("SELECT id_tag, meter_start FROM transactions WHERE transaction_id=?", (transaction_id,))
+                row = _cur.fetchone()
+                if row:
+                    id_tag, meter_start = row
+                    try:
+                        meter_start_val = float(meter_start or 0)
+                        meter_stop_val = float(meter_stop or 0)
+                        used_kwh = max(0.0, (meter_stop_val - meter_start_val) / 1000.0)
+                    except Exception:
+                        used_kwh = 0.0
+
+                    # 查單價
+                    unit_price = float(_price_for_timestamp(stop_ts)) if stop_ts else 6.0
+                    total_amount = round(used_kwh * unit_price, 2)
+
+                    # 更新卡片餘額
+                    _cur.execute("SELECT balance FROM cards WHERE card_id=?", (id_tag,))
+                    card_row = _cur.fetchone()
+                    if card_row:
+                        old_balance = float(card_row[0] or 0)
+                        new_balance = max(0.0, old_balance - total_amount)
+                        _cur.execute("UPDATE cards SET balance=? WHERE card_id=?", (new_balance, id_tag))
+                        logging.info(f"💳 卡片扣款完成 | idTag={id_tag} | 扣款={total_amount} | 原餘額={old_balance} → 新餘額={new_balance}")
+
+                    # 記錄付款紀錄
+                    _cur.execute('''
+                        INSERT INTO payments (transaction_id, base_fee, energy_fee, overuse_fee, total_amount, paid_at)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                    ''', (transaction_id, 0.0, total_amount, 0.0, total_amount, stop_ts))
+
                 _conn.commit()
+                # ====== ⭐ 新增結束 ======
 
             # ⭐ 清除快取
             logging.debug(f"🔍 [DEBUG] StopTransaction 前快取: {live_status_cache.get(cp_id)}")
@@ -803,7 +836,6 @@ class ChargePoint(OcppChargePoint):
         except Exception as e:
             logging.exception(f"🔴 StopTransaction 發生錯誤：{e}")
             return call_result.StopTransactionPayload()
-
 
 
 
@@ -1537,6 +1569,51 @@ def get_latest_energy(charge_point_id: str):
     logging.debug(f"🔍 [DEBUG] latest-energy 回傳: {result}")
     return result
 
+
+@app.get("/api/cards/{card_id}/history")
+def get_card_history(card_id: str, limit: int = 20):
+    """
+    回傳指定卡片的扣款紀錄（從 payments 表）。
+    預設顯示最近 20 筆，可透過 limit 參數調整。
+    """
+    card_id = card_id.strip()
+    with get_conn() as conn:
+        cur = conn.cursor()
+
+        # 找出該卡片相關的交易 ID
+        cur.execute("SELECT transaction_id FROM transactions WHERE id_tag=? ORDER BY start_timestamp DESC", (card_id,))
+        tx_ids = [r[0] for r in cur.fetchall()]
+        if not tx_ids:
+            return {"card_id": card_id, "history": []}
+
+        # 查詢扣款紀錄
+        q_marks = ",".join("?" * len(tx_ids))
+        cur.execute(f"""
+            SELECT p.transaction_id, p.total_amount, p.paid_at,
+                   t.start_timestamp, t.stop_timestamp
+            FROM payments p
+            LEFT JOIN transactions t ON p.transaction_id = t.transaction_id
+            WHERE p.transaction_id IN ({q_marks})
+            ORDER BY p.paid_at DESC
+            LIMIT ?
+        """, (*tx_ids, limit))
+
+        rows = cur.fetchall()
+
+    history = []
+    for row in rows:
+        history.append({
+            "transaction_id": row[0],
+            "amount": float(row[1] or 0),
+            "paid_at": row[2],
+            "start_timestamp": row[3],
+            "stop_timestamp": row[4],
+        })
+
+    return {
+        "card_id": card_id,
+        "history": history
+    }
 
 
 
