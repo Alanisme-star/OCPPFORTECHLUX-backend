@@ -548,7 +548,7 @@ class ChargePoint(OcppChargePoint):
 
             logging.info(f"📡 StatusNotification | CP={cp_id} | connector={connector_id} | errorCode={error_code} | status={status}")
 
-            # ⭐ 當狀態切換成 Available，清空該樁的快取 (包含 energy)
+            # ⭐ 當狀態切換成 Available，清空快取並補 0 到 DB
             if status == "Available":
                 logging.debug(f"🔍 [DEBUG] Status=Available 前快取: {live_status_cache.get(cp_id)}")
                 live_status_cache[cp_id] = {
@@ -561,6 +561,17 @@ class ChargePoint(OcppChargePoint):
                     "price_per_kwh": 0,
                     "timestamp": datetime.utcnow().isoformat()
                 }
+                # → 補一筆 0 kWh 到 DB
+                with sqlite3.connect(DB_FILE) as _c:
+                    _cur = _c.cursor()
+                    _cur.execute('''
+                        INSERT INTO meter_values (charge_point_id, connector_id, transaction_id,
+                                                  value, measurand, unit, timestamp)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ''', (cp_id, connector_id, None, 0.0,
+                          "Energy.Active.Import.Register", "kWh", datetime.utcnow().isoformat()))
+                    _c.commit()
+
                 logging.debug(f"🔍 [DEBUG] Status=Available 後快取: {live_status_cache.get(cp_id)}")
 
             return call_result.StatusNotificationPayload()
@@ -732,6 +743,7 @@ class ChargePoint(OcppChargePoint):
 
 
 
+
     @on(Action.StopTransaction)
     async def on_stop_transaction(self, **kwargs):
         try:
@@ -761,9 +773,18 @@ class ChargePoint(OcppChargePoint):
                     SET meter_stop = ?, stop_timestamp = ?, reason = ?
                     WHERE transaction_id = ?
                 ''', (meter_stop, stop_ts, reason, transaction_id))
+
+                # → 補一筆 0 kWh 到 DB
+                _cur.execute('''
+                    INSERT INTO meter_values (charge_point_id, connector_id, transaction_id,
+                                              value, measurand, unit, timestamp)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                ''', (cp_id, 0, transaction_id, 0.0,
+                      "Energy.Active.Import.Register", "kWh", stop_ts))
+
                 _conn.commit()
 
-            # ⭐ 結束時清除該充電樁的快取
+            # ⭐ 清除快取
             logging.debug(f"🔍 [DEBUG] StopTransaction 前快取: {live_status_cache.get(cp_id)}")
             live_status_cache[cp_id] = {
                 "power": 0,
@@ -1502,6 +1523,14 @@ def get_latest_energy(charge_point_id: str):
                     "totalEnergyKWh": round(kwh, 6),
                     "sessionEnergyKWh": round(kwh, 6)
                 }
+
+                # ⭐ 保護條件：若狀態是 Available，強制回傳 0
+                cp_status = charging_point_status.get(cp_id, {}).get("status")
+                if cp_status == "Available" and result.get("totalEnergyKWh", 0) > 0:
+                    logging.debug(f"⚠️ [DEBUG] 保護觸發: CP={cp_id} 狀態=Available 但 DB 最新值={result['totalEnergyKWh']} → 強制改為 0")
+                    result["totalEnergyKWh"] = 0
+                    result["sessionEnergyKWh"] = 0
+
         except Exception as e:
             logging.warning(f"⚠️ latest-energy 計算失敗: {e}")
 
