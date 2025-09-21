@@ -1617,6 +1617,74 @@ def get_card_history(card_id: str, limit: int = 20):
 
 
 
+# === 每日電價 API ===
+
+from fastapi import Query
+
+@app.get("/api/daily-pricing")
+def get_daily_pricing(date: str = Query(..., description="查詢的日期 YYYY-MM-DD")):
+    """
+    查詢某一天的電價設定
+    """
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT start_time, end_time, price, label
+            FROM daily_pricing_rules
+            WHERE date = ?
+            ORDER BY start_time
+        """, (date,))
+        rows = cur.fetchall()
+    return [
+        {
+            "startTime": r[0],
+            "endTime": r[1],
+            "price": r[2],
+            "label": r[3]
+        }
+        for r in rows
+    ]
+
+
+@app.post("/api/daily-pricing")
+def add_daily_pricing(data: dict = Body(...)):
+    """
+    新增一天的時段電價規則
+    """
+    date = data.get("date")
+    start_time = data.get("startTime")
+    end_time = data.get("endTime")
+    price = data.get("price")
+    label = data.get("label")
+
+    if not (date and start_time and end_time and price is not None):
+        raise HTTPException(status_code=400, detail="缺少必要欄位")
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO daily_pricing_rules (date, start_time, end_time, price, label)
+            VALUES (?, ?, ?, ?, ?)
+        """, (date, start_time, end_time, price, label))
+        conn.commit()
+    return {"message": "✅ 新增成功"}
+
+
+@app.delete("/api/daily-pricing")
+def delete_daily_pricing(date: str = Query(..., description="要刪除的日期 YYYY-MM-DD")):
+    """
+    刪除某一天的所有電價規則
+    """
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM daily_pricing_rules WHERE date=?", (date,))
+        conn.commit()
+    return {"message": f"✅ 已刪除 {date} 的所有規則"}
+
+
+
+
+
 
 # 新增獨立的卡片餘額查詢 API（修正縮排）
 @app.get("/api/cards/{id_tag}/balance")
