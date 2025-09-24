@@ -2581,23 +2581,33 @@ def init_db():
         conn.commit()
 
 
+# === 充電樁白名單 + 住戶管理 API ===
+from fastapi import Path
+
 @app.get("/api/charge-points")
 def list_charge_points():
+    """
+    取得所有充電樁清單
+    """
     with get_conn() as conn:
         cur = conn.cursor()
         cur.execute("""
             SELECT charge_point_id, name, status, resident_name, resident_floor
             FROM charge_points
+            ORDER BY created_at DESC
         """)
         rows = cur.fetchall()
 
     return [
         {
-            "chargePointId": r[0],
+            "charge_point_id": r[0],
+            "chargePointId": r[0],  # 前端相容 (camelCase)
             "name": r[1],
             "status": r[2],
-            "residentName": r[3] or "",
-            "residentFloor": r[4] or ""
+            "resident_name": r[3],
+            "residentName": r[3],
+            "resident_floor": r[4],
+            "residentFloor": r[4],
         }
         for r in rows
     ]
@@ -2605,53 +2615,67 @@ def list_charge_points():
 
 @app.post("/api/charge-points")
 def add_charge_point(data: dict = Body(...)):
-    cp_id = data.get("chargePointId")
-    name = data.get("name", "")
+    """
+    新增一個充電樁
+    """
+    cp_id = data.get("chargePointId") or data.get("charge_point_id")
+    name = data.get("name")
     status = data.get("status", "enabled")
-    resident_name = data.get("residentName", "")
-    resident_floor = data.get("residentFloor", "")
+    resident_name = data.get("residentName") or data.get("resident_name")
+    resident_floor = data.get("residentFloor") or data.get("resident_floor")
 
     if not cp_id:
-        raise HTTPException(status_code=400, detail="chargePointId is required")
+        raise HTTPException(status_code=400, detail="缺少 chargePointId")
 
     with get_conn() as conn:
         cur = conn.cursor()
         cur.execute("""
-            INSERT OR REPLACE INTO charge_points
-            (charge_point_id, name, status, resident_name, resident_floor)
+            INSERT OR IGNORE INTO charge_points (charge_point_id, name, status, resident_name, resident_floor)
             VALUES (?, ?, ?, ?, ?)
         """, (cp_id, name, status, resident_name, resident_floor))
         conn.commit()
-    return {"message": "新增成功"}
+
+    return {"message": "✅ 新增完成", "charge_point_id": cp_id}
 
 
-@app.put("/api/charge-points/{cp_id}")
-def update_charge_point(cp_id: str, data: dict = Body(...)):
-    name = data.get("name", "")
-    status = data.get("status", "enabled")
-    resident_name = data.get("residentName", "")
-    resident_floor = data.get("residentFloor", "")
+@app.put("/api/charge-points/{charge_point_id}")
+def update_charge_point(
+    charge_point_id: str = Path(...),
+    data: dict = Body(...)
+):
+    """
+    更新充電樁資訊
+    """
+    cp_id = _normalize_cp_id(charge_point_id)
+    name = data.get("name")
+    status = data.get("status")
+    resident_name = data.get("residentName") or data.get("resident_name")
+    resident_floor = data.get("residentFloor") or data.get("resident_floor")
 
     with get_conn() as conn:
         cur = conn.cursor()
         cur.execute("""
             UPDATE charge_points
-            SET name = ?, status = ?, resident_name = ?, resident_floor = ?
-            WHERE charge_point_id = ?
+            SET name=?, status=?, resident_name=?, resident_floor=?
+            WHERE charge_point_id=?
         """, (name, status, resident_name, resident_floor, cp_id))
-        if cur.rowcount == 0:
-            raise HTTPException(status_code=404, detail="Not found")
         conn.commit()
-    return {"message": "更新成功"}
+
+    return {"message": "✅ 更新完成", "charge_point_id": cp_id}
 
 
+@app.delete("/api/charge-points/{charge_point_id}")
+def delete_charge_point(charge_point_id: str = Path(...)):
+    """
+    刪除充電樁
+    """
+    cp_id = _normalize_cp_id(charge_point_id)
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM charge_points WHERE charge_point_id=?", (cp_id,))
+        conn.commit()
 
-
-@app.delete("/api/charge-points/{cp_id}")
-async def delete_charge_point(cp_id: str = Path(...)):
-    cursor.execute("DELETE FROM charge_points WHERE charge_point_id = ?", (cp_id,))
-    conn.commit()
-    return {"message": "已刪除"}
+    return {"message": "✅ 已刪除", "charge_point_id": cp_id}
 
 
 
