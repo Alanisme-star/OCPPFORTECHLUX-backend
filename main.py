@@ -3541,6 +3541,34 @@ def update_user(id_tag: str, data: dict = Body(...)):
 
 
 
+# 新增白名單與住戶
+@app.post("/api/charge-points")
+def add_charge_point(data: dict = Body(...)):
+    cp_id = data.get("chargePointId")
+    name = data.get("name")
+    status = data.get("status", "enabled")
+    resident_name = data.get("residentName")
+    resident_floor = data.get("residentFloor")
+
+    if not cp_id:
+        raise HTTPException(status_code=400, detail="缺少 chargePointId")
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT OR REPLACE INTO charge_points (charge_point_id, name, status)
+            VALUES (?, ?, ?)
+        """, (cp_id, name, status))
+        # 住戶資料 → 另建一張表比較好
+        cur.execute("""
+            INSERT OR REPLACE INTO residents (charge_point_id, resident_name, resident_floor)
+            VALUES (?, ?, ?)
+        """, (cp_id, resident_name, resident_floor))
+        conn.commit()
+
+    return {"message": "✅ 已新增/更新", "charge_point_id": cp_id}
+
+
 
 
 if __name__ == "__main__":
