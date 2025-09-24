@@ -47,8 +47,8 @@ logging.basicConfig(level=logging.INFO)
 # 允許跨域（若前端使用）
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # ✅ 改為英文半形引號
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_credentials=False,   # 關掉
     allow_methods=["*"],
     allow_headers=["*"],
 )
