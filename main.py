@@ -2566,17 +2566,17 @@ def init_db():
             charge_point_id TEXT UNIQUE NOT NULL,
             name TEXT,
             status TEXT,
-            resident_name TEXT,     -- ⭐ 新增
-            resident_floor TEXT,    -- ⭐ 新增
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         )
         """)
-        # ⭐ 防呆：若舊表格已存在，補欄位
+        # ⭐ 防呆：補缺少的欄位
         cur.execute("PRAGMA table_info(charge_points)")
         cols = [c[1] for c in cur.fetchall()]
         if "resident_name" not in cols:
+            print("⚠️ [init_db] 新增欄位 resident_name")
             cur.execute("ALTER TABLE charge_points ADD COLUMN resident_name TEXT")
         if "resident_floor" not in cols:
+            print("⚠️ [init_db] 新增欄位 resident_floor")
             cur.execute("ALTER TABLE charge_points ADD COLUMN resident_floor TEXT")
         conn.commit()
 
