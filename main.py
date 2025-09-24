@@ -3602,6 +3602,70 @@ def add_charge_point(data: dict = Body(...)):
     return {"message": "✅ 已新增/更新", "charge_point_id": cp_id}
 
 
+from fastapi import Body
+
+@app.get("/api/charge-points")
+def list_charge_points():
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT charge_point_id, name, status, resident_name, resident_floor FROM charge_points")
+        rows = cur.fetchall()
+    return [
+        {
+            "charge_point_id": r[0],
+            "name": r[1],
+            "status": r[2],
+            "resident_name": r[3],
+            "resident_floor": r[4],
+        } for r in rows
+    ]
+
+@app.post("/api/charge-points")
+def add_charge_point(data: dict = Body(...)):
+    cp_id = data.get("chargePointId")
+    name = data.get("name")
+    status = data.get("status", "enabled")
+    resident_name = data.get("residentName")
+    resident_floor = data.get("residentFloor")
+
+    if not cp_id:
+        raise HTTPException(status_code=400, detail="缺少 chargePointId")
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT OR REPLACE INTO charge_points (charge_point_id, name, status, resident_name, resident_floor)
+            VALUES (?, ?, ?, ?, ?)
+        """, (cp_id, name, status, resident_name, resident_floor))
+        conn.commit()
+
+    return {"message": "✅ 新增成功"}
+
+@app.put("/api/charge-points/{cp_id}")
+def update_charge_point(cp_id: str, data: dict = Body(...)):
+    name = data.get("name")
+    status = data.get("status")
+    resident_name = data.get("residentName")
+    resident_floor = data.get("residentFloor")
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE charge_points
+            SET name=?, status=?, resident_name=?, resident_floor=?
+            WHERE charge_point_id=?
+        """, (name, status, resident_name, resident_floor, cp_id))
+        conn.commit()
+
+    return {"message": "✅ 更新成功"}
+
+@app.delete("/api/charge-points/{cp_id}")
+def delete_charge_point(cp_id: str):
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM charge_points WHERE charge_point_id=?", (cp_id,))
+        conn.commit()
+    return {"message": "✅ 刪除成功"}
 
 
 if __name__ == "__main__":
