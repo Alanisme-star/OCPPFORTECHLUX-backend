@@ -1481,6 +1481,30 @@ def get_current_tx_summary_by_cp(charge_point_id: str):
         }
 
 
+@app.get("/api/charge-points/{charge_point_id}/current-transaction/summary")
+def get_current_tx_summary(charge_point_id: str):
+    cp_id = _normalize_cp_id(charge_point_id)
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT transaction_id, id_tag, start_timestamp
+            FROM transactions
+            WHERE charge_point_id=? AND stop_timestamp IS NULL
+            ORDER BY start_timestamp DESC LIMIT 1
+        """, (cp_id,))
+        row = cur.fetchone()
+        if not row:
+            return {"found": False}
+        
+        tx_id, id_tag, start_ts = row
+        return {
+            "found": True,
+            "transaction_id": tx_id,
+            "id_tag": id_tag,
+            "start_timestamp": start_ts
+        }
+
+
 
 @app.get("/api/charge-points/{charge_point_id}/last-finished-transaction/summary")
 def get_last_finished_tx_summary_by_cp(charge_point_id: str):
