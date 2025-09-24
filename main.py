@@ -1436,7 +1436,6 @@ def get_latest_energy(charge_point_id: str):
 
 
 
-
 @app.get("/api/charge-points/{charge_point_id}/current-transaction/summary")
 def get_current_tx_summary_by_cp(charge_point_id: str):
     cp_id = _normalize_cp_id(charge_point_id)
@@ -1461,7 +1460,7 @@ def get_current_tx_summary_by_cp(charge_point_id: str):
         pay = cur.fetchone()
         total_amount = float(pay[0]) if pay else 0.0
 
-        # 計算最終電量（進行中可能還在增加）
+        # 計算目前累積電量
         final_energy = None
         if meter_start is not None and meter_stop is not None:
             try:
@@ -1480,29 +1479,6 @@ def get_current_tx_summary_by_cp(charge_point_id: str):
             "final_cost": total_amount
         }
 
-
-@app.get("/api/charge-points/{charge_point_id}/current-transaction/summary")
-def get_current_tx_summary(charge_point_id: str):
-    cp_id = _normalize_cp_id(charge_point_id)
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT transaction_id, id_tag, start_timestamp
-            FROM transactions
-            WHERE charge_point_id=? AND stop_timestamp IS NULL
-            ORDER BY start_timestamp DESC LIMIT 1
-        """, (cp_id,))
-        row = cur.fetchone()
-        if not row:
-            return {"found": False}
-        
-        tx_id, id_tag, start_ts = row
-        return {
-            "found": True,
-            "transaction_id": tx_id,
-            "id_tag": id_tag,
-            "start_timestamp": start_ts
-        }
 
 
 
@@ -2580,65 +2556,92 @@ async def get_cards():
     rows = cursor.fetchall()
     return [{"id": row[0], "card_id": row[0], "balance": row[1]} for row in rows]
 
+
+def init_db():
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS charge_points (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            charge_point_id TEXT UNIQUE NOT NULL,
+            name TEXT,
+            status TEXT,
+            resident_name TEXT,     -- ⭐ 新增
+            resident_floor TEXT,    -- ⭐ 新增
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+        """)
+        # ⭐ 防呆：若舊表格已存在，補欄位
+        cur.execute("PRAGMA table_info(charge_points)")
+        cols = [c[1] for c in cur.fetchall()]
+        if "resident_name" not in cols:
+            cur.execute("ALTER TABLE charge_points ADD COLUMN resident_name TEXT")
+        if "resident_floor" not in cols:
+            cur.execute("ALTER TABLE charge_points ADD COLUMN resident_floor TEXT")
+        conn.commit()
+
 @app.get("/api/charge-points")
-async def list_charge_points():
-    cursor.execute("SELECT id, charge_point_id, name, status, created_at FROM charge_points")
-    rows = cursor.fetchall()
+def list_charge_points():
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT charge_point_id, name, status, resident_name, resident_floor
+            FROM charge_points
+        """)
+        rows = cur.fetchall()
     return [
         {
-            "id": r[0],
-            "chargePointId": r[1],  # 注意：這是駝峰命名，對應前端
-            "name": r[2],
-            "status": r[3],
-            "createdAt": r[4]
-        } for r in rows
+            "chargePointId": r[0],
+            "name": r[1],
+            "status": r[2],
+            "residentName": r[3] or "",
+            "residentFloor": r[4] or ""
+        }
+        for r in rows
     ]
 
 @app.post("/api/charge-points")
-async def add_charge_point(data: dict = Body(...)):
-    print("🔥 payload=", data)  # 新增，除錯用
-    cp_id = data.get("chargePointId") or data.get("charge_point_id")
+def add_charge_point(data: dict = Body(...)):
+    cp_id = data.get("chargePointId")
     name = data.get("name", "")
-    status = (data.get("status") or "enabled").lower()
+    status = data.get("status", "enabled")
+    resident_name = data.get("residentName", "")
+    resident_floor = data.get("residentFloor", "")
+
     if not cp_id:
         raise HTTPException(status_code=400, detail="chargePointId is required")
-    try:
-        cursor.execute(
-            "INSERT INTO charge_points (charge_point_id, name, status) VALUES (?, ?, ?)",
-            (cp_id, name, status)
-        )
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT OR REPLACE INTO charge_points
+            (charge_point_id, name, status, resident_name, resident_floor)
+            VALUES (?, ?, ?, ?, ?)
+        """, (cp_id, name, status, resident_name, resident_floor))
         conn.commit()
-        print(f"✅ 新增白名單到資料庫: {cp_id}, {name}, {status}")  # 新增，除錯用
-        cursor.execute("SELECT * FROM charge_points")
-        print("所有白名單=", cursor.fetchall())  # 新增，除錯用
-        return {"message": "新增成功"}
-    except sqlite3.IntegrityError as e:
-        print("❌ IntegrityError:", e)
-        raise HTTPException(status_code=409, detail="充電樁已存在")
-    except Exception as e:
-        print("❌ 其他新增錯誤:", e)
-        raise HTTPException(status_code=500, detail="內部錯誤")
-
-
+    return {"message": "新增成功"}
 
 @app.put("/api/charge-points/{cp_id}")
-async def update_charge_point(cp_id: str = Path(...), data: dict = Body(...)):
-    name = data.get("name")
-    status = data.get("status")
-    update_fields = []
-    params = []
-    if name is not None:
-        update_fields.append("name = ?")
-        params.append(name)
-    if status is not None:
-        update_fields.append("status = ?")
-        params.append(status)
-    if not update_fields:
-        raise HTTPException(status_code=400, detail="無可更新欄位")
-    params.append(cp_id)
-    cursor.execute(f"UPDATE charge_points SET {', '.join(update_fields)} WHERE charge_point_id = ?", params)
-    conn.commit()
-    return {"message": "已更新"}
+def update_charge_point(cp_id: str, data: dict = Body(...)):
+    name = data.get("name", "")
+    status = data.get("status", "enabled")
+    resident_name = data.get("residentName", "")
+    resident_floor = data.get("residentFloor", "")
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE charge_points
+            SET name = ?, status = ?, resident_name = ?, resident_floor = ?
+            WHERE charge_point_id = ?
+        """, (name, status, resident_name, resident_floor, cp_id))
+        if cur.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Not found")
+        conn.commit()
+    return {"message": "更新成功"}
+
+
+
 
 @app.delete("/api/charge-points/{cp_id}")
 async def delete_charge_point(cp_id: str = Path(...)):
@@ -3444,6 +3447,97 @@ def last_transactions():
         ]
         return {"last_transactions": result}
 
+
+
+# =========================
+#  其他 API 區塊 (cards, charge-points 等)
+# =========================
+
+@app.get("/api/cards")
+def list_cards():
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT id_tag, balance FROM cards")
+        rows = cur.fetchall()
+    return [{"idTag": r[0], "balance": r[1]} for r in rows]
+
+
+# === Users 住戶管理 API ===
+
+@app.post("/api/users")
+def add_user(data: dict = Body(...)):
+    id_tag = data.get("id_tag")
+    name = data.get("name")
+    department = data.get("department")
+    card_number = data.get("card_number")
+
+    if not id_tag or not name or not department:
+        raise HTTPException(status_code=400, detail="缺少必要欄位")
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT OR REPLACE INTO users (id_tag, name, department, card_number)
+            VALUES (?, ?, ?, ?)
+        """, (id_tag, name, department, card_number))
+        conn.commit()
+
+    return {"message": "✅ 住戶已新增或更新", "id_tag": id_tag}
+
+
+@app.get("/api/users")
+def list_users():
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT id_tag, name, department, card_number FROM users")
+        rows = cur.fetchall()
+    return [
+        {"id_tag": r[0], "name": r[1], "department": r[2], "card_number": r[3]}
+        for r in rows
+    ]
+
+
+@app.get("/api/users/{id_tag}")
+def get_user(id_tag: str):
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT id_tag, name, department, card_number FROM users WHERE id_tag=?", (id_tag,))
+        row = cur.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="住戶不存在")
+    return {"id_tag": row[0], "name": row[1], "department": row[2], "card_number": row[3]}
+
+
+@app.delete("/api/users/{id_tag}")
+def delete_user(id_tag: str):
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM users WHERE id_tag=?", (id_tag,))
+        conn.commit()
+    return {"message": f"✅ 已刪除住戶 {id_tag}"}
+
+
+@app.put("/api/users/{id_tag}")
+def update_user(id_tag: str, data: dict = Body(...)):
+    """
+    更新指定住戶的資料
+    """
+    name = data.get("name")
+    department = data.get("department")
+    card_number = data.get("card_number")
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE users
+            SET name = ?, department = ?, card_number = ?
+            WHERE id_tag = ?
+        """, (name, department, card_number, id_tag))
+        if cur.rowcount == 0:
+            raise HTTPException(status_code=404, detail="住戶不存在")
+        conn.commit()
+
+    return {"message": "✅ 住戶更新成功", "id_tag": id_tag}
 
 
 
