@@ -1379,6 +1379,64 @@ def get_last_tx_summary_by_cp(charge_point_id: str):
 
 
 
+# ✅ 新增 API：回傳單次充電的累積電量
+@app.get("/api/charge-points/{charge_point_id}/latest-energy")
+def get_latest_energy(charge_point_id: str):
+    """
+    回傳該樁「目前交易的累積電量 (kWh)」。
+    算法：最新 Energy.Active.Import.Register - meter_start。
+    """
+    cp_id = _normalize_cp_id(charge_point_id)
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+        # 找出該樁進行中的交易
+        cur.execute("""
+            SELECT transaction_id, meter_start
+            FROM transactions
+            WHERE charge_point_id=? AND stop_timestamp IS NULL
+            ORDER BY start_timestamp DESC LIMIT 1
+        """, (cp_id,))
+        row = cur.fetchone()
+        if not row:
+            return {"found": False, "sessionEnergyKWh": 0.0}
+
+        tx_id, meter_start = row
+        meter_start = float(meter_start or 0)
+
+        # 找最新的能量值
+        cur.execute("""
+            SELECT value, unit, timestamp
+            FROM meter_values
+            WHERE charge_point_id=? AND transaction_id=? 
+              AND (measurand='Energy.Active.Import.Register' OR measurand='Energy.Active.Import')
+            ORDER BY timestamp DESC LIMIT 1
+        """, (cp_id, tx_id))
+        mv = cur.fetchone()
+        if not mv:
+            return {"found": True, "transaction_id": tx_id, "sessionEnergyKWh": 0.0}
+
+        val, unit, ts = mv
+        try:
+            total_kwh = float(val)
+            if unit and unit.lower() in ("wh", "w*h", "w_h"):
+                total_kwh = total_kwh / 1000.0
+        except Exception:
+            total_kwh = 0.0
+
+        session_kwh = max(0.0, total_kwh - (meter_start / 1000.0))
+
+        return {
+            "found": True,
+            "transaction_id": tx_id,
+            "timestamp": ts,
+            "sessionEnergyKWh": round(session_kwh, 6)
+        }
+
+
+
+
+
 @app.get("/api/charge-points/{charge_point_id}/current-transaction/summary")
 def get_current_tx_summary_by_cp(charge_point_id: str):
     cp_id = _normalize_cp_id(charge_point_id)
