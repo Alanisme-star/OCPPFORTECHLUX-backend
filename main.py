@@ -2584,33 +2584,38 @@ def init_db():
 # === 充電樁白名單 + 住戶管理 API ===
 from fastapi import Path
 
+# === Charge Points CRUD API ===
 @app.get("/api/charge-points")
 def list_charge_points():
-    """
-    取得所有充電樁清單
-    """
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT charge_point_id, name, status, resident_name, resident_floor
-            FROM charge_points
-            ORDER BY created_at DESC
-        """)
-        rows = cur.fetchall()
+    import traceback
+    print("🔍 [DEBUG] /api/charge-points called")  # ⭐ 紀錄 API 被呼叫
 
-    return [
-        {
-            "charge_point_id": r[0],
-            "chargePointId": r[0],  # 前端相容 (camelCase)
-            "name": r[1],
-            "status": r[2],
-            "resident_name": r[3],
-            "residentName": r[3],
-            "resident_floor": r[4],
-            "residentFloor": r[4],
-        }
-        for r in rows
-    ]
+    try:
+        with get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT charge_point_id, name, status, resident_name, resident_floor
+                FROM charge_points
+                ORDER BY created_at DESC
+            """)
+            rows = cur.fetchall()
+        print(f"✅ [DEBUG] Fetched rows: {rows}")  # ⭐ 顯示抓到的資料
+
+        return [
+            {
+                "chargePointId": r[0],
+                "name": r[1],
+                "status": r[2],
+                "residentName": r[3],
+                "residentFloor": r[4],
+            }
+            for r in rows
+        ]
+    except Exception as e:
+        print("❌ [ERROR] list_charge_points failed:", e)
+        traceback.print_exc()  # ⭐ 打印完整錯誤堆疊
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 
 @app.post("/api/charge-points")
@@ -3308,81 +3313,6 @@ async def stop_transaction_by_charge_point(charge_point_id: str):
 
 
 
-# === Charge Points CRUD API ===
-from fastapi import Path
-
-@app.get("/api/charge-points")
-def list_charge_points():
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT charge_point_id, name, status, resident_name, resident_floor
-            FROM charge_points
-            ORDER BY created_at DESC
-        """)
-        rows = cur.fetchall()
-    return [
-        {
-            "chargePointId": r[0],
-            "name": r[1],
-            "status": r[2],
-            "residentName": r[3],
-            "residentFloor": r[4]
-        } for r in rows
-    ]
-
-
-@app.post("/api/charge-points")
-def create_charge_point(data: dict = Body(...)):
-    cp_id = data.get("chargePointId")
-    name = data.get("name")
-    status = data.get("status", "enabled")
-    resident_name = data.get("residentName")
-    resident_floor = data.get("residentFloor")
-
-    if not cp_id or not name:
-        raise HTTPException(status_code=400, detail="缺少必要欄位")
-
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO charge_points (charge_point_id, name, status, resident_name, resident_floor)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(charge_point_id) DO UPDATE SET
-                name=excluded.name,
-                status=excluded.status,
-                resident_name=excluded.resident_name,
-                resident_floor=excluded.resident_floor
-        """, (cp_id, name, status, resident_name, resident_floor))
-        conn.commit()
-    return {"message": "✅ 已新增或更新", "chargePointId": cp_id}
-
-
-@app.put("/api/charge-points/{charge_point_id}")
-def update_charge_point(charge_point_id: str = Path(...), data: dict = Body(...)):
-    name = data.get("name")
-    status = data.get("status")
-    resident_name = data.get("residentName")
-    resident_floor = data.get("residentFloor")
-
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("""
-            UPDATE charge_points
-            SET name=?, status=?, resident_name=?, resident_floor=?
-            WHERE charge_point_id=?
-        """, (name, status, resident_name, resident_floor, charge_point_id))
-        conn.commit()
-    return {"message": "✅ 已更新", "chargePointId": charge_point_id}
-
-
-@app.delete("/api/charge-points/{charge_point_id}")
-def delete_charge_point(charge_point_id: str = Path(...)):
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("DELETE FROM charge_points WHERE charge_point_id=?", (charge_point_id,))
-        conn.commit()
-    return {"message": "🗑️ 已刪除", "chargePointId": charge_point_id}
 
 
 
