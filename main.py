@@ -2580,6 +2580,7 @@ def init_db():
             cur.execute("ALTER TABLE charge_points ADD COLUMN resident_floor TEXT")
         conn.commit()
 
+
 @app.get("/api/charge-points")
 def list_charge_points():
     with get_conn() as conn:
@@ -2589,6 +2590,7 @@ def list_charge_points():
             FROM charge_points
         """)
         rows = cur.fetchall()
+
     return [
         {
             "chargePointId": r[0],
@@ -2599,6 +2601,7 @@ def list_charge_points():
         }
         for r in rows
     ]
+
 
 @app.post("/api/charge-points")
 def add_charge_point(data: dict = Body(...)):
@@ -2620,6 +2623,7 @@ def add_charge_point(data: dict = Body(...)):
         """, (cp_id, name, status, resident_name, resident_floor))
         conn.commit()
     return {"message": "新增成功"}
+
 
 @app.put("/api/charge-points/{cp_id}")
 def update_charge_point(cp_id: str, data: dict = Body(...)):
