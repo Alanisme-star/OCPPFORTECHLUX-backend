@@ -23,7 +23,7 @@ class SimChargePoint(OcppChargePoint):
         super().__init__(charge_point_id, connection)
         self._running = True
         self.current_txn_id: int | None = None
-        self.latest_energy_kwh = 0.0  # <== 儲存最新的 kWh
+        self.latest_energy_kwh = 0.0  # <== 新增欄位供 StopTransaction 使用
 
     @on(Action.remote_stop_transaction)
     async def on_remote_stop_transaction(self, transaction_id, **kwargs):
@@ -69,33 +69,21 @@ class SimChargePoint(OcppChargePoint):
         self.current_txn_id = int(res.transaction_id) if getattr(res, "transaction_id", 0) else local_txn_id
         print("[SIM] StartTransaction result:", res)
 
-    async def _send_meter_values(
-        self, connector_id=1, power_w=0.0, voltage_v=230.0,
-        current_a=None, energy_kwh=0.0, inject_anomaly=False
-    ):
+    async def _send_meter_values(self, connector_id=1, power_w=0.0, voltage_v=230.0, current_a=None, energy_kwh=0.0):
         self.latest_energy_kwh = energy_kwh  # <== 儲存最新的 kWh
 
         if current_a is None:
             current_a = (power_w / voltage_v) if voltage_v > 0 else 0.0
 
-        sampled_values = [
-            {"value": f"{power_w:.2f}", "measurand": "Power.Active.Import", "unit": "W"},
-            {"value": f"{voltage_v:.1f}", "measurand": "Voltage", "unit": "V"},
-            {"value": f"{current_a:.2f}", "measurand": "Current.Import", "unit": "A"},
-            {"value": f"{energy_kwh:.4f}", "measurand": "Energy.Active.Import.Register", "unit": "kWh"},
-        ]
-
-        # === 新增：隨機異常注入 ===
-        if inject_anomaly:
-            anomaly_val = random.choice([9999, 123456, 888888]) / 1000.0  # 單位 kWh
-            sampled_values.append({
-                "value": f"{anomaly_val:.4f}",
-                "measurand": "Energy.Active.Import.Register",
-                "unit": "kWh"
-            })
-            print(f"[SIM] ⚠️ Injected anomaly energy value: {anomaly_val:.4f} kWh")
-
-        mv = {"timestamp": iso_now(), "sampledValue": sampled_values}
+        mv = {
+            "timestamp": iso_now(),
+            "sampledValue": [
+                {"value": f"{power_w:.2f}", "measurand": "Power.Active.Import", "unit": "W"},
+                {"value": f"{voltage_v:.1f}", "measurand": "Voltage", "unit": "V"},
+                {"value": f"{current_a:.2f}", "measurand": "Current.Import", "unit": "A"},
+                {"value": f"{energy_kwh:.4f}", "measurand": "Energy.Active.Import.Register", "unit": "kWh"},
+            ],
+        }
 
         kwargs = dict(connector_id=connector_id, meter_value=[mv])
         if isinstance(self.current_txn_id, int):
@@ -138,16 +126,12 @@ class SimChargePoint(OcppChargePoint):
             power_w = base_power_w * (0.85 + 0.15 * (1 + math.sin(2 * math.pi * t / 12.0)) / 2.0)
             power_w += random.uniform(-50, 50)
             power_w = max(0.0, power_w)
-            energy_kwh += power_w / 3600000.0  # W → kWh
-
-            # 每 10% 機率注入一次異常數據
-            inject_anomaly = (random.random() < 0.1)
+            energy_kwh += power_w / 3600000.0  # W → kWh（注意換算）
 
             await self._send_meter_values(
                 power_w=power_w,
                 voltage_v=voltage_v,
-                energy_kwh=max(0.0, energy_kwh),
-                inject_anomaly=inject_anomaly
+                energy_kwh=max(0.0, energy_kwh)
             )
             await asyncio.sleep(1.0)
 
