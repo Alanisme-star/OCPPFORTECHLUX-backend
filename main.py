@@ -941,39 +941,60 @@ class ChargePoint(OcppChargePoint):
                             except Exception:
                                 pass
 
-                        elif meas in ("Energy.Active.Import.Register", "Energy.Active.Import"):
-                            kwh = _energy_to_kwh(val, unit)
-                            if kwh is not None:
-                                # === 過濾異常值：和上一筆比較 ===
-                                prev_energy = (live_status_cache.get(cp_id) or {}).get("energy")
-                                if prev_energy is not None:
-                                    diff = kwh - prev_energy
-                                    if diff < 0 or diff > 10:  # 閾值可調整
-                                        logging.warning(
-                                            f"⚠️ 棄用異常能量值：{kwh} kWh (diff={diff}，prev={prev_energy})"
+                        elif str(meas or "").lower().startswith("energy.active.import"):
+                            kwh_raw = _energy_to_kwh(val, unit)
+                            if kwh_raw is None:
+                                continue
+
+                            meas_l = str(meas or "").lower()
+                            prev_total = (live_status_cache.get(cp_id) or {}).get("energy")
+
+                            if meas_l.endswith(".register") or meas_l == "energy.active.import":
+                                # 累積表數：直接當作 "樁上總表(kWh)"
+                                kwh_total = kwh_raw
+
+                            elif meas_l.endswith(".interval"):
+                                # 區段能量：用上一筆 total 疊加
+                                base = prev_total if isinstance(prev_total, (int, float)) else 0.0
+                                kwh_total = max(0.0, base + kwh_raw)
+
+                            else:
+                                # 其他變體，一律當作累積值處理
+                                kwh_total = kwh_raw
+
+                            # 過濾異常躍升
+                            if prev_total is not None:
+                                diff = kwh_total - prev_total
+                                if diff < 0 or diff > 10:
+                                    logging.warning(f"⚠️ 棄用異常能量值：{kwh_total} kWh (diff={diff}，prev={prev_total})")
+                                    continue
+
+                            _upsert_live(cp_id, energy=round(kwh_total, 6), timestamp=ts)
+
+                            # 估算本次用電與金額
+                            try:
+                                with sqlite3.connect(DB_FILE) as _c2:
+                                    _cur2 = _c2.cursor()
+                                    _cur2.execute(
+                                        "SELECT meter_start FROM transactions WHERE transaction_id = ?",
+                                        (transaction_id,)
+                                    )
+                                    row_tx = _cur2.fetchone()
+                                    if row_tx:
+                                        meter_start_wh = float(row_tx[0] or 0)
+                                        used_kwh = max(0.0, (kwh_total - (meter_start_wh / 1000.0)))
+                                        unit_price = float(_price_for_timestamp(ts)) if ts else 6.0
+                                        est_amount = round(used_kwh * unit_price, 2)
+                                        _upsert_live(
+                                            cp_id,
+                                            estimated_energy=round(used_kwh, 6),
+                                            estimated_amount=est_amount,
+                                            price_per_kwh=unit_price,
+                                            timestamp=ts
                                         )
-                                        continue
+                            except Exception as e:
+                                logging.warning(f"⚠️ 預估金額計算失敗: {e}")
 
-                                _upsert_live(cp_id, energy=round(kwh, 6), timestamp=ts)
-
-                                # 計算用電量與金額
-                                try:
-                                    with sqlite3.connect(DB_FILE) as _c2:
-                                        _cur2 = _c2.cursor()
-                                        _cur2.execute("SELECT meter_start FROM transactions WHERE transaction_id = ?", (transaction_id,))
-                                        row_tx = _cur2.fetchone()
-                                        if row_tx:
-                                            meter_start_wh = float(row_tx[0] or 0)
-                                            used_kwh = max(0.0, (kwh - (meter_start_wh / 1000.0)))
-                                            unit_price = float(_price_for_timestamp(ts)) if ts else 6.0
-                                            est_amount = round(used_kwh * unit_price, 2)
-                                            _upsert_live(cp_id,
-                                                         estimated_energy=round(used_kwh, 6),
-                                                         estimated_amount=est_amount,
-                                                         price_per_kwh=unit_price,
-                                                         timestamp=ts)
-                                except Exception as e:
-                                    logging.warning(f"⚠️ 預估金額計算失敗: {e}")
 
                         # Debug log
                         logging.info(f"[DEBUG][MeterValues] tx={transaction_id} | measurand={meas} | value={val}{unit} | ts={ts}")
