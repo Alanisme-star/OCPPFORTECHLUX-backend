@@ -1753,9 +1753,9 @@ def get_latest_energy(charge_point_id: str):
     if row:
         ts, val, unit = row
         try:
-            kwh_total = _energy_to_kwh(val, unit)   # ✅ 取總累積電量
+            kwh_total = _energy_to_kwh(val, unit)   # ✅ 取實體充電樁累積電量
             if kwh_total is not None:
-                # === ⭐ 新增：查詢當前交易的 meter_start，用來計算 sessionEnergyKWh ===
+                # === ⭐ 查詢當前交易的 meter_start，用來計算 sessionEnergyKWh ===
                 with get_conn() as conn2:
                     cur2 = conn2.cursor()
                     cur2.execute("""
@@ -1770,19 +1770,19 @@ def get_latest_energy(charge_point_id: str):
                     session_kwh = max(0.0, kwh_total - (meter_start_wh / 1000.0))
                 else:
                     session_kwh = 0.0
-                # === ⭐ 新增結束 ===
+                # === ⭐ 修改點：這裡同時計算 sessionEnergyKWh 與 totalEnergyKWh ===
 
                 result = {
                     "timestamp": ts,
-                    "totalEnergyKWh": round(kwh_total, 6),
-                    "sessionEnergyKWh": round(session_kwh, 6)   # ✅ 修正：變成「本次充電累積電量」
+                    "meterTotalKWh": round(kwh_total, 6),        # ⭐ 新增：實體充電樁累積電量
+                    "sessionEnergyKWh": round(session_kwh, 6)    # ⭐ 保留：本次充電累積電量
                 }
 
                 # ⭐ 保護條件：若狀態是 Available，強制回傳 0
                 cp_status = charging_point_status.get(cp_id, {}).get("status")
-                if cp_status == "Available" and result.get("totalEnergyKWh", 0) > 0:
-                    logging.debug(f"⚠️ [DEBUG] 保護觸發: CP={cp_id} 狀態=Available 但 DB 最新值={result['totalEnergyKWh']} → 強制改為 0")
-                    result["totalEnergyKWh"] = 0
+                if cp_status == "Available" and result.get("meterTotalKWh", 0) > 0:
+                    logging.debug(f"⚠️ [DEBUG] 保護觸發: CP={cp_id} 狀態=Available 但 DB 最新值={result['meterTotalKWh']} → 強制改為 0")
+                    result["meterTotalKWh"] = 0
                     result["sessionEnergyKWh"] = 0
 
         except Exception as e:
