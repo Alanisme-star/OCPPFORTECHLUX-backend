@@ -1428,6 +1428,35 @@ def get_latest_current_api(charge_point_id: str):
     return {}
 
 
+@app.get("/api/charge-points/{cp_id}/current-transaction/start-meter")
+def get_start_meter(cp_id: str):
+    """
+    查詢目前進行中交易的起始電量 (kWh)。
+    來源：transactions 表的 meter_start 欄位 (Wh)。
+    """
+    cp_id = _normalize_cp_id(cp_id)
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT meter_start, start_timestamp
+            FROM transactions
+            WHERE charge_point_id = ? AND stop_timestamp IS NULL
+            ORDER BY start_timestamp DESC LIMIT 1
+        """, (cp_id,))
+        row = cur.fetchone()
+
+    if not row:
+        return {"found": False}
+
+    meter_start_wh, start_ts = row
+    return {
+        "found": True,
+        "meter_start_kwh": round((meter_start_wh or 0) / 1000.0, 6),
+        "start_timestamp": start_ts
+    }
+
+
+
 
 
 # ✅ 原本 API（加上最終電量 / 電費，不動結構）
@@ -1707,7 +1736,6 @@ def get_live_status(charge_point_id: str):
 
 
 
-
 @app.get("/api/charge-points/{charge_point_id}/latest-energy")
 def get_latest_energy(charge_point_id: str):
     cp_id = _normalize_cp_id(charge_point_id)
@@ -1725,12 +1753,29 @@ def get_latest_energy(charge_point_id: str):
     if row:
         ts, val, unit = row
         try:
-            kwh = _energy_to_kwh(val, unit)
-            if kwh is not None:
+            kwh_total = _energy_to_kwh(val, unit)   # ✅ 取總累積電量
+            if kwh_total is not None:
+                # === ⭐ 新增：查詢當前交易的 meter_start，用來計算 sessionEnergyKWh ===
+                with get_conn() as conn2:
+                    cur2 = conn2.cursor()
+                    cur2.execute("""
+                        SELECT meter_start
+                        FROM transactions
+                        WHERE charge_point_id=? AND stop_timestamp IS NULL
+                        ORDER BY start_timestamp DESC LIMIT 1
+                    """, (cp_id,))
+                    row_tx = cur2.fetchone()
+                if row_tx:
+                    meter_start_wh = float(row_tx[0] or 0)
+                    session_kwh = max(0.0, kwh_total - (meter_start_wh / 1000.0))
+                else:
+                    session_kwh = 0.0
+                # === ⭐ 新增結束 ===
+
                 result = {
                     "timestamp": ts,
-                    "totalEnergyKWh": round(kwh, 6),
-                    "sessionEnergyKWh": round(kwh, 6)
+                    "totalEnergyKWh": round(kwh_total, 6),
+                    "sessionEnergyKWh": round(session_kwh, 6)   # ✅ 修正：變成「本次充電累積電量」
                 }
 
                 # ⭐ 保護條件：若狀態是 Available，強制回傳 0
@@ -1745,6 +1790,10 @@ def get_latest_energy(charge_point_id: str):
 
     logging.debug(f"🔍 [DEBUG] latest-energy 回傳: {result}")
     return result
+
+
+
+
 
 
 @app.get("/api/cards/{card_id}/history")
