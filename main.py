@@ -1509,57 +1509,6 @@ def get_last_tx_summary_by_cp(charge_point_id: str):
 
 
 
-# ✅ 新增 API：回傳單次充電的累積電量
-@app.get("/api/charge-points/{cp_id}/latest-energy")
-async def get_latest_energy(cp_id: str):
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT value, unit
-            FROM meter_values
-            WHERE charge_point_id=? 
-              AND measurand IN ('Energy.Active.Import.Register','Energy.Active.Import')
-            ORDER BY timestamp DESC LIMIT 1
-        """, (cp_id,))
-        row = cur.fetchone()
-        if row:
-            kwh = _energy_to_kwh(row[0], row[1])
-            return {"found": True, "sessionEnergyKWh": kwh}
-
-    # 🔽 Register/Import 沒資料時，用 Interval 加總
-    with get_conn() as conn2:
-        cur2 = conn2.cursor()
-        cur2.execute("""
-            SELECT transaction_id, meter_start
-            FROM transactions
-            WHERE charge_point_id=? AND stop_timestamp IS NULL
-            ORDER BY start_timestamp DESC LIMIT 1
-        """, (cp_id,))
-        tx = cur2.fetchone()
-        if not tx:
-            return {}
-        tx_id, meter_start = tx
-        meter_start = float(meter_start or 0)
-
-        cur2.execute("""
-            SELECT value, unit
-            FROM meter_values
-            WHERE charge_point_id=? AND transaction_id=?
-              AND measurand='Energy.Active.Import.Interval'
-        """, (cp_id, tx_id))
-        rows_iv = cur2.fetchall()
-        sum_kwh = 0.0
-        for v, u in rows_iv or []:
-            k = _energy_to_kwh(v, u)
-            if k is not None:
-                sum_kwh += max(0.0, float(k))
-
-        return {"found": True, "transaction_id": tx_id, "sessionEnergyKWh": round(sum_kwh, 6)}
-
-
-
-
-
 
 @app.get("/api/charge-points/{charge_point_id}/current-transaction/summary")
 def get_current_tx_summary_by_cp(charge_point_id: str):
@@ -1736,26 +1685,29 @@ def get_live_status(charge_point_id: str):
 
 
 
-@app.get("/api/charge-points/{charge_point_id}/latest-energy")
-def get_latest_energy(charge_point_id: str):
-    cp_id = _normalize_cp_id(charge_point_id)
-    c = conn.cursor()
-
-    c.execute("""
-        SELECT timestamp, value, unit
-        FROM meter_values
-        WHERE charge_point_id=? AND measurand IN ('Energy.Active.Import.Register','Energy.Active.Import')
-        ORDER BY timestamp DESC LIMIT 1
-    """, (cp_id,))
-    row = c.fetchone()
-
+# ✅ 合併後的唯一 API：同時計算總表與單次充電累積電量
+@app.get("/api/charge-points/{cp_id}/latest-energy")
+async def get_latest_energy(cp_id: str):
+    cp_id = _normalize_cp_id(cp_id)
     result = {}
-    if row:
-        ts, val, unit = row
-        try:
-            kwh_total = _energy_to_kwh(val, unit)   # ✅ 取實體充電樁累積電量
+
+    try:
+        with get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT timestamp, value, unit
+                FROM meter_values
+                WHERE charge_point_id=? 
+                  AND measurand IN ('Energy.Active.Import.Register','Energy.Active.Import')
+                ORDER BY timestamp DESC LIMIT 1
+            """, (cp_id,))
+            row = cur.fetchone()
+
+        if row:
+            ts, val, unit = row
+            kwh_total = _energy_to_kwh(val, unit)
             if kwh_total is not None:
-                # === ⭐ 查詢當前交易的 meter_start，用來計算 sessionEnergyKWh ===
+                # 查詢當前交易的 meter_start (Wh)
                 with get_conn() as conn2:
                     cur2 = conn2.cursor()
                     cur2.execute("""
@@ -1765,32 +1717,68 @@ def get_latest_energy(charge_point_id: str):
                         ORDER BY start_timestamp DESC LIMIT 1
                     """, (cp_id,))
                     row_tx = cur2.fetchone()
+
                 if row_tx:
                     meter_start_wh = float(row_tx[0] or 0)
                     session_kwh = max(0.0, kwh_total - (meter_start_wh / 1000.0))
                 else:
                     session_kwh = 0.0
-                # === ⭐ 修改點：這裡同時計算 sessionEnergyKWh 與 totalEnergyKWh ===
 
                 result = {
                     "timestamp": ts,
-                    "meterTotalKWh": round(kwh_total, 6),        # ⭐ 新增：實體充電樁累積電量
-                    "sessionEnergyKWh": round(session_kwh, 6)    # ⭐ 保留：本次充電累積電量
+                    "meterTotalKWh": round(kwh_total, 6),     # ⭐ 累積電量
+                    "sessionEnergyKWh": round(session_kwh, 6) # ⭐ 本次充電電量
                 }
 
-                # ⭐ 保護條件：若狀態是 Available，強制回傳 0
-                cp_status = charging_point_status.get(cp_id, {}).get("status")
-                if cp_status == "Available" and result.get("meterTotalKWh", 0) > 0:
-                    logging.debug(f"⚠️ [DEBUG] 保護觸發: CP={cp_id} 狀態=Available 但 DB 最新值={result['meterTotalKWh']} → 強制改為 0")
-                    result["meterTotalKWh"] = 0
-                    result["sessionEnergyKWh"] = 0
+        # 🔽 如果沒有 Register/Import，退回 Interval 加總
+        if not result:
+            with get_conn() as conn2:
+                cur2 = conn2.cursor()
+                cur2.execute("""
+                    SELECT transaction_id, meter_start
+                    FROM transactions
+                    WHERE charge_point_id=? AND stop_timestamp IS NULL
+                    ORDER BY start_timestamp DESC LIMIT 1
+                """, (cp_id,))
+                tx = cur2.fetchone()
+                if tx:
+                    tx_id, meter_start = tx
+                    meter_start = float(meter_start or 0)
 
-        except Exception as e:
-            logging.warning(f"⚠️ latest-energy 計算失敗: {e}")
+                    cur2.execute("""
+                        SELECT value, unit
+                        FROM meter_values
+                        WHERE charge_point_id=? AND transaction_id=?
+                          AND measurand='Energy.Active.Import.Interval'
+                    """, (cp_id, tx_id))
+                    rows_iv = cur2.fetchall()
+
+                    sum_kwh = 0.0
+                    for v, u in rows_iv or []:
+                        k = _energy_to_kwh(v, u)
+                        if k is not None:
+                            sum_kwh += max(0.0, float(k))
+
+                    result = {
+                        "transaction_id": tx_id,
+                        "meterTotalKWh": round(meter_start/1000.0 + sum_kwh, 6),
+                        "sessionEnergyKWh": round(sum_kwh, 6)
+                    }
+
+        # ⭐ 保護條件：如果樁是 Available，強制歸零
+        cp_status = charging_point_status.get(cp_id, {}).get("status")
+        if cp_status == "Available" and result.get("meterTotalKWh", 0) > 0:
+            logging.debug(
+                f"⚠️ [DEBUG] 保護觸發: CP={cp_id} 狀態=Available 但 DB 最新值={result['meterTotalKWh']} → 強制改為 0"
+            )
+            result["meterTotalKWh"] = 0
+            result["sessionEnergyKWh"] = 0
+
+    except Exception as e:
+        logging.warning(f"⚠️ latest-energy 計算失敗: {e}")
 
     logging.debug(f"🔍 [DEBUG] latest-energy 回傳: {result}")
     return result
-
 
 
 
