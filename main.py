@@ -1685,13 +1685,15 @@ def get_live_status(charge_point_id: str):
 
 
 
-# ✅ 合併後的唯一 API：同時計算總表與單次充電累積電量
+
+# ✅ 唯一安全版 API：同時計算「總累積電量」、「本次充電電量」、「電價」、「預估電費」
 @app.get("/api/charge-points/{cp_id}/latest-energy")
 async def get_latest_energy(cp_id: str):
     cp_id = _normalize_cp_id(cp_id)
     result = {}
 
     try:
+        # 1. 找最新的總累積電量 (Register/Import)
         with get_conn() as conn:
             cur = conn.cursor()
             cur.execute("""
@@ -1707,7 +1709,7 @@ async def get_latest_energy(cp_id: str):
             ts, val, unit = row
             kwh_total = _energy_to_kwh(val, unit)
             if kwh_total is not None:
-                # 查詢當前交易的 meter_start (Wh)
+                # 2. 找進行中的交易，取得起始電量 (Wh)
                 with get_conn() as conn2:
                     cur2 = conn2.cursor()
                     cur2.execute("""
@@ -1720,17 +1722,29 @@ async def get_latest_energy(cp_id: str):
 
                 if row_tx:
                     meter_start_wh = float(row_tx[0] or 0)
+                    # 本次充電累積電量 (kWh)
                     session_kwh = max(0.0, kwh_total - (meter_start_wh / 1000.0))
                 else:
                     session_kwh = 0.0
 
+                # 3. 取電價 (查不到則預設 6.0 元/kWh)
+                try:
+                    unit_price = float(_price_for_timestamp(ts)) if ts else 6.0
+                except Exception:
+                    unit_price = 6.0
+
+                # 4. 預估電費 = session_kwh * unit_price
+                est_amount = round(session_kwh * unit_price, 2)
+
                 result = {
                     "timestamp": ts,
-                    "meterTotalKWh": round(kwh_total, 6),     # ⭐ 累積電量
-                    "sessionEnergyKWh": round(session_kwh, 6) # ⭐ 本次充電電量
+                    "meterTotalKWh": round(kwh_total, 6),      # 總累積電量
+                    "sessionEnergyKWh": round(session_kwh, 6), # 本次充電電量
+                    "pricePerKWh": unit_price,                 # 當前電價
+                    "estimatedAmount": est_amount              # 預估電費
                 }
 
-        # 🔽 如果沒有 Register/Import，退回 Interval 加總
+        # 5. 如果沒有 Register/Import，退回 Interval 加總
         if not result:
             with get_conn() as conn2:
                 cur2 = conn2.cursor()
@@ -1759,25 +1773,33 @@ async def get_latest_energy(cp_id: str):
                         if k is not None:
                             sum_kwh += max(0.0, float(k))
 
+                    # 電價與預估金額
+                    try:
+                        unit_price = float(_price_for_timestamp(None))
+                    except Exception:
+                        unit_price = 6.0
+                    est_amount = round(sum_kwh * unit_price, 2)
+
                     result = {
                         "transaction_id": tx_id,
                         "meterTotalKWh": round(meter_start/1000.0 + sum_kwh, 6),
-                        "sessionEnergyKWh": round(sum_kwh, 6)
+                        "sessionEnergyKWh": round(sum_kwh, 6),
+                        "pricePerKWh": unit_price,
+                        "estimatedAmount": est_amount
                     }
 
-        # ⭐ 保護條件：如果樁是 Available，強制歸零
+        # 6. 保護條件：如果狀態是 Available，強制歸零
         cp_status = charging_point_status.get(cp_id, {}).get("status")
-        if cp_status == "Available" and result.get("meterTotalKWh", 0) > 0:
-            logging.debug(
-                f"⚠️ [DEBUG] 保護觸發: CP={cp_id} 狀態=Available 但 DB 最新值={result['meterTotalKWh']} → 強制改為 0"
-            )
+        if cp_status == "Available":
+            logging.debug(f"[DEBUG] 保護觸發: CP={cp_id} 狀態=Available → 強制歸零")
             result["meterTotalKWh"] = 0
             result["sessionEnergyKWh"] = 0
+            result["estimatedAmount"] = 0
 
     except Exception as e:
-        logging.warning(f"⚠️ latest-energy 計算失敗: {e}")
+        logging.warning(f"[WARNING] latest-energy 計算失敗: {e}")
 
-    logging.debug(f"🔍 [DEBUG] latest-energy 回傳: {result}")
+    logging.debug(f"[DEBUG] latest-energy 回傳: {result}")
     return result
 
 
