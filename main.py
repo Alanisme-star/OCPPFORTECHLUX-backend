@@ -1219,6 +1219,23 @@ def update_card_balance(data: dict = Body(...)):
     return {"message": f"✅ 已更新 {card_id} 餘額為 {balance} 元"}
 
 
+@app.get("/api/whitelist/with-cards")
+def get_whitelist_with_cards():
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT charge_point_id, name, status FROM charge_points")
+        cps = [{"charge_point_id": r[0], "name": r[1], "status": r[2]} for r in cur.fetchall()]
+
+        cur.execute("SELECT card_id, balance FROM cards")
+        cards = {r[0]: r[1] for r in cur.fetchall()}
+
+    # 合併卡片餘額
+    for cp in cps:
+        cp_id = cp["charge_point_id"]
+        cp["balance"] = cards.get(cp_id, 0.0)
+    return cps
+
+
 
 from fastapi import HTTPException
 
