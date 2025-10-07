@@ -1063,6 +1063,20 @@ class ChargePoint(OcppChargePoint):
                                                     f"ΔkWh={delta_kwh:.4f} | 扣款={delta_fee:.2f} | {old_balance:.2f}→{new_balance:.2f}"
                                                 )
 
+
+
+                                                # 🔥 新增：後端保護 — 餘額 <=0 時立即下達停止充電
+                                                if new_balance <= 0.01:
+                                                    logging.warning(f"⚡ 餘額不足，自動停止充電 | CP={cp_id} | tx={transaction_id}")
+                                                    cp = connected_charge_points.get(cp_id)
+                                                    if cp:
+                                                        try:
+                                                            await cp.send_stop_transaction(transaction_id)
+                                                        except Exception as e:
+                                                            logging.error(f"⚠️ 自動停止充電失敗: {e}")
+
+
+
                                             new_deducted_kwh = current_kwh
                                             new_deducted_amount = round(deducted_amount + delta_fee, 2)
                                             if row:
