@@ -1231,8 +1231,7 @@ def get_whitelist_with_cards():
 
     # 合併卡片餘額
     for cp in cps:
-        cp_id = cp["charge_point_id"]
-        cp["balance"] = cards.get(cp_id, 0.0)
+        cp["balance"] = cards.get(cp.get("charge_point_id")) or 0.0
     return cps
 
 
