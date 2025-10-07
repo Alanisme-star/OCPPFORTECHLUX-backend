@@ -1155,6 +1155,68 @@ def force_add_charge_point(
     }
 
 
+# ============================================================
+# 🆕 新增整合管理 API：WhitelistManager
+# ============================================================
+
+@app.get("/api/whitelist-manager/list")
+def list_whitelist_and_cards():
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT charge_point_id, name, status, created_at FROM charge_points ORDER BY created_at DESC")
+        charge_points = [{"charge_point_id": r[0], "name": r[1], "status": r[2], "created_at": r[3]} for r in cur.fetchall()]
+        cur.execute("SELECT card_id, balance FROM cards ORDER BY card_id ASC")
+        cards = [{"card_id": r[0], "balance": r[1]} for r in cur.fetchall()]
+    return {"charge_points": charge_points, "cards": cards}
+
+@app.post("/api/whitelist-manager/add")
+def add_whitelist_or_card(data: dict = Body(...)):
+    item_type = data.get("type")
+    with get_conn() as conn:
+        cur = conn.cursor()
+        if item_type == "charge_point":
+            charge_point_id = data.get("charge_point_id")
+            name = data.get("name") or charge_point_id
+            cur.execute("INSERT OR IGNORE INTO charge_points (charge_point_id, name, status) VALUES (?, ?, 'enabled')", (charge_point_id, name))
+            conn.commit()
+            return {"message": f"✅ 已新增充電樁白名單：{charge_point_id}"}
+        elif item_type == "card":
+            card_id = data.get("card_id")
+            balance = float(data.get("balance") or 0)
+            cur.execute("INSERT OR IGNORE INTO cards (card_id, balance) VALUES (?, ?)", (card_id, balance))
+            conn.commit()
+            return {"message": f"✅ 已新增卡片：{card_id}，初始餘額 {balance} 元"}
+        else:
+            raise HTTPException(status_code=400, detail="type 必須是 'charge_point' 或 'card'")
+
+@app.delete("/api/whitelist-manager/delete")
+def delete_whitelist_or_card(item_type: str = Query(...), id_value: str = Query(...)):
+    with get_conn() as conn:
+        cur = conn.cursor()
+        if item_type == "charge_point":
+            cur.execute("DELETE FROM charge_points WHERE charge_point_id=?", (id_value,))
+            conn.commit()
+            return {"message": f"✅ 已刪除充電樁：{id_value}"}
+        elif item_type == "card":
+            cur.execute("DELETE FROM cards WHERE card_id=?", (id_value,))
+            conn.commit()
+            return {"message": f"✅ 已刪除卡片：{id_value}"}
+        else:
+            raise HTTPException(status_code=400, detail="type 必須是 'charge_point' 或 'card'")
+
+
+@app.put("/api/whitelist-manager/update-card-balance")
+def update_card_balance(data: dict = Body(...)):
+    card_id = data.get("card_id")
+    balance = data.get("balance")
+    if not card_id:
+        raise HTTPException(status_code=400, detail="缺少 card_id")
+    balance = float(balance)
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("UPDATE cards SET balance=? WHERE card_id=?", (balance, card_id))
+        conn.commit()
+    return {"message": f"✅ 已更新 {card_id} 餘額為 {balance} 元"}
 
 
 
