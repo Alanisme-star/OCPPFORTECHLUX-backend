@@ -263,10 +263,18 @@ CREATE TABLE IF NOT EXISTS charge_points (
     charge_point_id TEXT UNIQUE NOT NULL,
     name TEXT,
     status TEXT,
+    default_card_id TEXT,                   -- ★ 新增：記錄此充電樁預設綁定的卡片
     created_at TEXT DEFAULT CURRENT_TIMESTAMP
 )
 """)
 conn.commit()
+
+# ★ 舊資料表自動補欄位 (避免已有資料庫時需要手動修改)
+cursor.execute("PRAGMA table_info(charge_points)")
+cols = [r[1] for r in cursor.fetchall()]
+if "default_card_id" not in cols:
+    cursor.execute("ALTER TABLE charge_points ADD COLUMN default_card_id TEXT")
+    conn.commit()
 
 # 初始化 connection_logs 表格（如不存在就建立）
 cursor.execute("""
@@ -1114,37 +1122,29 @@ class ChargePoint(OcppChargePoint):
 @app.post("/api/debug/force-add-charge-point")
 def force_add_charge_point(
     charge_point_id: str = "TW*MSI*E000100",
-    name: str = "MSI充電樁",           # ← 補上逗號
-    card_id: str = "6678B3EB",        # ★ 新增：可指定卡片 ID（預設模擬器用的卡）
-    initial_balance: float = 100.0    # ★ 新增：可指定初始餘額（預設 100 元）
+    name: str = "MSI充電樁",
+    card_id: str = "6678B3EB",
+    initial_balance: float = 100.0
 ):
     """
-    Debug 用 API：強制新增一個充電樁到白名單 (charge_points 資料表)，
-    並同步建立測試卡片 (cards 表)，避免沒有卡片餘額資料。
+    Debug 用 API：強制新增充電樁，並指定預設卡片與餘額。
     """
     with get_conn() as conn:
         cur = conn.cursor()
-        # === 原本的充電樁白名單建立 ===
+        # 新增充電樁，同時寫入 default_card_id
         cur.execute(
             """
-            INSERT OR IGNORE INTO charge_points (charge_point_id, name, status)
-            VALUES (?, ?, 'enabled')
+            INSERT OR IGNORE INTO charge_points (charge_point_id, name, status, default_card_id)
+            VALUES (?, ?, 'enabled', ?)
             """,
-            (charge_point_id, name),
+            (charge_point_id, name, card_id),
         )
-
-
-
-        # === 新增：同步建立卡片（如果不存在就建立） ===
+        # 建立卡片
         cur.execute(
             "INSERT OR IGNORE INTO cards (card_id, balance) VALUES (?, ?)",
             (card_id, initial_balance)
         )
-
-
         conn.commit()
-
-
 
     return {
         "message": f"已新增或存在白名單: {charge_point_id}",
@@ -1153,6 +1153,7 @@ def force_add_charge_point(
         "card_id": card_id,
         "balance": initial_balance
     }
+
 
 
 # ============================================================
@@ -1221,18 +1222,30 @@ def update_card_balance(data: dict = Body(...)):
 
 @app.get("/api/whitelist/with-cards")
 def get_whitelist_with_cards():
+    """
+    ✅ 正規做法：直接在 charge_points 表中使用 default_card_id 來對應卡片餘額。
+    """
     with get_conn() as conn:
         cur = conn.cursor()
-        cur.execute("SELECT charge_point_id, name, status FROM charge_points")
-        cps = [{"charge_point_id": r[0], "name": r[1], "status": r[2]} for r in cur.fetchall()]
+        cur.execute("""
+            SELECT cp.charge_point_id, cp.name, cp.status, cp.default_card_id, IFNULL(c.balance, 0)
+            FROM charge_points cp
+            LEFT JOIN cards c ON c.card_id = cp.default_card_id
+            ORDER BY cp.created_at DESC
+        """)
+        rows = cur.fetchall()
 
-        cur.execute("SELECT card_id, balance FROM cards")
-        cards = {r[0]: r[1] for r in cur.fetchall()}
+    return [
+        {
+            "charge_point_id": r[0],
+            "name": r[1],
+            "status": r[2],
+            "card_id": r[3],
+            "balance": float(r[4] or 0)
+        }
+        for r in rows
+    ]
 
-    # 合併卡片餘額
-    for cp in cps:
-        cp["balance"] = cards.get(cp.get("charge_point_id")) or 0.0
-    return cps
 
 
 
