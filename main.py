@@ -1116,8 +1116,6 @@ class ChargePoint(OcppChargePoint):
         return call_result.RemoteStopTransactionPayload(status="Accepted")
 
 
-
-
 @app.post("/api/debug/force-add-charge-point")
 def force_add_charge_point(
     charge_point_id: str = "TW*MSI*E000100",
@@ -1125,6 +1123,10 @@ def force_add_charge_point(
     card_id: str = "6678B3EB",
     initial_balance: float = 100.0
 ):
+    """
+    Debug 用 API：強制新增充電樁並綁定預設卡片。
+    狀態改為 'Available' 以符合 OCPP 常見狀態。
+    """
     # 確保為數值
     try:
         initial_balance = float(initial_balance)
@@ -1138,10 +1140,10 @@ def force_add_charge_point(
         cur.execute(
             """
             INSERT INTO charge_points (charge_point_id, name, status, default_card_id)
-            VALUES (?, ?, 'enabled', ?)
+            VALUES (?, ?, 'Available', ?)
             ON CONFLICT(charge_point_id) DO UPDATE SET
               name=excluded.name,
-              status='enabled',
+              status='Available',
               default_card_id=excluded.default_card_id
             """,
             (charge_point_id, name, card_id),
@@ -1167,6 +1169,7 @@ def force_add_charge_point(
         "card_id": card_id,
         "balance": initial_balance
     }
+
 
 
 
