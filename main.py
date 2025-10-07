@@ -1118,7 +1118,6 @@ class ChargePoint(OcppChargePoint):
 
 
 
-
 @app.post("/api/debug/force-add-charge-point")
 def force_add_charge_point(
     charge_point_id: str = "TW*MSI*E000100",
@@ -1126,33 +1125,49 @@ def force_add_charge_point(
     card_id: str = "6678B3EB",
     initial_balance: float = 100.0
 ):
-    """
-    Debug 用 API：強制新增充電樁，並指定預設卡片與餘額。
-    """
+    # 確保為數值
+    try:
+        initial_balance = float(initial_balance)
+    except Exception:
+        initial_balance = 0.0
+
     with get_conn() as conn:
         cur = conn.cursor()
-        # 新增充電樁，同時寫入 default_card_id
+
+        # 1) 充電樁：若已存在就更新名稱/狀態/綁定卡
         cur.execute(
             """
-            INSERT OR IGNORE INTO charge_points (charge_point_id, name, status, default_card_id)
+            INSERT INTO charge_points (charge_point_id, name, status, default_card_id)
             VALUES (?, ?, 'enabled', ?)
+            ON CONFLICT(charge_point_id) DO UPDATE SET
+              name=excluded.name,
+              status='enabled',
+              default_card_id=excluded.default_card_id
             """,
             (charge_point_id, name, card_id),
         )
-        # 建立卡片
+
+        # 2) 卡片：若已存在就更新餘額為此次指定的初始餘額
         cur.execute(
-            "INSERT OR IGNORE INTO cards (card_id, balance) VALUES (?, ?)",
+            """
+            INSERT INTO cards (card_id, balance)
+            VALUES (?, ?)
+            ON CONFLICT(card_id) DO UPDATE SET
+              balance=excluded.balance
+            """,
             (card_id, initial_balance)
         )
+
         conn.commit()
 
     return {
-        "message": f"已新增或存在白名單: {charge_point_id}",
+        "message": f"已新增或更新白名單與卡片: {charge_point_id}",
         "charge_point_id": charge_point_id,
         "name": name,
         "card_id": card_id,
         "balance": initial_balance
     }
+
 
 
 
