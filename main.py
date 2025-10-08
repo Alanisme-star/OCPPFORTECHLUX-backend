@@ -1212,20 +1212,16 @@ def add_whitelist_or_card(data: dict = Body(...)):
             if cur.fetchone():
                 raise HTTPException(status_code=400, detail=f"充電樁 {charge_point_id} 已存在")
 
-            # ✅ 新增充電樁
             cur.execute(
                 "INSERT INTO charge_points (charge_point_id, name, status, default_card_id) VALUES (?, ?, 'enabled', ?)",
                 (charge_point_id, name, charge_point_id),
             )
-
-            # ✅ 同時建立卡片（若不存在）
             cur.execute("SELECT 1 FROM cards WHERE card_id=?", (charge_point_id,))
             if not cur.fetchone():
                 cur.execute(
                     "INSERT INTO cards (card_id, balance) VALUES (?, ?)",
                     (charge_point_id, init_balance),
                 )
-
             conn.commit()
             return {"message": f"✅ 已新增充電樁 {charge_point_id}，並建立初始餘額 {init_balance} 元的卡片"}
 
@@ -1251,36 +1247,6 @@ def add_whitelist_or_card(data: dict = Body(...)):
             conn.commit()
             return {"message": f"✅ 已新增卡片：{card_id}，初始餘額 {balance} 元"}
 
-        else:
-            raise HTTPException(status_code=400, detail="type 必須是 'charge_point' 或 'card'")
-
-
-
-        # ---------- 新增卡片 ----------
-        elif item_type == "card":
-            card_id = data.get("card_id")
-            if not card_id:
-                raise HTTPException(status_code=400, detail="缺少 card_id")
-
-            try:
-                balance = float(data.get("balance") or 0)
-            except ValueError:
-                raise HTTPException(status_code=400, detail="balance 必須是數字")
-
-            # 🔍 檢查是否已存在
-            cur.execute("SELECT 1 FROM cards WHERE card_id=?", (card_id,))
-            if cur.fetchone():
-                raise HTTPException(status_code=400, detail=f"卡片 {card_id} 已存在")
-
-            # ✅ 新增
-            cur.execute(
-                "INSERT INTO cards (card_id, balance) VALUES (?, ?)",
-                (card_id, balance),
-            )
-            conn.commit()
-            return {"message": f"✅ 已新增卡片：{card_id}，初始餘額 {balance} 元"}
-
-        # ---------- 非法參數 ----------
         else:
             raise HTTPException(status_code=400, detail="type 必須是 'charge_point' 或 'card'")
 
