@@ -1456,6 +1456,43 @@ async def api_latest_status(cp_id: str):
 
 
 
+@app.get("/api/cards/{card_id}/balance")
+def get_card_balance(card_id: str):
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT balance FROM cards WHERE card_id=?", (card_id,))
+        row = cur.fetchone()
+    return {"balance": float(row[0]) if row else 0}
+
+@app.get("/api/charge-points/{cp_id}/current-transaction/start-meter")
+def get_start_meter(cp_id: str):
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("""SELECT meter_start FROM transactions
+                       WHERE charge_point_id=? AND stop_timestamp IS NULL
+                       ORDER BY start_timestamp DESC LIMIT 1""", (cp_id,))
+        row = cur.fetchone()
+    if row:
+        return {"found": True, "meter_start_kwh": float(row[0]) / 1000.0}
+    return {"found": False}
+
+@app.get("/api/charge-points/{cp_id}/current-transaction/summary")
+def get_current_tx_summary(cp_id: str):
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("""SELECT transaction_id, start_timestamp
+                       FROM transactions
+                       WHERE charge_point_id=? AND stop_timestamp IS NULL
+                       ORDER BY start_timestamp DESC LIMIT 1""", (cp_id,))
+        row = cur.fetchone()
+    if row:
+        return {"found": True, "transaction_id": row[0], "start_timestamp": row[1]}
+    return {"found": False}
+
+
+
+
+
 
 
 @app.post("/api/charge-points/{charge_point_id}/start")
