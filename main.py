@@ -1065,7 +1065,7 @@ class ChargePoint(OcppChargePoint):
 
 
 
-                                                # --- 餘額保護：餘額 <= 0 時自動停止充電 ---
+                                                # --- 餘額保護：餘額 <= 0 時自動停止充電（非阻塞版） ---
                                                 if new_balance <= 0.01 and transaction_id not in stop_requested:
                                                     stop_requested.add(transaction_id)
                                                     logging.warning(f"⚡ 餘額不足，自動發送 RemoteStopTransaction | CP={cp_id} | tx={transaction_id}")
@@ -1074,10 +1074,12 @@ class ChargePoint(OcppChargePoint):
                                                     if cp:
                                                         try:
                                                             req = call.RemoteStopTransactionPayload(transaction_id=int(transaction_id))
-                                                            await cp.call(req)
-                                                            logging.info(f"✅ 已發送 RemoteStopTransaction，等待樁端回覆 StopTransaction")
+                                                            # ✅ 使用非同步任務，避免阻塞主事件循環
+                                                            asyncio.create_task(cp.call(req))
+                                                            logging.info(f"✅ 已非同步發送 RemoteStopTransaction，等待樁端回覆 StopTransaction")
                                                         except Exception as e:
                                                             logging.error(f"⚠️ RemoteStopTransaction 發送失敗: {e}")
+
 
 
 
