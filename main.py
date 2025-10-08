@@ -988,13 +988,15 @@ class ChargePoint(OcppChargePoint):
                             except Exception:
                                 pass
 
+
+
                         elif str(meas or "").lower().startswith("energy.active.import"):
                             kwh_raw = _energy_to_kwh(val, unit)
                             if kwh_raw is None:
                                 continue
 
                             meas_l = str(meas or "").lower()
-                            prev_total = (live_status_cache.get(cp_id) or {}).get("energy")
+                            prev_total = (live_status_cache.get(cp_id) or {}).get("estimated_energy")
 
                             if meas_l.endswith(".register") or meas_l == "energy.active.import":
                                 kwh_total = kwh_raw
@@ -1007,12 +1009,19 @@ class ChargePoint(OcppChargePoint):
                             if prev_total is not None:
                                 diff = kwh_total - prev_total
                                 if diff < 0 or diff > 10:
-                                    logging.warning(f"⚠️ 棄用異常能量值：{kwh_total} kWh (diff={diff}，prev={prev_total})")
+                                    logging.warning(
+                                        f"⚠️ 棄用異常能量值：{kwh_total} kWh (diff={diff}，prev={prev_total})"
+                                    )
                                     continue
 
-                            _upsert_live(cp_id, energy=round(kwh_total, 6), timestamp=ts)
+                            # ✅ 改成直接更新 estimated_energy，避免只更新 energy 前端讀不到
+                            _upsert_live(
+                                cp_id,
+                                estimated_energy=round(kwh_total, 6),
+                                timestamp=ts
+                            )
 
-                            # === (A) 原本的「估算但不扣款」仍保留 ===
+                            # === (A) 計算估算金額 ===
                             try:
                                 with sqlite3.connect(DB_FILE) as _c2:
                                     _cur2 = _c2.cursor()
@@ -1036,6 +1045,12 @@ class ChargePoint(OcppChargePoint):
                                         )
                                     else:
                                         id_tag = None
+
+
+
+
+
+
                             except Exception as e:
                                 logging.warning(f"⚠️ 預估金額計算失敗: {e}")
                                 id_tag = None
@@ -1410,19 +1425,15 @@ async def api_live_status(cp_id: str):
         "power": data.get("power", 0),
         "voltage": data.get("voltage", 0),
         "current": data.get("current", 0),
-        "estimated_energy": data.get("energy", 0),         # kWh
+        "estimated_energy": data.get("estimated_energy", 0),   # ✅ 修正
         "estimated_amount": data.get("estimated_amount", 0),
         "price_per_kwh": data.get("price_per_kwh", 0),
     }
 
 
+
 @app.get("/api/charge-points/{cp_id}/latest-energy")
 async def api_latest_energy(cp_id: str):
-    """
-    回傳目前交易的起始電量與累計電量，
-    讓前端顯示「本次已充電量」與「金額」。
-    """
-    # 從資料庫查詢目前進行中的交易起始電表
     with get_conn() as conn:
         cur = conn.cursor()
         cur.execute("""
@@ -1434,12 +1445,14 @@ async def api_latest_energy(cp_id: str):
         start_wh = float(row[0]) if row else 0.0
 
     cur_val = live_status_cache.get(cp_id) or {}
-    current_energy = cur_val.get("energy", 0)    # kWh
+    # ✅ 改成讀 estimated_energy
+    current_energy = cur_val.get("estimated_energy", 0)
     return {
         "meterTotalKWh": current_energy,
         "sessionEnergyKWh": max(0.0, current_energy - (start_wh / 1000.0)),
         "estimatedAmount": cur_val.get("estimated_amount", 0)
     }
+
 
 
 @app.get("/api/charge-points/{cp_id}/latest-status")
