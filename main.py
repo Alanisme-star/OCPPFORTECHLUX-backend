@@ -1209,13 +1209,14 @@ def add_whitelist_or_card(data: dict = Body(...)):
             if cur.fetchone():
                 raise HTTPException(status_code=400, detail=f"充電樁 {charge_point_id} 已存在")
 
-            # ✅ 新增
-            cur.execute(
-                "INSERT INTO charge_points (charge_point_id, name, status) VALUES (?, ?, 'enabled')",
-                (charge_point_id, name),
-            )
-            conn.commit()
-            return {"message": f"✅ 已新增充電樁白名單：{charge_point_id}"}
+    # ✅ 新增並設定 default_card_id
+    cur.execute(
+        "INSERT INTO charge_points (charge_point_id, name, status, default_card_id) VALUES (?, ?, 'enabled', ?)",
+        (charge_point_id, name, charge_point_id),
+    )
+    conn.commit()
+    return {"message": f"✅ 已新增充電樁白名單：{charge_point_id}"}
+
 
         # ---------- 新增卡片 ----------
         elif item_type == "card":
