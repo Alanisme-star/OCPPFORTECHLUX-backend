@@ -1079,19 +1079,35 @@ class ChargePoint(OcppChargePoint):
 
 
 
-                                                # --- 餘額保護：餘額 <= 0 時自動停止充電（安全同步版） ---
-                                                if new_balance <= 0.01 and transaction_id not in stop_requested:
-                                                    stop_requested.add(transaction_id)
-                                                    logging.warning(f"⚡ 餘額不足，自動發送 RemoteStopTransaction | CP={cp_id} | tx={transaction_id}")
+                                                # --- 餘額保護：餘額 <= 0 時自動停止充電（改良版） ---
+                                                tx_id = str(transaction_id)
+                                                if new_balance <= 0.01 and tx_id not in stop_requested:
+                                                    stop_requested.add(tx_id)
+                                                    logging.warning(f"⚡ 餘額不足，自動發送 RemoteStopTransaction | CP={cp_id} | tx={tx_id}")
 
                                                     cp = connected_charge_points.get(cp_id)
                                                     if cp:
                                                         try:
-                                                            req = call.RemoteStopTransaction(transaction_id=int(transaction_id))
-                                                            resp = await cp.call(req)  # ✅ 改為 await 等待回覆
-                                                            logging.info(f"✅ RemoteStopTransaction 已送出並收到回覆: {resp}")
+                                                            # 建立與 /stop API 相同的等待機制
+                                                            loop = asyncio.get_event_loop()
+                                                            fut = loop.create_future()
+                                                            pending_stop_transactions[tx_id] = fut
+
+                                                            req = call.RemoteStopTransaction(transaction_id=int(tx_id))
+                                                            await cp.call(req)  # 發送停充命令
+                                                            logging.info(f"✅ 已送出 RemoteStopTransaction，等待 StopTransaction 回覆…")
+
+                                                            try:
+                                                                await asyncio.wait_for(fut, timeout=10)
+                                                                logging.info(f"✅ 自動停充成功：tx={tx_id}")
+                                                            except asyncio.TimeoutError:
+                                                                logging.warning(f"⚠️ 自動停充等待 StopTransaction 超時 tx={tx_id}")
+
                                                         except Exception as e:
                                                             logging.error(f"⚠️ RemoteStopTransaction 發送失敗: {e}")
+                                                        finally:
+                                                            pending_stop_transactions.pop(tx_id, None)
+
 
 
 
