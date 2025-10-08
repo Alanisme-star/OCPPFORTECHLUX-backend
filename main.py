@@ -1182,16 +1182,12 @@ def list_whitelist_and_cards():
         cards = [{"card_id": r[0], "balance": r[1]} for r in cur.fetchall()]
     return {"charge_points": charge_points, "cards": cards}
 
+
 @app.post("/api/whitelist-manager/add")
 def add_whitelist_or_card(data: dict = Body(...)):
-    """
-    ✅ 修正：
-    - 保證 charge_point 與卡片新增都在同一個 DB transaction 內完成
-    - 新增充電樁時，同步建立一張綁定的卡片，並依照 balance 參數設定初始餘額
-    """
     item_type = data.get("type")
     if not item_type:
-        raise HTTPException(status_code=400, detail="缺少 type 參數，必須是 'charge_point' 或 'card'")
+        raise HTTPException(status_code=400, detail="缺少 type 參數")
 
     with get_conn() as conn:
         cur = conn.cursor()
@@ -1202,28 +1198,36 @@ def add_whitelist_or_card(data: dict = Body(...)):
             if not charge_point_id:
                 raise HTTPException(status_code=400, detail="缺少 charge_point_id")
 
-            name = data.get("name") or charge_point_id
+            # ✅ 改為使用前端傳入的 card_id
+            card_id = data.get("card_id") or charge_point_id
             try:
                 init_balance = float(data.get("balance") or 0)
             except ValueError:
                 init_balance = 0
 
+            name = data.get("name") or charge_point_id
+
+            # 檢查是否已有同名充電樁
             cur.execute("SELECT 1 FROM charge_points WHERE charge_point_id=?", (charge_point_id,))
             if cur.fetchone():
                 raise HTTPException(status_code=400, detail=f"充電樁 {charge_point_id} 已存在")
 
+            # 建立充電樁並設定 default_card_id
             cur.execute(
                 "INSERT INTO charge_points (charge_point_id, name, status, default_card_id) VALUES (?, ?, 'enabled', ?)",
-                (charge_point_id, name, charge_point_id),
+                (charge_point_id, name, card_id),
             )
-            cur.execute("SELECT 1 FROM cards WHERE card_id=?", (charge_point_id,))
+
+            # 如果該卡片不存在則建立並設定初始餘額
+            cur.execute("SELECT 1 FROM cards WHERE card_id=?", (card_id,))
             if not cur.fetchone():
                 cur.execute(
                     "INSERT INTO cards (card_id, balance) VALUES (?, ?)",
-                    (charge_point_id, init_balance),
+                    (card_id, init_balance),
                 )
+
             conn.commit()
-            return {"message": f"✅ 已新增充電樁 {charge_point_id}，並建立初始餘額 {init_balance} 元的卡片"}
+            return {"message": f"✅ 已新增充電樁 {charge_point_id}，並建立卡片 {card_id}，初始餘額 {init_balance} 元"}
 
         # ---------- 新增卡片 ----------
         elif item_type == "card":
@@ -1249,6 +1253,7 @@ def add_whitelist_or_card(data: dict = Body(...)):
 
         else:
             raise HTTPException(status_code=400, detail="type 必須是 'charge_point' 或 'card'")
+
 
 
 @app.delete("/api/whitelist-manager/delete")
