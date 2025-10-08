@@ -700,10 +700,11 @@ class ChargePoint(OcppChargePoint):
             cursor.execute("SELECT balance FROM cards WHERE card_id = ?", (id_tag,))
             card = cursor.fetchone()
             if not card:
-                logging.info(f"🟢【修正】卡片 {id_tag} 不存在，系統自動建立（餘額=0）")
-                cursor.execute("INSERT INTO cards (card_id, balance) VALUES (?, ?)", (id_tag, 0.0))
-                conn.commit()
-                balance = 0.0
+                logging.warning(f"❌ StartTransaction 被拒：卡片 {id_tag} 不在系統內")
+                return call_result.StartTransactionPayload(
+                    transaction_id=0,
+                    id_tag_info={"status": "Invalid"}
+                )
             else:
                 balance = float(card[0] or 0)
 
