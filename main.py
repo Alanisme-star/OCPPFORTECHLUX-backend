@@ -1397,6 +1397,67 @@ async def stop_transaction_by_charge_point(charge_point_id: str):
         pending_stop_transactions.pop(str(transaction_id), None)
 
 
+
+# ------------------------------------------------------------
+# 🆕 補上前端需要的即時狀態 API
+# ------------------------------------------------------------
+
+@app.get("/api/charge-points/{cp_id}/live-status")
+async def api_live_status(cp_id: str):
+    """回傳充電樁即時功率/電壓/電流/累計電量/即時計費金額"""
+    data = live_status_cache.get(cp_id) or {}
+    return {
+        "power": data.get("power", 0),
+        "voltage": data.get("voltage", 0),
+        "current": data.get("current", 0),
+        "estimated_energy": data.get("energy", 0),         # kWh
+        "estimated_amount": data.get("estimated_amount", 0),
+        "price_per_kwh": data.get("price_per_kwh", 0),
+    }
+
+
+@app.get("/api/charge-points/{cp_id}/latest-energy")
+async def api_latest_energy(cp_id: str):
+    """
+    回傳目前交易的起始電量與累計電量，
+    讓前端顯示「本次已充電量」與「金額」。
+    """
+    # 從資料庫查詢目前進行中的交易起始電表
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT meter_start FROM transactions
+            WHERE charge_point_id=? AND stop_timestamp IS NULL
+            ORDER BY start_timestamp DESC LIMIT 1
+        """, (cp_id,))
+        row = cur.fetchone()
+        start_wh = float(row[0]) if row else 0.0
+
+    cur_val = live_status_cache.get(cp_id) or {}
+    current_energy = cur_val.get("energy", 0)    # kWh
+    return {
+        "meterTotalKWh": current_energy,
+        "sessionEnergyKWh": max(0.0, current_energy - (start_wh / 1000.0)),
+        "estimatedAmount": cur_val.get("estimated_amount", 0)
+    }
+
+
+@app.get("/api/charge-points/{cp_id}/latest-status")
+async def api_latest_status(cp_id: str):
+    """
+    回傳充電樁最新狀態字串（例如 Available / Charging / Finishing）
+    """
+    cur = live_status_cache.get(cp_id) or {}
+    status_info = charging_point_status.get(cp_id, {})
+    return {
+        "status": status_info.get("status", "Unknown"),
+        "timestamp": cur.get("timestamp", datetime.utcnow().isoformat())
+    }
+
+
+
+
+
 @app.post("/api/charge-points/{charge_point_id}/start")
 async def start_transaction_by_charge_point(charge_point_id: str, data: dict = Body(...)):
     id_tag = data.get("idTag")
