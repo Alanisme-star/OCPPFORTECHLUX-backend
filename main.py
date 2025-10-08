@@ -1065,15 +1065,19 @@ class ChargePoint(OcppChargePoint):
 
 
 
-                                                # 🔥 新增：後端保護 — 餘額 <=0 時立即下達停止充電
-                                                if new_balance <= 0.01:
-                                                    logging.warning(f"⚡ 餘額不足，自動停止充電 | CP={cp_id} | tx={transaction_id}")
+                                                # --- 餘額保護：餘額 <= 0 時自動停止充電 ---
+                                                if new_balance <= 0.01 and transaction_id not in stop_requested:
+                                                    stop_requested.add(transaction_id)
+                                                    logging.warning(f"⚡ 餘額不足，自動發送 RemoteStopTransaction | CP={cp_id} | tx={transaction_id}")
+
                                                     cp = connected_charge_points.get(cp_id)
                                                     if cp:
                                                         try:
-                                                            await cp.send_stop_transaction(transaction_id)
+                                                            req = call.RemoteStopTransactionPayload(transaction_id=int(transaction_id))
+                                                            await cp.call(req)
+                                                            logging.info(f"✅ 已發送 RemoteStopTransaction，等待樁端回覆 StopTransaction")
                                                         except Exception as e:
-                                                            logging.error(f"⚠️ 自動停止充電失敗: {e}")
+                                                            logging.error(f"⚠️ RemoteStopTransaction 發送失敗: {e}")
 
 
 
