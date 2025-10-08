@@ -1431,13 +1431,14 @@ async def api_live_status(cp_id: str):
     }
 
 
-# === 新增即時狀態查詢 API ===
-@app.get("/api/live-status/{cp_id}")
+
+# === 新增：即時狀態查詢 API ===
+@app.get("/api/charge-points/{cp_id}/live-status")
 def get_live_status(cp_id: str):
     cp_id = _normalize_cp_id(cp_id)
     data = live_status_cache.get(cp_id)
     if not data:
-        raise HTTPException(status_code=404, detail=f"⚠️ 找不到即時資料，可能該充電樁尚未送過 MeterValues")
+        raise HTTPException(status_code=404, detail="⚠️ 找不到即時資料，可能該充電樁尚未送過 MeterValues")
     return data
 
 
