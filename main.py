@@ -152,6 +152,9 @@ def _upsert_live(cp_id: str, **kv):
 
 
 
+from fastapi import WebSocket, WebSocketDisconnect
+
+
 async def _accept_or_reject_ws(websocket: WebSocket, raw_cp_id: str):
     # 標準化 CPID
     cp_id = _normalize_cp_id(raw_cp_id)
@@ -482,6 +485,7 @@ class ChargePoint(OcppChargePoint):
 
     async def send_stop_transaction(self, transaction_id):
         import sqlite3
+        from datetime import datetime, timezone
 
         # 讀取交易資訊
         with sqlite3.connect(DB_FILE) as conn:
@@ -657,11 +661,6 @@ class ChargePoint(OcppChargePoint):
 
     @on(Action.StartTransaction)
     async def on_start_transaction(self, connector_id, id_tag, meter_start, timestamp, **kwargs):
-
-        # ⭐ 新增：確保新的交易前先清除舊的停充旗標
-        stop_requested.discard(str(id_tag))
-        stop_requested.discard(id_tag)
-
         with sqlite3.connect(DB_FILE) as conn:
             cursor = conn.cursor()
 
@@ -700,11 +699,10 @@ class ChargePoint(OcppChargePoint):
             cursor.execute("SELECT balance FROM cards WHERE card_id = ?", (id_tag,))
             card = cursor.fetchone()
             if not card:
-                logging.warning(f"❌ StartTransaction 被拒：卡片 {id_tag} 不在系統內")
-                return call_result.StartTransactionPayload(
-                    transaction_id=0,
-                    id_tag_info={"status": "Invalid"}
-                )
+                logging.info(f"🟢【修正】卡片 {id_tag} 不存在，系統自動建立（餘額=0）")
+                cursor.execute("INSERT INTO cards (card_id, balance) VALUES (?, ?)", (id_tag, 0.0))
+                conn.commit()
+                balance = 0.0
             else:
                 balance = float(card[0] or 0)
 
@@ -865,25 +863,12 @@ class ChargePoint(OcppChargePoint):
             }
             logging.debug(f"🔍 [DEBUG] StopTransaction 後快取: {live_status_cache.get(cp_id)}")
 
-            # ⭐⭐ 新增：通知 /stop API 等待的 Future 完成 + 清理旗標
-            try:
-                fut = pending_stop_transactions.pop(str(transaction_id), None)
-                if fut and not fut.done():
-                    fut.set_result({"transaction_id": transaction_id, "timestamp": stop_ts})
-            except Exception:
-                pass
-
-            try:
-                stop_requested.discard(str(transaction_id))
-                stop_requested.discard(transaction_id)
-            except Exception:
-                pass
-
             return call_result.StopTransactionPayload()
 
         except Exception as e:
             logging.exception(f"🔴 StopTransaction 發生錯誤：{e}")
             return call_result.StopTransactionPayload()
+
 
 
 
@@ -988,15 +973,13 @@ class ChargePoint(OcppChargePoint):
                             except Exception:
                                 pass
 
-
-
                         elif str(meas or "").lower().startswith("energy.active.import"):
                             kwh_raw = _energy_to_kwh(val, unit)
                             if kwh_raw is None:
                                 continue
 
                             meas_l = str(meas or "").lower()
-                            prev_total = (live_status_cache.get(cp_id) or {}).get("estimated_energy")
+                            prev_total = (live_status_cache.get(cp_id) or {}).get("energy")
 
                             if meas_l.endswith(".register") or meas_l == "energy.active.import":
                                 kwh_total = kwh_raw
@@ -1009,19 +992,12 @@ class ChargePoint(OcppChargePoint):
                             if prev_total is not None:
                                 diff = kwh_total - prev_total
                                 if diff < 0 or diff > 10:
-                                    logging.warning(
-                                        f"⚠️ 棄用異常能量值：{kwh_total} kWh (diff={diff}，prev={prev_total})"
-                                    )
+                                    logging.warning(f"⚠️ 棄用異常能量值：{kwh_total} kWh (diff={diff}，prev={prev_total})")
                                     continue
 
-                            # ✅ 改成直接更新 estimated_energy，避免只更新 energy 前端讀不到
-                            _upsert_live(
-                                cp_id,
-                                estimated_energy=round(kwh_total, 6),
-                                timestamp=ts
-                            )
+                            _upsert_live(cp_id, energy=round(kwh_total, 6), timestamp=ts)
 
-                            # === (A) 計算估算金額 ===
+                            # === (A) 原本的「估算但不扣款」仍保留 ===
                             try:
                                 with sqlite3.connect(DB_FILE) as _c2:
                                     _cur2 = _c2.cursor()
@@ -1045,12 +1021,6 @@ class ChargePoint(OcppChargePoint):
                                         )
                                     else:
                                         id_tag = None
-
-
-
-
-
-
                             except Exception as e:
                                 logging.warning(f"⚠️ 預估金額計算失敗: {e}")
                                 id_tag = None
@@ -1095,37 +1065,15 @@ class ChargePoint(OcppChargePoint):
 
 
 
-                                                # --- 餘額保護：餘額 <= 0 時自動停止充電（改良版） ---
-                                                tx_id = str(transaction_id)
-                                                if new_balance <= 0.01 and tx_id not in stop_requested:
-                                                    stop_requested.add(tx_id)
-                                                    logging.warning(f"⚡ 餘額不足，自動發送 RemoteStopTransaction | CP={cp_id} | tx={tx_id}")
-
+                                                # 🔥 新增：後端保護 — 餘額 <=0 時立即下達停止充電
+                                                if new_balance <= 0.01:
+                                                    logging.warning(f"⚡ 餘額不足，自動停止充電 | CP={cp_id} | tx={transaction_id}")
                                                     cp = connected_charge_points.get(cp_id)
                                                     if cp:
                                                         try:
-                                                            # 建立與 /stop API 相同的等待機制
-                                                            loop = asyncio.get_event_loop()
-                                                            fut = loop.create_future()
-                                                            pending_stop_transactions[tx_id] = fut
-
-                                                            req = call.RemoteStopTransaction(transaction_id=int(tx_id))
-                                                            await cp.call(req)  # 發送停充命令
-                                                            logging.info(f"✅ 已送出 RemoteStopTransaction，等待 StopTransaction 回覆…")
-
-                                                            try:
-                                                                await asyncio.wait_for(fut, timeout=10)
-                                                                logging.info(f"✅ 自動停充成功：tx={tx_id}")
-                                                            except asyncio.TimeoutError:
-                                                                logging.warning(f"⚠️ 自動停充等待 StopTransaction 超時 tx={tx_id}")
-
+                                                            await cp.send_stop_transaction(transaction_id)
                                                         except Exception as e:
-                                                            logging.error(f"⚠️ RemoteStopTransaction 發送失敗: {e}")
-                                                        finally:
-                                                            pending_stop_transactions.pop(tx_id, None)
-
-
-
+                                                            logging.error(f"⚠️ 自動停止充電失敗: {e}")
 
 
 
@@ -1182,6 +1130,63 @@ class ChargePoint(OcppChargePoint):
         return call_result.RemoteStopTransactionPayload(status="Accepted")
 
 
+@app.post("/api/debug/force-add-charge-point")
+def force_add_charge_point(
+    charge_point_id: str = "TW*MSI*E000100",
+    name: str = "MSI充電樁",
+    card_id: str = "6678B3EB",
+    initial_balance: float = 100.0
+):
+    """
+    Debug 用 API：強制新增充電樁並綁定預設卡片。
+    狀態改為 'Available' 以符合 OCPP 常見狀態。
+    """
+    # 確保為數值
+    try:
+        initial_balance = float(initial_balance)
+    except Exception:
+        initial_balance = 0.0
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+
+        # 1) 充電樁：若已存在就更新名稱/狀態/綁定卡
+        cur.execute(
+            """
+            INSERT INTO charge_points (charge_point_id, name, status, default_card_id)
+            VALUES (?, ?, 'Available', ?)
+            ON CONFLICT(charge_point_id) DO UPDATE SET
+              name=excluded.name,
+              status='Available',
+              default_card_id=excluded.default_card_id
+            """,
+            (charge_point_id, name, card_id),
+        )
+
+        # 2) 卡片：若已存在就更新餘額為此次指定的初始餘額
+        cur.execute(
+            """
+            INSERT INTO cards (card_id, balance)
+            VALUES (?, ?)
+            ON CONFLICT(card_id) DO UPDATE SET
+              balance=excluded.balance
+            """,
+            (card_id, initial_balance)
+        )
+
+        conn.commit()
+
+    return {
+        "message": f"已新增或更新白名單與卡片: {charge_point_id}",
+        "charge_point_id": charge_point_id,
+        "name": name,
+        "card_id": card_id,
+        "balance": initial_balance
+    }
+
+
+
+
 
 # ============================================================
 # 🆕 新增整合管理 API：WhitelistManager
@@ -1197,107 +1202,25 @@ def list_whitelist_and_cards():
         cards = [{"card_id": r[0], "balance": r[1]} for r in cur.fetchall()]
     return {"charge_points": charge_points, "cards": cards}
 
-
 @app.post("/api/whitelist-manager/add")
 def add_whitelist_or_card(data: dict = Body(...)):
-    """
-    新增白名單/卡片（一次完成對應）
-    - type == "charge_point": 同時建立充電樁與預設卡片，並把 balance 寫入 cards
-    - type == "card": 只建卡片
-    """
     item_type = data.get("type")
-    if not item_type:
-        raise HTTPException(status_code=400, detail="缺少 type 參數（charge_point 或 card）")
-
     with get_conn() as conn:
         cur = conn.cursor()
-
-        # ---------- 新增充電樁（同時建立卡片並對應） ----------
         if item_type == "charge_point":
             charge_point_id = data.get("charge_point_id")
-            if not charge_point_id:
-                raise HTTPException(status_code=400, detail="缺少 charge_point_id")
-
-            name = (data.get("name") or charge_point_id).strip()
-            # 這裡很關鍵：使用前端傳進來的 card_id（若沒傳才退回用充電樁 id）
-            card_id = (data.get("card_id") or charge_point_id).strip()
-            try:
-                init_balance = float(data.get("balance") or 0)
-            except ValueError:
-                init_balance = 0
-
-            # 不允許重複
-            cur.execute("SELECT 1 FROM charge_points WHERE charge_point_id=?", (charge_point_id,))
-            if cur.fetchone():
-                raise HTTPException(status_code=400, detail=f"充電樁 {charge_point_id} 已存在")
-
-            # 建立充電樁，default_card_id 一定等於 card_id（前端傳進來的）
-            cur.execute(
-                "INSERT INTO charge_points (charge_point_id, name, status, default_card_id) VALUES (?, ?, 'enabled', ?)",
-                (charge_point_id, name, card_id),
-            )
-
-            # 若卡片不存在則建立（使用同一個 card_id）
-            cur.execute("SELECT 1 FROM cards WHERE card_id=?", (card_id,))
-            if not cur.fetchone():
-                cur.execute("INSERT INTO cards (card_id, balance) VALUES (?, ?)", (card_id, init_balance))
-
+            name = data.get("name") or charge_point_id
+            cur.execute("INSERT OR IGNORE INTO charge_points (charge_point_id, name, status) VALUES (?, ?, 'enabled')", (charge_point_id, name))
             conn.commit()
-            return {
-                "message": f"✅ 已新增充電樁 {charge_point_id}，預設卡片 {card_id}，初始餘額 {init_balance} 元"
-            }
-
-        # ---------- 單獨新增卡片 ----------
+            return {"message": f"✅ 已新增充電樁白名單：{charge_point_id}"}
         elif item_type == "card":
             card_id = data.get("card_id")
-            if not card_id:
-                raise HTTPException(status_code=400, detail="缺少 card_id")
-            try:
-                balance = float(data.get("balance") or 0)
-            except ValueError:
-                raise HTTPException(status_code=400, detail="balance 必須是數字")
-
-            cur.execute("SELECT 1 FROM cards WHERE card_id=?", (card_id,))
-            if cur.fetchone():
-                raise HTTPException(status_code=400, detail=f"卡片 {card_id} 已存在")
-
-            cur.execute("INSERT INTO cards (card_id, balance) VALUES (?, ?)", (card_id, balance))
+            balance = float(data.get("balance") or 0)
+            cur.execute("INSERT OR IGNORE INTO cards (card_id, balance) VALUES (?, ?)", (card_id, balance))
             conn.commit()
             return {"message": f"✅ 已新增卡片：{card_id}，初始餘額 {balance} 元"}
-
         else:
             raise HTTPException(status_code=400, detail="type 必須是 'charge_point' 或 'card'")
-
-
-# 建議的查詢 API（確保 JOIN 正確）
-@app.get("/api/whitelist/with-cards")
-def get_whitelist_with_cards():
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT
-                cp.charge_point_id,
-                cp.name,
-                cp.status,
-                cp.default_card_id AS card_id,
-                IFNULL(c.balance, 0) AS balance
-            FROM charge_points cp
-            LEFT JOIN cards c ON c.card_id = cp.default_card_id
-            ORDER BY cp.charge_point_id
-        """)
-        rows = cur.fetchall()
-        return [
-            {
-                "charge_point_id": r[0],
-                "name": r[1],
-                "status": r[2],
-                "card_id": r[3],
-                "balance": float(r[4] or 0),
-            }
-            for r in rows
-        ]
-
-
 
 @app.delete("/api/whitelist-manager/delete")
 def delete_whitelist_or_card(item_type: str = Query(...), id_value: str = Query(...)):
@@ -1355,7 +1278,11 @@ def get_whitelist_with_cards():
         for r in rows
     ]
 
-# ✅ 唯一正式版：支援 OCPP RemoteStopTransaction + 等待 StopTransaction 完成
+
+
+
+from fastapi import HTTPException
+
 @app.post("/api/charge-points/{charge_point_id}/stop")
 async def stop_transaction_by_charge_point(charge_point_id: str):
     # ← 先正規化，處理星號與 URL 編碼
@@ -1395,8 +1322,7 @@ async def stop_transaction_by_charge_point(charge_point_id: str):
     print(f"🟢【API呼叫】發送 RemoteStopTransaction 給充電樁")
     print(f"🟢【API呼叫】即將送出 RemoteStopTransaction | charge_point_id={charge_point_id} | transaction_id={transaction_id}")
     # 送 RemoteStopTransaction（使用 Payload）
-    # req = call.RemoteStopTransactionPayload(transaction_id=int(transaction_id)) 先隱藏
-    req = call.RemoteStopTransaction(transaction_id=int(transaction_id))
+    req = call.RemoteStopTransactionPayload(transaction_id=int(transaction_id))
     resp = await cp.call(req)
     print(f"🟢【API回應】呼叫 RemoteStopTransaction 完成，resp={resp}")
 
@@ -1410,113 +1336,6 @@ async def stop_transaction_by_charge_point(charge_point_id: str):
         return JSONResponse(status_code=504, content={"message": "等待充電樁停止回覆逾時 (StopTransaction timeout)"})
     finally:
         pending_stop_transactions.pop(str(transaction_id), None)
-
-
-
-# ------------------------------------------------------------
-# 🆕 補上前端需要的即時狀態 API
-# ------------------------------------------------------------
-
-@app.get("/api/charge-points/{cp_id}/live-status")
-async def api_live_status(cp_id: str):
-    """回傳充電樁即時功率/電壓/電流/累計電量/即時計費金額"""
-    data = live_status_cache.get(cp_id) or {}
-    return {
-        "power": data.get("power", 0),
-        "voltage": data.get("voltage", 0),
-        "current": data.get("current", 0),
-        "estimated_energy": data.get("estimated_energy", 0),   # ✅ 修正
-        "estimated_amount": data.get("estimated_amount", 0),
-        "price_per_kwh": data.get("price_per_kwh", 0),
-    }
-
-
-
-# === 新增：即時狀態查詢 API ===
-@app.get("/api/charge-points/{cp_id}/live-status")
-def get_live_status(cp_id: str):
-    cp_id = _normalize_cp_id(cp_id)
-    data = live_status_cache.get(cp_id)
-    if not data:
-        raise HTTPException(status_code=404, detail="⚠️ 找不到即時資料，可能該充電樁尚未送過 MeterValues")
-    return data
-
-
-
-@app.get("/api/charge-points/{cp_id}/latest-energy")
-async def api_latest_energy(cp_id: str):
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT meter_start FROM transactions
-            WHERE charge_point_id=? AND stop_timestamp IS NULL
-            ORDER BY start_timestamp DESC LIMIT 1
-        """, (cp_id,))
-        row = cur.fetchone()
-        start_wh = float(row[0]) if row else 0.0
-
-    cur_val = live_status_cache.get(cp_id) or {}
-    # ✅ 改成讀 estimated_energy
-    current_energy = cur_val.get("estimated_energy", 0)
-    return {
-        "meterTotalKWh": current_energy,
-        "sessionEnergyKWh": max(0.0, current_energy - (start_wh / 1000.0)),
-        "estimatedAmount": cur_val.get("estimated_amount", 0)
-    }
-
-
-
-@app.get("/api/charge-points/{cp_id}/latest-status")
-async def api_latest_status(cp_id: str):
-    """
-    回傳充電樁最新狀態字串（例如 Available / Charging / Finishing）
-    """
-    cur = live_status_cache.get(cp_id) or {}
-    status_info = charging_point_status.get(cp_id, {})
-    return {
-        "status": status_info.get("status", "Unknown"),
-        "timestamp": cur.get("timestamp", datetime.utcnow().isoformat())
-    }
-
-
-
-@app.get("/api/cards/{card_id}/balance")
-def get_card_balance(card_id: str):
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT balance FROM cards WHERE card_id=?", (card_id,))
-        row = cur.fetchone()
-    return {"balance": float(row[0]) if row else 0}
-
-@app.get("/api/charge-points/{cp_id}/current-transaction/start-meter")
-def get_start_meter(cp_id: str):
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("""SELECT meter_start FROM transactions
-                       WHERE charge_point_id=? AND stop_timestamp IS NULL
-                       ORDER BY start_timestamp DESC LIMIT 1""", (cp_id,))
-        row = cur.fetchone()
-    if row:
-        return {"found": True, "meter_start_kwh": float(row[0]) / 1000.0}
-    return {"found": False}
-
-@app.get("/api/charge-points/{cp_id}/current-transaction/summary")
-def get_current_tx_summary(cp_id: str):
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("""SELECT transaction_id, start_timestamp
-                       FROM transactions
-                       WHERE charge_point_id=? AND stop_timestamp IS NULL
-                       ORDER BY start_timestamp DESC LIMIT 1""", (cp_id,))
-        row = cur.fetchone()
-    if row:
-        return {"found": True, "transaction_id": row[0], "start_timestamp": row[1]}
-    return {"found": False}
-
-
-
-
-
 
 
 @app.post("/api/charge-points/{charge_point_id}/start")
@@ -1541,6 +1360,8 @@ async def start_transaction_by_charge_point(charge_point_id: str, data: dict = B
     print(f"🟢【API】回應 RemoteStartTransaction: {response}")
     return {"message": "已送出啟動充電請求", "response": response}
 
+
+from fastapi import FastAPI, HTTPException
 
 # 假設這裡有一個全域變數在存充電樁即時數據
 latest_power_data = {}
@@ -2157,6 +1978,7 @@ def get_card_history(card_id: str, limit: int = 20):
 
 # === 每日電價 API ===
 
+from fastapi import Query
 
 @app.get("/api/daily-pricing")
 def get_daily_pricing(date: str = Query(..., description="查詢的日期 YYYY-MM-DD")):
@@ -2684,7 +2506,7 @@ async def get_summary(group_by: str = Query("day")):
 
 
 
-
+from fastapi.responses import JSONResponse
 
 import sqlite3
 import logging
@@ -3182,6 +3004,8 @@ async def get_daily_by_chargepoint_range(
 
 
 
+from datetime import datetime, timedelta, timezone
+from fastapi import Query
 
 TZ_TAIPEI = timezone(timedelta(hours=8))
 
@@ -3676,6 +3500,66 @@ async def duplicate_by_rule(data: dict = Body(...)):
 
 
 
+from fastapi import HTTPException
+
+@app.post("/api/charge-points/{charge_point_id}/stop")
+async def stop_transaction_by_charge_point(charge_point_id: str):
+    print(f"🟢【API呼叫】收到停止充電API請求, charge_point_id = {charge_point_id}")
+
+    norm_id = _normalize_cp_id(charge_point_id)
+    cp = connected_charge_points.get(norm_id)
+    if not cp:
+        print(f"🔴【API異常】找不到連線中的充電樁：{norm_id}")
+        raise HTTPException(
+            status_code=404,
+            detail=f"⚠️ 找不到連線中的充電樁：{norm_id}",
+            headers={"X-Connected-CPs": str(list(connected_charge_points.keys()))}
+        )
+
+    # 取進行中交易
+    with sqlite3.connect(DB_FILE) as lconn:
+        c = lconn.cursor()
+        c.execute("""
+            SELECT transaction_id FROM transactions
+            WHERE charge_point_id = ? AND stop_timestamp IS NULL
+            ORDER BY start_timestamp DESC LIMIT 1
+        """, (norm_id,))
+        r = c.fetchone()
+        if not r:
+            print(f"🔴【API異常】無進行中交易 charge_point_id={norm_id}")
+            raise HTTPException(status_code=400, detail="⚠️ 無進行中交易")
+        transaction_id = int(r[0])
+
+    # 等待 StopTransaction 回覆
+    loop = asyncio.get_event_loop()
+    fut = loop.create_future()
+    pending_stop_transactions[str(transaction_id)] = fut
+
+    # 發送 RemoteStopTransaction（新版類名，無 Payload）
+    print(f"🟢【API呼叫】發送 RemoteStopTransaction 給充電樁")
+    req = call.RemoteStopTransaction(transaction_id=transaction_id)
+    resp = await cp.call(req)
+    print(f"🟢【API回應】呼叫 RemoteStopTransaction 完成，resp={resp}")
+
+    try:
+        stop_result = await asyncio.wait_for(fut, timeout=10)
+        print(f"🟢【API回應】StopTransaction 完成: {stop_result}")
+        return {"message": "充電已停止", "transaction_id": transaction_id, "stop_result": stop_result}
+    except asyncio.TimeoutError:
+        print(f"🔴【API異常】等待 StopTransaction 超時")
+        return JSONResponse(status_code=504, content={"message": "等待充電樁停止回覆逾時 (StopTransaction timeout)"})
+    finally:
+        pending_stop_transactions.pop(str(transaction_id), None)
+
+
+
+
+
+
+
+
+
+
 @app.get("/debug/charge-points")
 async def debug_ids():
     cursor.execute("SELECT charge_point_id FROM charge_points")
@@ -3685,8 +3569,58 @@ async def debug_ids():
 def debug_connected_cp():
     return list(connected_charge_points.keys())
 
+@app.post("/api/charge-points/{charge_point_id}/stop")
+async def stop_transaction_by_charge_point(charge_point_id: str):
+    print(f"🟢【API呼叫】收到停止充電API請求, charge_point_id = {charge_point_id}")
+    cp = connected_charge_points.get(charge_point_id)
+
+    if not cp:
+        print(f"🔴【API異常】找不到連線中的充電樁：{charge_point_id}")
+        raise HTTPException(
+            status_code=404,
+            detail=f"⚠️ 找不到連線中的充電樁：{charge_point_id}",
+            headers={"X-Connected-CPs": str(list(connected_charge_points.keys()))}
+        )
+    # 查詢進行中的 transaction_id
+    with sqlite3.connect(DB_FILE) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT transaction_id FROM transactions
+            WHERE charge_point_id = ? AND stop_timestamp IS NULL
+            ORDER BY start_timestamp DESC LIMIT 1
+        """, (charge_point_id,))
+        row = cursor.fetchone()
+        if not row:
+            print(f"🔴【API異常】無進行中交易 charge_point_id={charge_point_id}")
+            raise HTTPException(status_code=400, detail="⚠️ 無進行中交易")
+        transaction_id = row[0]
+        print(f"🟢【API呼叫】找到進行中交易 transaction_id={transaction_id}")
+
+    # 新增同步等待機制
+    loop = asyncio.get_event_loop()
+    fut = loop.create_future()
+    pending_stop_transactions[str(transaction_id)] = fut
+
+    # 發送 RemoteStopTransaction
+    print(f"🟢【API呼叫】發送 RemoteStopTransaction 給充電樁")
+    req = call.RemoteStopTransaction(transaction_id=transaction_id)
+    resp = await cp.call(req)
+    print(f"🟢【API回應】呼叫 RemoteStopTransaction 完成，resp={resp}")
+
+    # 等待 StopTransaction 被觸發（最多 10 秒）
+    try:
+        stop_result = await asyncio.wait_for(fut, timeout=10)
+        print(f"🟢【API回應】StopTransaction 完成: {stop_result}")
+        return {"message": "充電已停止", "transaction_id": transaction_id, "stop_result": stop_result}
+    except asyncio.TimeoutError:
+        print(f"🔴【API異常】等待 StopTransaction 超時")
+        return JSONResponse(status_code=504, content={"message": "等待充電樁停止回覆逾時 (StopTransaction timeout)"})
+    finally:
+        pending_stop_transactions.pop(str(transaction_id), None)
 
 
+from fastapi import Query
+from fastapi.responses import JSONResponse
 
 @app.get("/api/charging_status")
 async def charging_status(cp_id: str = Query(..., description="Charge Point ID")):
