@@ -1184,23 +1184,67 @@ def list_whitelist_and_cards():
 
 @app.post("/api/whitelist-manager/add")
 def add_whitelist_or_card(data: dict = Body(...)):
+    """
+    ✅ 改良版：白名單與卡片新增 API
+    - 原本使用 INSERT OR IGNORE 會靜默失敗，現在改成「先檢查 → 不允許重複」
+    - 如果已存在會回傳 HTTP 400，前端就能顯示錯誤訊息
+    """
     item_type = data.get("type")
+    if not item_type:
+        raise HTTPException(status_code=400, detail="缺少 type 參數，必須是 'charge_point' 或 'card'")
+
     with get_conn() as conn:
         cur = conn.cursor()
+
+        # ---------- 新增充電樁 ----------
         if item_type == "charge_point":
             charge_point_id = data.get("charge_point_id")
+            if not charge_point_id:
+                raise HTTPException(status_code=400, detail="缺少 charge_point_id")
+
             name = data.get("name") or charge_point_id
-            cur.execute("INSERT OR IGNORE INTO charge_points (charge_point_id, name, status) VALUES (?, ?, 'enabled')", (charge_point_id, name))
+
+            # 🔍 檢查是否已存在
+            cur.execute("SELECT 1 FROM charge_points WHERE charge_point_id=?", (charge_point_id,))
+            if cur.fetchone():
+                raise HTTPException(status_code=400, detail=f"充電樁 {charge_point_id} 已存在")
+
+            # ✅ 新增
+            cur.execute(
+                "INSERT INTO charge_points (charge_point_id, name, status) VALUES (?, ?, 'enabled')",
+                (charge_point_id, name),
+            )
             conn.commit()
             return {"message": f"✅ 已新增充電樁白名單：{charge_point_id}"}
+
+        # ---------- 新增卡片 ----------
         elif item_type == "card":
             card_id = data.get("card_id")
-            balance = float(data.get("balance") or 0)
-            cur.execute("INSERT OR IGNORE INTO cards (card_id, balance) VALUES (?, ?)", (card_id, balance))
+            if not card_id:
+                raise HTTPException(status_code=400, detail="缺少 card_id")
+
+            try:
+                balance = float(data.get("balance") or 0)
+            except ValueError:
+                raise HTTPException(status_code=400, detail="balance 必須是數字")
+
+            # 🔍 檢查是否已存在
+            cur.execute("SELECT 1 FROM cards WHERE card_id=?", (card_id,))
+            if cur.fetchone():
+                raise HTTPException(status_code=400, detail=f"卡片 {card_id} 已存在")
+
+            # ✅ 新增
+            cur.execute(
+                "INSERT INTO cards (card_id, balance) VALUES (?, ?)",
+                (card_id, balance),
+            )
             conn.commit()
             return {"message": f"✅ 已新增卡片：{card_id}，初始餘額 {balance} 元"}
+
+        # ---------- 非法參數 ----------
         else:
             raise HTTPException(status_code=400, detail="type 必須是 'charge_point' 或 'card'")
+
 
 @app.delete("/api/whitelist-manager/delete")
 def delete_whitelist_or_card(item_type: str = Query(...), id_value: str = Query(...)):
