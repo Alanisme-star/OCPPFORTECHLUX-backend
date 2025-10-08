@@ -1073,7 +1073,7 @@ class ChargePoint(OcppChargePoint):
                                                     cp = connected_charge_points.get(cp_id)
                                                     if cp:
                                                         try:
-                                                            req = call.RemoteStopTransactionPayload(transaction_id=int(transaction_id))
+                                                            req = call.RemoteStopTransaction(transaction_id=int(transaction_id))
                                                             resp = await cp.call(req)  # ✅ 改為 await 等待回覆
                                                             logging.info(f"✅ RemoteStopTransaction 已送出並收到回覆: {resp}")
                                                         except Exception as e:
