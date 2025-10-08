@@ -1185,56 +1185,58 @@ def list_whitelist_and_cards():
 
 @app.post("/api/whitelist-manager/add")
 def add_whitelist_or_card(data: dict = Body(...)):
+    """
+    新增白名單/卡片（一次完成對應）
+    - type == "charge_point": 同時建立充電樁與預設卡片，並把 balance 寫入 cards
+    - type == "card": 只建卡片
+    """
     item_type = data.get("type")
     if not item_type:
-        raise HTTPException(status_code=400, detail="缺少 type 參數")
+        raise HTTPException(status_code=400, detail="缺少 type 參數（charge_point 或 card）")
 
     with get_conn() as conn:
         cur = conn.cursor()
 
-        # ---------- 新增充電樁 ----------
+        # ---------- 新增充電樁（同時建立卡片並對應） ----------
         if item_type == "charge_point":
             charge_point_id = data.get("charge_point_id")
             if not charge_point_id:
                 raise HTTPException(status_code=400, detail="缺少 charge_point_id")
 
-            # ✅ 改為使用前端傳入的 card_id
-            card_id = data.get("card_id") or charge_point_id
+            name = (data.get("name") or charge_point_id).strip()
+            # 這裡很關鍵：使用前端傳進來的 card_id（若沒傳才退回用充電樁 id）
+            card_id = (data.get("card_id") or charge_point_id).strip()
             try:
                 init_balance = float(data.get("balance") or 0)
             except ValueError:
                 init_balance = 0
 
-            name = data.get("name") or charge_point_id
-
-            # 檢查是否已有同名充電樁
+            # 不允許重複
             cur.execute("SELECT 1 FROM charge_points WHERE charge_point_id=?", (charge_point_id,))
             if cur.fetchone():
                 raise HTTPException(status_code=400, detail=f"充電樁 {charge_point_id} 已存在")
 
-            # 建立充電樁並設定 default_card_id
+            # 建立充電樁，default_card_id 一定等於 card_id（前端傳進來的）
             cur.execute(
                 "INSERT INTO charge_points (charge_point_id, name, status, default_card_id) VALUES (?, ?, 'enabled', ?)",
                 (charge_point_id, name, card_id),
             )
 
-            # 如果該卡片不存在則建立並設定初始餘額
+            # 若卡片不存在則建立（使用同一個 card_id）
             cur.execute("SELECT 1 FROM cards WHERE card_id=?", (card_id,))
             if not cur.fetchone():
-                cur.execute(
-                    "INSERT INTO cards (card_id, balance) VALUES (?, ?)",
-                    (card_id, init_balance),
-                )
+                cur.execute("INSERT INTO cards (card_id, balance) VALUES (?, ?)", (card_id, init_balance))
 
             conn.commit()
-            return {"message": f"✅ 已新增充電樁 {charge_point_id}，並建立卡片 {card_id}，初始餘額 {init_balance} 元"}
+            return {
+                "message": f"✅ 已新增充電樁 {charge_point_id}，預設卡片 {card_id}，初始餘額 {init_balance} 元"
+            }
 
-        # ---------- 新增卡片 ----------
+        # ---------- 單獨新增卡片 ----------
         elif item_type == "card":
             card_id = data.get("card_id")
             if not card_id:
                 raise HTTPException(status_code=400, detail="缺少 card_id")
-
             try:
                 balance = float(data.get("balance") or 0)
             except ValueError:
@@ -1244,15 +1246,41 @@ def add_whitelist_or_card(data: dict = Body(...)):
             if cur.fetchone():
                 raise HTTPException(status_code=400, detail=f"卡片 {card_id} 已存在")
 
-            cur.execute(
-                "INSERT INTO cards (card_id, balance) VALUES (?, ?)",
-                (card_id, balance),
-            )
+            cur.execute("INSERT INTO cards (card_id, balance) VALUES (?, ?)", (card_id, balance))
             conn.commit()
             return {"message": f"✅ 已新增卡片：{card_id}，初始餘額 {balance} 元"}
 
         else:
             raise HTTPException(status_code=400, detail="type 必須是 'charge_point' 或 'card'")
+
+
+# 建議的查詢 API（確保 JOIN 正確）
+@app.get("/api/whitelist/with-cards")
+def get_whitelist_with_cards():
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT
+                cp.charge_point_id,
+                cp.name,
+                cp.status,
+                cp.default_card_id AS card_id,
+                IFNULL(c.balance, 0) AS balance
+            FROM charge_points cp
+            LEFT JOIN cards c ON c.card_id = cp.default_card_id
+            ORDER BY cp.charge_point_id
+        """)
+        rows = cur.fetchall()
+        return [
+            {
+                "charge_point_id": r[0],
+                "name": r[1],
+                "status": r[2],
+                "card_id": r[3],
+                "balance": float(r[4] or 0),
+            }
+            for r in rows
+        ]
 
 
 
