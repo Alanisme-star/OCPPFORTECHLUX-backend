@@ -1044,9 +1044,10 @@ class ChargePoint(OcppChargePoint):
                                     logging.error(f"❌ 發送 RemoteStopTransaction 失敗: {e}")
                             else:
                                 logging.warning(f"❌ 無法找到充電樁 {cp_id}，停充指令未送出。")
+
             except Exception as e:
                 logging.error(f"⚠️ 餘額自動停充檢查失敗: {e}")
-
+                return call_result.MeterValuesPayload()
 
 
 
