@@ -226,18 +226,20 @@ async def websocket_endpoint(websocket: WebSocket, charge_point_id: str):
             await websocket.close()
         except Exception:
             pass
+
     finally:
-        # --- 連線中斷後自動清除狀態與快取 ---
         norm_id = _normalize_cp_id(charge_point_id)
 
+        # 保留 connected_charge_points，以便 RemoteStopTransaction 能找到對應對象
         if norm_id in connected_charge_points:
-            connected_charge_points.pop(norm_id, None)
-            logging.info(f"🔌 連線已關閉：{norm_id}")
+            logging.info(f"🔌 連線已關閉：{norm_id}（連線物件暫留以便停充）")
+        else:
+            logging.info(f"🔌 連線已關閉：{norm_id}（無對應物件）")
 
-        # ⭐ 新增：清除中斷樁的快取資料，避免下次啟動殘留狀態
+        # ✅ 僅清除即時快取，避免下次啟動殘留數值
         if norm_id in live_status_cache:
             live_status_cache.pop(norm_id, None)
-            logging.info(f"🧹 清除中斷樁的快取資料：{norm_id}")
+            logging.info(f"🧹 清除中斷樁的即時快取資料：{norm_id}")
         else:
             logging.info(f"ℹ️ 無快取可清（可能尚未啟動交易）：{norm_id}")
 
