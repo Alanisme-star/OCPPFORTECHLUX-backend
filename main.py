@@ -263,18 +263,10 @@ CREATE TABLE IF NOT EXISTS charge_points (
     charge_point_id TEXT UNIQUE NOT NULL,
     name TEXT,
     status TEXT,
-    default_card_id TEXT,                   -- ★ 新增：記錄此充電樁預設綁定的卡片
     created_at TEXT DEFAULT CURRENT_TIMESTAMP
 )
 """)
 conn.commit()
-
-# ★ 舊資料表自動補欄位 (避免已有資料庫時需要手動修改)
-cursor.execute("PRAGMA table_info(charge_points)")
-cols = [r[1] for r in cursor.fetchall()]
-if "default_card_id" not in cols:
-    cursor.execute("ALTER TABLE charge_points ADD COLUMN default_card_id TEXT")
-    conn.commit()
 
 # 初始化 connection_logs 表格（如不存在就建立）
 cursor.execute("""
@@ -347,7 +339,7 @@ CREATE TABLE IF NOT EXISTS stop_transactions (
 ''')
 
 
-# ✅ 既有
+# ✅ 加在這裡！
 cursor.execute("""
     CREATE TABLE IF NOT EXISTS payments (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -359,19 +351,9 @@ cursor.execute("""
         paid_at TEXT
     )
 """)
-conn.commit()
 
-# ⭐ 新增：即時扣款進度表（每個 transaction_id 只保留 1 筆）
-cursor.execute("""
-    CREATE TABLE IF NOT EXISTS realtime_deductions (
-        transaction_id TEXT PRIMARY KEY,
-        deducted_kwh REAL DEFAULT 0,
-        deducted_amount REAL DEFAULT 0,
-        updated_at TEXT
-    )
-""")
-conn.commit()
 
+conn.commit()
 
 
 cursor.execute('''
@@ -801,7 +783,7 @@ class ChargePoint(OcppChargePoint):
                 ''', (cp_id, 0, transaction_id, 0.0,
                       "Energy.Active.Import.Register", "kWh", stop_ts))
 
-                # ====== ⭐ 新版：結束時只補扣「未扣的尾段」，並寫入總額到 payments ======
+                # ====== ⭐ 新增：計算電量與扣款 ======
                 _cur.execute("SELECT id_tag, meter_start FROM transactions WHERE transaction_id=?", (transaction_id,))
                 row = _cur.fetchone()
                 if row:
@@ -813,38 +795,24 @@ class ChargePoint(OcppChargePoint):
                     except Exception:
                         used_kwh = 0.0
 
+                    # 查單價
                     unit_price = float(_price_for_timestamp(stop_ts)) if stop_ts else 6.0
                     total_amount = round(used_kwh * unit_price, 2)
 
-                    _cur.execute(
-                        "SELECT deducted_kwh, deducted_amount FROM realtime_deductions WHERE transaction_id=?",
-                        (transaction_id,)
-                    )
-                    rt = _cur.fetchone()
-                    deducted_kwh = float(rt[0]) if rt else 0.0
-                    deducted_amount = float(rt[1]) if rt else 0.0
+                    # 更新卡片餘額
+                    _cur.execute("SELECT balance FROM cards WHERE card_id=?", (id_tag,))
+                    card_row = _cur.fetchone()
+                    if card_row:
+                        old_balance = float(card_row[0] or 0)
+                        new_balance = max(0.0, old_balance - total_amount)
+                        _cur.execute("UPDATE cards SET balance=? WHERE card_id=?", (new_balance, id_tag))
+                        logging.info(f"💳 卡片扣款完成 | idTag={id_tag} | 扣款={total_amount} | 原餘額={old_balance} → 新餘額={new_balance}")
 
-                    remaining_kwh = max(0.0, used_kwh - deducted_kwh)
-                    remaining_fee = round(remaining_kwh * unit_price, 2)
-
-                    if remaining_fee > 0:
-                        _cur.execute("SELECT balance FROM cards WHERE card_id=?", (id_tag,))
-                        card_row = _cur.fetchone()
-                        if card_row:
-                            old_balance = float(card_row[0] or 0)
-                            new_balance = max(0.0, old_balance - remaining_fee)
-                            _cur.execute("UPDATE cards SET balance=? WHERE card_id=?", (new_balance, id_tag))
-                            logging.info(
-                                f"💳 Stop 補扣 | idTag={id_tag} | tx={transaction_id} | "
-                                f"尾段={remaining_kwh:.4f}kWh → {remaining_fee:.2f}元 | {old_balance:.2f}→{new_balance:.2f}"
-                            )
-
-                    _cur.execute("""
+                    # 記錄付款紀錄
+                    _cur.execute('''
                         INSERT INTO payments (transaction_id, base_fee, energy_fee, overuse_fee, total_amount, paid_at)
                         VALUES (?, ?, ?, ?, ?, ?)
-                    """, (transaction_id, 0.0, total_amount, 0.0, total_amount, stop_ts))
-
-                    _cur.execute("DELETE FROM realtime_deductions WHERE transaction_id=?", (transaction_id,))
+                    ''', (transaction_id, 0.0, total_amount, 0.0, total_amount, stop_ts))
 
                 _conn.commit()
                 # ====== ⭐ 新增結束 ======
@@ -973,130 +941,39 @@ class ChargePoint(OcppChargePoint):
                             except Exception:
                                 pass
 
-                        elif str(meas or "").lower().startswith("energy.active.import"):
-                            kwh_raw = _energy_to_kwh(val, unit)
-                            if kwh_raw is None:
-                                continue
-
-                            meas_l = str(meas or "").lower()
-                            prev_total = (live_status_cache.get(cp_id) or {}).get("energy")
-
-                            if meas_l.endswith(".register") or meas_l == "energy.active.import":
-                                kwh_total = kwh_raw
-                            elif meas_l.endswith(".interval"):
-                                base = prev_total if isinstance(prev_total, (int, float)) else 0.0
-                                kwh_total = max(0.0, base + kwh_raw)
-                            else:
-                                kwh_total = kwh_raw
-
-                            if prev_total is not None:
-                                diff = kwh_total - prev_total
-                                if diff < 0 or diff > 10:
-                                    logging.warning(f"⚠️ 棄用異常能量值：{kwh_total} kWh (diff={diff}，prev={prev_total})")
-                                    continue
-
-                            _upsert_live(cp_id, energy=round(kwh_total, 6), timestamp=ts)
-
-                            # === (A) 原本的「估算但不扣款」仍保留 ===
-                            try:
-                                with sqlite3.connect(DB_FILE) as _c2:
-                                    _cur2 = _c2.cursor()
-                                    _cur2.execute(
-                                        "SELECT meter_start, id_tag FROM transactions WHERE transaction_id = ?",
-                                        (transaction_id,)
-                                    )
-                                    row_tx = _cur2.fetchone()
-                                    if row_tx:
-                                        meter_start_wh = float(row_tx[0] or 0)
-                                        id_tag = row_tx[1]
-                                        used_kwh = max(0.0, (kwh_total - (meter_start_wh / 1000.0)))
-                                        unit_price = float(_price_for_timestamp(ts)) if ts else 6.0
-                                        est_amount = round(used_kwh * unit_price, 2)
-                                        _upsert_live(
-                                            cp_id,
-                                            estimated_energy=round(used_kwh, 6),
-                                            estimated_amount=est_amount,
-                                            price_per_kwh=unit_price,
-                                            timestamp=ts
+                        elif meas in ("Energy.Active.Import.Register", "Energy.Active.Import"):
+                            kwh = _energy_to_kwh(val, unit)
+                            if kwh is not None:
+                                # === 過濾異常值：和上一筆比較 ===
+                                prev_energy = (live_status_cache.get(cp_id) or {}).get("energy")
+                                if prev_energy is not None:
+                                    diff = kwh - prev_energy
+                                    if diff < 0 or diff > 10:  # 閾值可調整
+                                        logging.warning(
+                                            f"⚠️ 棄用異常能量值：{kwh} kWh (diff={diff}，prev={prev_energy})"
                                         )
-                                    else:
-                                        id_tag = None
-                            except Exception as e:
-                                logging.warning(f"⚠️ 預估金額計算失敗: {e}")
-                                id_tag = None
+                                        continue
 
-                            # === (B) ⭐ 新增：差額即時扣款（有交易 + 有 id_tag 才做）===
-                            try:
-                                if id_tag:
-                                    with sqlite3.connect(DB_FILE) as _c3:
-                                        _cur3 = _c3.cursor()
-                                        _cur3.execute("""
-                                            CREATE TABLE IF NOT EXISTS realtime_deductions (
-                                                transaction_id TEXT PRIMARY KEY,
-                                                deducted_kwh REAL DEFAULT 0,
-                                                deducted_amount REAL DEFAULT 0,
-                                                updated_at TEXT
-                                            )
-                                        """)
-                                        _cur3.execute(
-                                            "SELECT deducted_kwh, deducted_amount FROM realtime_deductions WHERE transaction_id=?",
-                                            (transaction_id,)
-                                        )
-                                        row = _cur3.fetchone()
-                                        deducted_kwh = float(row[0]) if row else 0.0
-                                        deducted_amount = float(row[1]) if row else 0.0
+                                _upsert_live(cp_id, energy=round(kwh, 6), timestamp=ts)
 
-                                        current_kwh = max(0.0, used_kwh)
-                                        delta_kwh = max(0.0, current_kwh - deducted_kwh)
-
-                                        if delta_kwh > 0.0005:
+                                # 計算用電量與金額
+                                try:
+                                    with sqlite3.connect(DB_FILE) as _c2:
+                                        _cur2 = _c2.cursor()
+                                        _cur2.execute("SELECT meter_start FROM transactions WHERE transaction_id = ?", (transaction_id,))
+                                        row_tx = _cur2.fetchone()
+                                        if row_tx:
+                                            meter_start_wh = float(row_tx[0] or 0)
+                                            used_kwh = max(0.0, (kwh - (meter_start_wh / 1000.0)))
                                             unit_price = float(_price_for_timestamp(ts)) if ts else 6.0
-                                            delta_fee = round(delta_kwh * unit_price, 2)
-                                            _cur3.execute("SELECT balance FROM cards WHERE card_id=?", (id_tag,))
-                                            card_row = _cur3.fetchone()
-                                            if card_row:
-                                                old_balance = float(card_row[0] or 0)
-                                                new_balance = max(0.0, old_balance - delta_fee)
-                                                _cur3.execute("UPDATE cards SET balance=? WHERE card_id=?", (new_balance, id_tag))
-                                                logging.info(
-                                                    f"⚡ 即時扣款 | CP={cp_id} | idTag={id_tag} | tx={transaction_id} | "
-                                                    f"ΔkWh={delta_kwh:.4f} | 扣款={delta_fee:.2f} | {old_balance:.2f}→{new_balance:.2f}"
-                                                )
-
-
-
-                                                # 🔥 新增：後端保護 — 餘額 <=0 時立即下達停止充電
-                                                if new_balance <= 0.01:
-                                                    logging.warning(f"⚡ 餘額不足，自動停止充電 | CP={cp_id} | tx={transaction_id}")
-                                                    cp = connected_charge_points.get(cp_id)
-                                                    if cp:
-                                                        try:
-                                                            await cp.send_stop_transaction(transaction_id)
-                                                        except Exception as e:
-                                                            logging.error(f"⚠️ 自動停止充電失敗: {e}")
-
-
-
-                                            new_deducted_kwh = current_kwh
-                                            new_deducted_amount = round(deducted_amount + delta_fee, 2)
-                                            if row:
-                                                _cur3.execute("""
-                                                    UPDATE realtime_deductions
-                                                       SET deducted_kwh=?,
-                                                           deducted_amount=?,
-                                                           updated_at=?
-                                                     WHERE transaction_id=?
-                                                """, (new_deducted_kwh, new_deducted_amount, datetime.utcnow().isoformat(), transaction_id))
-                                            else:
-                                                _cur3.execute("""
-                                                    INSERT INTO realtime_deductions (transaction_id, deducted_kwh, deducted_amount, updated_at)
-                                                    VALUES (?, ?, ?, ?)
-                                                """, (transaction_id, new_deducted_kwh, new_deducted_amount, datetime.utcnow().isoformat()))
-                                        _c3.commit()
-                            except Exception as e:
-                                logging.warning(f"⚠️ 即時扣款失敗: {e}")
-
-
+                                            est_amount = round(used_kwh * unit_price, 2)
+                                            _upsert_live(cp_id,
+                                                         estimated_energy=round(used_kwh, 6),
+                                                         estimated_amount=est_amount,
+                                                         price_per_kwh=unit_price,
+                                                         timestamp=ts)
+                                except Exception as e:
+                                    logging.warning(f"⚠️ 預估金額計算失敗: {e}")
 
                         # Debug log
                         logging.info(f"[DEBUG][MeterValues] tx={transaction_id} | measurand={meas} | value={val}{unit} | ts={ts}")
@@ -1130,153 +1007,52 @@ class ChargePoint(OcppChargePoint):
         return call_result.RemoteStopTransactionPayload(status="Accepted")
 
 
+
+
+
 @app.post("/api/debug/force-add-charge-point")
 def force_add_charge_point(
     charge_point_id: str = "TW*MSI*E000100",
-    name: str = "MSI充電樁",
-    card_id: str = "6678B3EB",
-    initial_balance: float = 100.0
+    name: str = "MSI充電樁",           # ← 補上逗號
+    card_id: str = "6678B3EB",        # ★ 新增：可指定卡片 ID（預設模擬器用的卡）
+    initial_balance: float = 100.0    # ★ 新增：可指定初始餘額（預設 100 元）
 ):
     """
-    Debug 用 API：強制新增充電樁並綁定預設卡片。
-    狀態改為 'Available' 以符合 OCPP 常見狀態。
+    Debug 用 API：強制新增一個充電樁到白名單 (charge_points 資料表)，
+    並同步建立測試卡片 (cards 表)，避免沒有卡片餘額資料。
     """
-    # 確保為數值
-    try:
-        initial_balance = float(initial_balance)
-    except Exception:
-        initial_balance = 0.0
-
     with get_conn() as conn:
         cur = conn.cursor()
-
-        # 1) 充電樁：若已存在就更新名稱/狀態/綁定卡
+        # === 原本的充電樁白名單建立 ===
         cur.execute(
             """
-            INSERT INTO charge_points (charge_point_id, name, status, default_card_id)
-            VALUES (?, ?, 'Available', ?)
-            ON CONFLICT(charge_point_id) DO UPDATE SET
-              name=excluded.name,
-              status='Available',
-              default_card_id=excluded.default_card_id
+            INSERT OR IGNORE INTO charge_points (charge_point_id, name, status)
+            VALUES (?, ?, 'enabled')
             """,
-            (charge_point_id, name, card_id),
+            (charge_point_id, name),
         )
 
-        # 2) 卡片：若已存在就更新餘額為此次指定的初始餘額
+
+
+        # === 新增：同步建立卡片（如果不存在就建立） ===
         cur.execute(
-            """
-            INSERT INTO cards (card_id, balance)
-            VALUES (?, ?)
-            ON CONFLICT(card_id) DO UPDATE SET
-              balance=excluded.balance
-            """,
+            "INSERT OR IGNORE INTO cards (card_id, balance) VALUES (?, ?)",
             (card_id, initial_balance)
         )
 
+
         conn.commit()
 
+
+
     return {
-        "message": f"已新增或更新白名單與卡片: {charge_point_id}",
+        "message": f"已新增或存在白名單: {charge_point_id}",
         "charge_point_id": charge_point_id,
         "name": name,
         "card_id": card_id,
         "balance": initial_balance
     }
 
-
-
-
-
-# ============================================================
-# 🆕 新增整合管理 API：WhitelistManager
-# ============================================================
-
-@app.get("/api/whitelist-manager/list")
-def list_whitelist_and_cards():
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT charge_point_id, name, status, created_at FROM charge_points ORDER BY created_at DESC")
-        charge_points = [{"charge_point_id": r[0], "name": r[1], "status": r[2], "created_at": r[3]} for r in cur.fetchall()]
-        cur.execute("SELECT card_id, balance FROM cards ORDER BY card_id ASC")
-        cards = [{"card_id": r[0], "balance": r[1]} for r in cur.fetchall()]
-    return {"charge_points": charge_points, "cards": cards}
-
-@app.post("/api/whitelist-manager/add")
-def add_whitelist_or_card(data: dict = Body(...)):
-    item_type = data.get("type")
-    with get_conn() as conn:
-        cur = conn.cursor()
-        if item_type == "charge_point":
-            charge_point_id = data.get("charge_point_id")
-            name = data.get("name") or charge_point_id
-            cur.execute("INSERT OR IGNORE INTO charge_points (charge_point_id, name, status) VALUES (?, ?, 'enabled')", (charge_point_id, name))
-            conn.commit()
-            return {"message": f"✅ 已新增充電樁白名單：{charge_point_id}"}
-        elif item_type == "card":
-            card_id = data.get("card_id")
-            balance = float(data.get("balance") or 0)
-            cur.execute("INSERT OR IGNORE INTO cards (card_id, balance) VALUES (?, ?)", (card_id, balance))
-            conn.commit()
-            return {"message": f"✅ 已新增卡片：{card_id}，初始餘額 {balance} 元"}
-        else:
-            raise HTTPException(status_code=400, detail="type 必須是 'charge_point' 或 'card'")
-
-@app.delete("/api/whitelist-manager/delete")
-def delete_whitelist_or_card(item_type: str = Query(...), id_value: str = Query(...)):
-    with get_conn() as conn:
-        cur = conn.cursor()
-        if item_type == "charge_point":
-            cur.execute("DELETE FROM charge_points WHERE charge_point_id=?", (id_value,))
-            conn.commit()
-            return {"message": f"✅ 已刪除充電樁：{id_value}"}
-        elif item_type == "card":
-            cur.execute("DELETE FROM cards WHERE card_id=?", (id_value,))
-            conn.commit()
-            return {"message": f"✅ 已刪除卡片：{id_value}"}
-        else:
-            raise HTTPException(status_code=400, detail="type 必須是 'charge_point' 或 'card'")
-
-
-@app.put("/api/whitelist-manager/update-card-balance")
-def update_card_balance(data: dict = Body(...)):
-    card_id = data.get("card_id")
-    balance = data.get("balance")
-    if not card_id:
-        raise HTTPException(status_code=400, detail="缺少 card_id")
-    balance = float(balance)
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("UPDATE cards SET balance=? WHERE card_id=?", (balance, card_id))
-        conn.commit()
-    return {"message": f"✅ 已更新 {card_id} 餘額為 {balance} 元"}
-
-
-@app.get("/api/whitelist/with-cards")
-def get_whitelist_with_cards():
-    """
-    ✅ 正規做法：直接在 charge_points 表中使用 default_card_id 來對應卡片餘額。
-    """
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT cp.charge_point_id, cp.name, cp.status, cp.default_card_id, IFNULL(c.balance, 0)
-            FROM charge_points cp
-            LEFT JOIN cards c ON c.card_id = cp.default_card_id
-            ORDER BY cp.created_at DESC
-        """)
-        rows = cur.fetchall()
-
-    return [
-        {
-            "charge_point_id": r[0],
-            "name": r[1],
-            "status": r[2],
-            "card_id": r[3],
-            "balance": float(r[4] or 0)
-        }
-        for r in rows
-    ]
 
 
 
@@ -1551,35 +1327,6 @@ def get_latest_current_api(charge_point_id: str):
     return {}
 
 
-@app.get("/api/charge-points/{cp_id}/current-transaction/start-meter")
-def get_start_meter(cp_id: str):
-    """
-    查詢目前進行中交易的起始電量 (kWh)。
-    來源：transactions 表的 meter_start 欄位 (Wh)。
-    """
-    cp_id = _normalize_cp_id(cp_id)
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT meter_start, start_timestamp
-            FROM transactions
-            WHERE charge_point_id = ? AND stop_timestamp IS NULL
-            ORDER BY start_timestamp DESC LIMIT 1
-        """, (cp_id,))
-        row = cur.fetchone()
-
-    if not row:
-        return {"found": False}
-
-    meter_start_wh, start_ts = row
-    return {
-        "found": True,
-        "meter_start_kwh": round((meter_start_wh or 0) / 1000.0, 6),
-        "start_timestamp": start_ts
-    }
-
-
-
 
 
 # ✅ 原本 API（加上最終電量 / 電費，不動結構）
@@ -1629,6 +1376,63 @@ def get_last_tx_summary_by_cp(charge_point_id: str):
             "final_energy_kwh": final_energy,
             "final_cost": total_amount  # final_cost 與 total_amount 相同
         }
+
+
+
+# ✅ 新增 API：回傳單次充電的累積電量
+@app.get("/api/charge-points/{charge_point_id}/latest-energy")
+def get_latest_energy(charge_point_id: str):
+    """
+    回傳該樁「目前交易的累積電量 (kWh)」。
+    算法：最新 Energy.Active.Import.Register - meter_start。
+    """
+    cp_id = _normalize_cp_id(charge_point_id)
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+        # 找出該樁進行中的交易
+        cur.execute("""
+            SELECT transaction_id, meter_start
+            FROM transactions
+            WHERE charge_point_id=? AND stop_timestamp IS NULL
+            ORDER BY start_timestamp DESC LIMIT 1
+        """, (cp_id,))
+        row = cur.fetchone()
+        if not row:
+            return {"found": False, "sessionEnergyKWh": 0.0}
+
+        tx_id, meter_start = row
+        meter_start = float(meter_start or 0)
+
+        # 找最新的能量值
+        cur.execute("""
+            SELECT value, unit, timestamp
+            FROM meter_values
+            WHERE charge_point_id=? AND transaction_id=? 
+              AND (measurand='Energy.Active.Import.Register' OR measurand='Energy.Active.Import')
+            ORDER BY timestamp DESC LIMIT 1
+        """, (cp_id, tx_id))
+        mv = cur.fetchone()
+        if not mv:
+            return {"found": True, "transaction_id": tx_id, "sessionEnergyKWh": 0.0}
+
+        val, unit, ts = mv
+        try:
+            total_kwh = float(val)
+            if unit and unit.lower() in ("wh", "w*h", "w_h"):
+                total_kwh = total_kwh / 1000.0
+        except Exception:
+            total_kwh = 0.0
+
+        session_kwh = max(0.0, total_kwh - (meter_start / 1000.0))
+
+        return {
+            "found": True,
+            "transaction_id": tx_id,
+            "timestamp": ts,
+            "sessionEnergyKWh": round(session_kwh, 6)
+        }
+
 
 
 
@@ -1809,124 +1613,43 @@ def get_live_status(charge_point_id: str):
 
 
 
-# ✅ 唯一安全版 API：同時計算「總累積電量」、「本次充電電量」、「電價」、「預估電費」
-@app.get("/api/charge-points/{cp_id}/latest-energy")
-async def get_latest_energy(cp_id: str):
-    cp_id = _normalize_cp_id(cp_id)
+@app.get("/api/charge-points/{charge_point_id}/latest-energy")
+def get_latest_energy(charge_point_id: str):
+    cp_id = _normalize_cp_id(charge_point_id)
+    c = conn.cursor()
+
+    c.execute("""
+        SELECT timestamp, value, unit
+        FROM meter_values
+        WHERE charge_point_id=? AND measurand IN ('Energy.Active.Import.Register','Energy.Active.Import')
+        ORDER BY timestamp DESC LIMIT 1
+    """, (cp_id,))
+    row = c.fetchone()
+
     result = {}
-
-    try:
-        # 1. 找最新的總累積電量 (Register/Import)
-        with get_conn() as conn:
-            cur = conn.cursor()
-            cur.execute("""
-                SELECT timestamp, value, unit
-                FROM meter_values
-                WHERE charge_point_id=? 
-                  AND measurand IN ('Energy.Active.Import.Register','Energy.Active.Import')
-                ORDER BY timestamp DESC LIMIT 1
-            """, (cp_id,))
-            row = cur.fetchone()
-
-        if row:
-            ts, val, unit = row
-            kwh_total = _energy_to_kwh(val, unit)
-            if kwh_total is not None:
-                # 2. 找進行中的交易，取得起始電量 (Wh)
-                with get_conn() as conn2:
-                    cur2 = conn2.cursor()
-                    cur2.execute("""
-                        SELECT meter_start
-                        FROM transactions
-                        WHERE charge_point_id=? AND stop_timestamp IS NULL
-                        ORDER BY start_timestamp DESC LIMIT 1
-                    """, (cp_id,))
-                    row_tx = cur2.fetchone()
-
-                if row_tx:
-                    meter_start_wh = float(row_tx[0] or 0)
-                    # 本次充電累積電量 (kWh)
-                    session_kwh = max(0.0, kwh_total - (meter_start_wh / 1000.0))
-                else:
-                    session_kwh = 0.0
-
-                # 3. 取電價 (查不到則預設 6.0 元/kWh)
-                try:
-                    unit_price = float(_price_for_timestamp(ts)) if ts else 6.0
-                except Exception:
-                    unit_price = 6.0
-
-                # 4. 預估電費 = session_kwh * unit_price
-                est_amount = round(session_kwh * unit_price, 2)
-
+    if row:
+        ts, val, unit = row
+        try:
+            kwh = _energy_to_kwh(val, unit)
+            if kwh is not None:
                 result = {
                     "timestamp": ts,
-                    "meterTotalKWh": round(kwh_total, 6),      # 總累積電量
-                    "sessionEnergyKWh": round(session_kwh, 6), # 本次充電電量
-                    "pricePerKWh": unit_price,                 # 當前電價
-                    "estimatedAmount": est_amount              # 預估電費
+                    "totalEnergyKWh": round(kwh, 6),
+                    "sessionEnergyKWh": round(kwh, 6)
                 }
 
-        # 5. 如果沒有 Register/Import，退回 Interval 加總
-        if not result:
-            with get_conn() as conn2:
-                cur2 = conn2.cursor()
-                cur2.execute("""
-                    SELECT transaction_id, meter_start
-                    FROM transactions
-                    WHERE charge_point_id=? AND stop_timestamp IS NULL
-                    ORDER BY start_timestamp DESC LIMIT 1
-                """, (cp_id,))
-                tx = cur2.fetchone()
-                if tx:
-                    tx_id, meter_start = tx
-                    meter_start = float(meter_start or 0)
+                # ⭐ 保護條件：若狀態是 Available，強制回傳 0
+                cp_status = charging_point_status.get(cp_id, {}).get("status")
+                if cp_status == "Available" and result.get("totalEnergyKWh", 0) > 0:
+                    logging.debug(f"⚠️ [DEBUG] 保護觸發: CP={cp_id} 狀態=Available 但 DB 最新值={result['totalEnergyKWh']} → 強制改為 0")
+                    result["totalEnergyKWh"] = 0
+                    result["sessionEnergyKWh"] = 0
 
-                    cur2.execute("""
-                        SELECT value, unit
-                        FROM meter_values
-                        WHERE charge_point_id=? AND transaction_id=?
-                          AND measurand='Energy.Active.Import.Interval'
-                    """, (cp_id, tx_id))
-                    rows_iv = cur2.fetchall()
+        except Exception as e:
+            logging.warning(f"⚠️ latest-energy 計算失敗: {e}")
 
-                    sum_kwh = 0.0
-                    for v, u in rows_iv or []:
-                        k = _energy_to_kwh(v, u)
-                        if k is not None:
-                            sum_kwh += max(0.0, float(k))
-
-                    # 電價與預估金額
-                    try:
-                        unit_price = float(_price_for_timestamp(None))
-                    except Exception:
-                        unit_price = 6.0
-                    est_amount = round(sum_kwh * unit_price, 2)
-
-                    result = {
-                        "transaction_id": tx_id,
-                        "meterTotalKWh": round(meter_start/1000.0 + sum_kwh, 6),
-                        "sessionEnergyKWh": round(sum_kwh, 6),
-                        "pricePerKWh": unit_price,
-                        "estimatedAmount": est_amount
-                    }
-
-        # 6. 保護條件：如果狀態是 Available，強制歸零
-        cp_status = charging_point_status.get(cp_id, {}).get("status")
-        if cp_status == "Available":
-            logging.debug(f"[DEBUG] 保護觸發: CP={cp_id} 狀態=Available → 強制歸零")
-            result["meterTotalKWh"] = 0
-            result["sessionEnergyKWh"] = 0
-            result["estimatedAmount"] = 0
-
-    except Exception as e:
-        logging.warning(f"[WARNING] latest-energy 計算失敗: {e}")
-
-    logging.debug(f"[DEBUG] latest-energy 回傳: {result}")
+    logging.debug(f"🔍 [DEBUG] latest-energy 回傳: {result}")
     return result
-
-
-
 
 
 @app.get("/api/cards/{card_id}/history")

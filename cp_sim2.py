@@ -23,13 +23,22 @@ class SimChargePoint(OcppChargePoint):
         super().__init__(charge_point_id, connection)
         self._running = True
         self.current_txn_id: int | None = None
-        self.latest_energy_kwh = 0.0  # <== 新增欄位供 StopTransaction 使用
+        self.latest_energy_kwh = 0.0  # <== 儲存最新 kWh 供 StopTransaction 使用
 
+    # ⚡⚡ 修正：使用套件實際定義的小寫 Action 名稱 + 正確的回傳 Payload
     @on(Action.remote_stop_transaction)
     async def on_remote_stop_transaction(self, transaction_id, **kwargs):
-        print(f"[SIM] Received RemoteStopTransaction: {transaction_id}")
+        print(f"[SIM] 🛑 收到遠端停充指令 | transaction_id={transaction_id}")
+
+        # 1️⃣ 停止內部的充電模擬迴圈
+        self._running = False
+
+        # 2️⃣ 主動送出 StopTransaction
         await self._send_stop_transaction(reason="Remote")
-        return call_result.RemoteStopTransaction(status="Accepted")
+
+        # 3️⃣ 回覆後端「已接受」停充指令
+        return call_result.RemoteStopTransactionPayload(status="Accepted")
+
 
     @on(Action.heartbeat)
     async def on_heartbeat(self, **kwargs):
@@ -82,6 +91,7 @@ class SimChargePoint(OcppChargePoint):
                 {"value": f"{voltage_v:.1f}", "measurand": "Voltage", "unit": "V"},
                 {"value": f"{current_a:.2f}", "measurand": "Current.Import", "unit": "A"},
                 {"value": f"{energy_kwh:.4f}", "measurand": "Energy.Active.Import.Register", "unit": "kWh"},
+                {"value": f"{(power_w / 3600000.0):.6f}", "measurand": "Energy.Active.Import.Interval", "unit": "kWh"},
             ],
         }
 
@@ -108,7 +118,7 @@ class SimChargePoint(OcppChargePoint):
         ))
         self.current_txn_id = None
 
-    async def scenario_charge(self, id_tag: str, seconds: int = 60):
+    async def scenario_charge(self, id_tag: str, seconds: int = 60):  # ⭐ 預設改為 60 秒（1 分鐘）
         await self._send_boot()
         await self._send_status("Available")
         await self._send_authorize(id_tag)
@@ -140,7 +150,7 @@ class SimChargePoint(OcppChargePoint):
         await self._send_status("Available")
 
 
-async def run_simulator(backend_base_url: str, charge_point_id: str, id_tag: str, duration_sec: int = 60):
+async def run_simulator(backend_base_url: str, charge_point_id: str, id_tag: str, duration_sec: int = 60):  # ⭐ 統一改為 60
     ws_url = backend_base_url.rstrip("/") + "/" + quote(charge_point_id, safe="")
     print(f"[SIM] Connecting to {ws_url}")
 
@@ -162,7 +172,7 @@ def main():
     backend = "wss://ocppfortechlux-backend.onrender.com"
     cpid = "TW*MSI*E000100"
     idtag = "6678B3EB"
-    duration = 60
+    duration = 900  # ⭐ 預設改為 900 秒（15 分鐘）
 
     if len(sys.argv) >= 2:
         backend = sys.argv[1]
