@@ -1050,7 +1050,7 @@ class ChargePoint(OcppChargePoint):
 
         # ← 加這一層空行或對齊，確保 try 區塊結束！
         # （確定這一行與 def on_meter_values 同縮排層級）
-
+        pass
 
     @on(Action.RemoteStopTransaction)
     async def on_remote_stop_transaction(self, transaction_id, **kwargs):
