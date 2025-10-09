@@ -1047,10 +1047,9 @@ class ChargePoint(OcppChargePoint):
 
             except Exception as e:
                 logging.error(f"⚠️ 餘額自動停充檢查失敗: {e}")
-                return call_result.MeterValuesPayload()
 
-
-
+        # ← 加這一層空行或對齊，確保 try 區塊結束！
+        # （確定這一行與 def on_meter_values 同縮排層級）
 
 
     @on(Action.RemoteStopTransaction)
