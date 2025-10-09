@@ -1017,7 +1017,7 @@ class ChargePoint(OcppChargePoint):
 
 
             from ocpp.v16 import call
-
+            logging.info(f"[DEBUG] 餘額檢查: tx={transaction_id} balance={balance}")
             if balance <= 0.01 and transaction_id not in stop_requested:
                 stop_requested.add(transaction_id)
                 logging.warning(f"⚡ 餘額不足，自動發送 RemoteStopTransaction | CP={cp_id} | tx={transaction_id}")
