@@ -1045,12 +1045,11 @@ class ChargePoint(OcppChargePoint):
                             else:
                                 logging.warning(f"❌ 無法找到充電樁 {cp_id}，停充指令未送出。")
 
-            except Exception as e:
-                logging.error(f"⚠️ 餘額自動停充檢查失敗: {e}")
+        except Exception as e:
+            logging.error(f"⚠️ 餘額自動停充檢查失敗: {e}")
 
-        # ← 加這一層空行或對齊，確保 try 區塊結束！
-        # （確定這一行與 def on_meter_values 同縮排層級）
-        pass
+
+
 
     @on(Action.RemoteStopTransaction)
     async def on_remote_stop_transaction(self, transaction_id, **kwargs):
