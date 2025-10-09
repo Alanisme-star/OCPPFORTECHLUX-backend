@@ -681,13 +681,13 @@ class ChargePoint(OcppChargePoint):
             cursor.execute("SELECT balance FROM cards WHERE card_id = ?", (id_tag,))
             card = cursor.fetchone()
             if not card:
-                logging.info(f"🟢【修正】卡片 {id_tag} 不存在，系統自動建立（餘額=0）")
-                cursor.execute("INSERT INTO cards (card_id, balance) VALUES (?, ?)", (id_tag, 0.0))
-                conn.commit()
-                balance = 0.0
-            else:
-                balance = float(card[0] or 0)
+                logging.warning(f"🔴 StartTransaction 拒絕：卡片 {id_tag} 不存在於系統（請先於白名單建立）")
+                return call_result.StartTransactionPayload(
+                    transaction_id=0,
+                    id_tag_info={"status": "Invalid"}
+                )
 
+            balance = float(card[0] or 0)
             if balance <= 0:
                 logging.warning(f"🔴 StartTransaction 被擋下：idTag={id_tag} | balance={balance}")
                 return call_result.StartTransactionPayload(transaction_id=0, id_tag_info={"status": "Blocked"})
@@ -1008,22 +1008,18 @@ class ChargePoint(OcppChargePoint):
 
 
 
-
-
 @app.post("/api/debug/force-add-charge-point")
 def force_add_charge_point(
     charge_point_id: str = "TW*MSI*E000100",
-    name: str = "MSI充電樁",           # ← 補上逗號
-    card_id: str = "6678B3EB",        # ★ 新增：可指定卡片 ID（預設模擬器用的卡）
-    initial_balance: float = 100.0    # ★ 新增：可指定初始餘額（預設 100 元）
+    name: str = "MSI充電樁"
 ):
     """
-    Debug 用 API：強制新增一個充電樁到白名單 (charge_points 資料表)，
-    並同步建立測試卡片 (cards 表)，避免沒有卡片餘額資料。
+    Debug 用 API：強制新增一個充電樁到白名單 (charge_points 資料表)。
+    不會自動建立任何卡片或餘額。
     """
     with get_conn() as conn:
         cur = conn.cursor()
-        # === 原本的充電樁白名單建立 ===
+        # 只建立白名單，不建立卡片
         cur.execute(
             """
             INSERT OR IGNORE INTO charge_points (charge_point_id, name, status)
@@ -1031,27 +1027,14 @@ def force_add_charge_point(
             """,
             (charge_point_id, name),
         )
-
-
-
-        # === 新增：同步建立卡片（如果不存在就建立） ===
-        cur.execute(
-            "INSERT OR IGNORE INTO cards (card_id, balance) VALUES (?, ?)",
-            (card_id, initial_balance)
-        )
-
-
         conn.commit()
-
-
 
     return {
         "message": f"已新增或存在白名單: {charge_point_id}",
         "charge_point_id": charge_point_id,
-        "name": name,
-        "card_id": card_id,
-        "balance": initial_balance
+        "name": name
     }
+
 
 
 
