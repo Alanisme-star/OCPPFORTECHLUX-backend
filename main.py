@@ -35,38 +35,6 @@ from ocpp.routing import on
 from urllib.parse import urlparse, parse_qsl
 from reportlab.pdfgen import canvas
 
-
-
-# === 優先寫入佇列機制（Priority Write Queue） ===
-import asyncio
-import sqlite3
-import logging
-
-DB_FILE = "ocpp_data.db"
-write_queue = asyncio.PriorityQueue()
-
-async def db_writer():
-    """背景寫入任務：統一管理 SQLite 寫入"""
-    conn = sqlite3.connect(DB_FILE, timeout=30)
-    conn.execute("PRAGMA journal_mode=WAL;")  # 啟用 WAL 模式以支援併發
-    while True:
-        try:
-            priority, sql, params = await write_queue.get()
-            conn.execute(sql, params)
-            conn.commit()
-            write_queue.task_done()
-        except Exception as e:
-            logging.warning(f"⚠️ DB 寫入失敗: {e}")
-            await asyncio.sleep(0.1)  # 避免 busy-loop
-
-async def add_write_task(priority: int, sql: str, params: tuple = ()):
-    """加入寫入任務（priority 數字越小優先級越高）"""
-    await write_queue.put((priority, sql, params))
-
-
-
-
-
 app = FastAPI()
 
 # === WebSocket 連線驗證設定（可選）===
@@ -74,7 +42,7 @@ REQUIRED_TOKEN = os.getenv("OCPP_WS_TOKEN", None)
 
 
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.WARNING)
 
 # 允許跨域（若前端使用）
 app.add_middleware(
@@ -277,13 +245,13 @@ async def get_status(cp_id: str):
 # 初始化 SQLite 資料庫
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_FILE = os.path.join(BASE_DIR, "ocpp_data.db")  # ✅ 固定資料庫絕對路徑
-conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+conn = sqlite3.connect(DB_FILE, check_same_thread=False, timeout=15)
 cursor = conn.cursor()
 
 
 def get_conn():
     # 為每次查詢建立新的連線與游標，避免共用全域 cursor 造成並發問題
-    return sqlite3.connect(DB_FILE, check_same_thread=False)
+    return sqlite3.connect(DB_FILE, check_same_thread=False, timeout=15)
 
 
 
@@ -746,7 +714,13 @@ class ChargePoint(OcppChargePoint):
 
             # 寫入交易紀錄
             cursor.execute("""
-                await add_write_task(2, "INSERT INTO transactions (transaction_id, cp_id, id_tag, start_timestamp) VALUES (?, ?, ?, ?)", (...))
+                INSERT INTO transactions (
+                    transaction_id, charge_point_id, connector_id, id_tag,
+                    meter_start, start_timestamp, meter_stop, stop_timestamp, reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (transaction_id, self.id, connector_id, id_tag, meter_start, start_ts, None, None, None))
+
+            conn.commit()
             logging.info(f"🚗 StartTransaction 成功 | CP={self.id} | idTag={id_tag} | transactionId={transaction_id} | start_ts={start_ts} | meter_start={meter_start_val} kWh")
 
             # ⭐ 重置快取，避免沿用上一筆交易的電費/電量
@@ -1023,9 +997,9 @@ class ChargePoint(OcppChargePoint):
 
                                             if diff_amount > 0:
                                                 new_balance = max(0.0, balance - diff_amount)
-                                                await add_write_task(1, "UPDATE cards SET balance=? WHERE card_id=?", (new_balance, id_tag))
+                                                _cur2.execute("UPDATE cards SET balance=? WHERE card_id=?", (new_balance, id_tag))
                                                 logging.info(f"💰 即時扣款 | idTag={id_tag} | 本次扣={diff_amount} | 累積估算={est_amount} | 餘額={new_balance}")
-                                                
+                                                _c2.commit()
 
                                             # 更新快取中的上次累積金額
                                             _upsert_live(cp_id, prev_est_amount=est_amount)
