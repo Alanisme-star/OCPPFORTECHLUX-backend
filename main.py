@@ -582,7 +582,7 @@ class ChargePoint(OcppChargePoint):
                 }
                 # → 補一筆 0 kWh 到 DB
                 with db_lock:
-                    _cur = global_c.cursor()
+                    _cur = global_conn.cursor()
                     _cur.execute('''
                         INSERT INTO meter_values (charge_point_id, connector_id, transaction_id,
                                                   value, measurand, unit, timestamp)
@@ -880,7 +880,7 @@ class ChargePoint(OcppChargePoint):
             transaction_id = pick(kwargs, "transactionId", "transaction_id", "TransactionId", default="")
             if not transaction_id:
                 with db_lock:
-                    _cur = global_c.cursor()
+                    _cur = global_conn.cursor()
                     _cur.execute("""
                         SELECT transaction_id FROM transactions
                         WHERE charge_point_id=? AND stop_timestamp IS NULL
@@ -898,7 +898,7 @@ class ChargePoint(OcppChargePoint):
             last_ts_in_batch = None
 
             with db_lock:
-                _cur = global_c.cursor()
+                _cur = global_conn.cursor()
 
                 for mv in meter_value_list:
                     ts = pick(mv, "timestamp", "timeStamp", "Timestamp")
