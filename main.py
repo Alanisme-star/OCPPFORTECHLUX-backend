@@ -1005,7 +1005,10 @@ class ChargePoint(OcppChargePoint):
 
 
             # ⭐ 改良版：餘額保護機制（balance < 0.01 時自動停充）
-            await self._check_and_stop_if_balance_low(transaction_id, cp_id)
+            try:
+                await self._check_and_stop_if_balance_low(transaction_id, cp_id)
+            except Exception as e:
+                logging.error(f"⚠️ 餘額檢查程序呼叫失敗: {e}")
 
 
     async def _check_and_stop_if_balance_low(self, transaction_id, cp_id):
