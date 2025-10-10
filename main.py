@@ -1026,12 +1026,16 @@ class ChargePoint(OcppChargePoint):
                             except Exception:
                                 safe_balance = 0.0
 
-                        logging.info(f"[DEBUG] 餘額檢查: tx={transaction_id} | 原始={balance} | 型別={type(balance)} | 解析後={safe_balance}")
+                        logging.info(
+                            f"[DEBUG] 餘額檢查: tx={transaction_id} | 原始={balance} | 型別={type(balance)} | 解析後={safe_balance}"
+                        )
 
                         # --- 餘額不足自動停充（僅在 balance < 0.01 時觸發） ---
                         if safe_balance < 0.01 and transaction_id not in stop_requested:
                             stop_requested.add(transaction_id)
-                            logging.warning(f"⚡ 餘額不足，自動發送 RemoteStopTransaction | CP={cp_id} | tx={transaction_id} | balance={safe_balance}")
+                            logging.warning(
+                                f"⚡ 餘額不足，自動發送 RemoteStopTransaction | CP={cp_id} | tx={transaction_id} | balance={safe_balance}"
+                            )
 
                             cp = connected_charge_points.get(cp_id)
                             if cp:
@@ -1044,8 +1048,10 @@ class ChargePoint(OcppChargePoint):
                                     logging.error(f"❌ 發送 RemoteStopTransaction 失敗: {e}")
                             else:
                                 logging.warning(f"⚠️ 找不到連線中的充電樁 {cp_id}，無法自動停充")
-                except Exception as e:
-                    logging.error(f"⚠️ 餘額自動停充檢查失敗: {e}")
+
+            except Exception as e:
+                logging.error(f"⚠️ 餘額自動停充檢查失敗: {e}")
+
 
 
 
