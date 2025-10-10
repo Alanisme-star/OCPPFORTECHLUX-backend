@@ -2990,9 +2990,29 @@ conn.commit()
 
 
 
-@app.get("/")
-async def root():
-    return {"status": "API is running"}
+@app.websocket("/{cp_id}")
+async def websocket_endpoint(websocket: WebSocket, cp_id: str):
+    """
+    OCPP WebSocket entry point.
+    用於接收充電樁連線，例如:
+    wss://ocppfortechlux-backend.onrender.com/TW*MSI*E000100
+    """
+    await websocket.accept()
+    logging.info(f"🔌 Charge Point connected: {cp_id}")
+
+    try:
+        while True:
+            data = await websocket.receive_text()
+            logging.debug(f"📥 Received from {cp_id}: {data}")
+            # 這裡可以呼叫你的 OCPP handler，例如：
+            # await handle_ocpp_message(cp_id, data, websocket)
+            await websocket.send_text(f"ACK from backend for {cp_id}")
+    except Exception as e:
+        logging.warning(f"⚠️ WebSocket disconnected | {cp_id}: {e}")
+    finally:
+        await websocket.close()
+        logging.info(f"🔌 Disconnected: {cp_id}")
+
 
 
 
