@@ -116,6 +116,17 @@ def get_whitelist():
     }
 
 
+# 🔧 新增：即時電價查詢 API
+@app.get("/api/debug/price")
+def get_debug_price():
+    """回傳目前後端實際使用的電價"""
+    try:
+        price = get_current_price()
+        return {"current_price": price}
+    except Exception as e:
+        return {"error": str(e)}
+
+
 
 
 # ==== Live 快取工具 ====
