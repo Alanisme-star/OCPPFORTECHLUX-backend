@@ -1004,55 +1004,58 @@ class ChargePoint(OcppChargePoint):
 
 
 
-
             # ⭐ 改良版：餘額保護機制（balance < 0.01 時自動停充）
-            try:
-                with sqlite3.connect(DB_FILE) as _c3:
-                    _cur3 = _c3.cursor()
-                    _cur3.execute("""
-                        SELECT t.id_tag, c.balance
-                        FROM transactions t
-                        JOIN cards c ON t.id_tag = c.card_id
-                        WHERE t.transaction_id = ?
-                    """, (transaction_id,))
-                    row = _cur3.fetchone()
-                    if row:
-                        id_tag, balance = row
+            await self._check_and_stop_if_balance_low(transaction_id, cp_id)
 
-                        # ✅ 型別安全轉換
-                        if isinstance(balance, (int, float)):
-                            safe_balance = float(balance)
-                        else:
-                            try:
-                                safe_balance = float(balance or 0)
-                            except Exception:
-                                safe_balance = 0.0
 
-                        logging.info(
-                            f"[DEBUG] 餘額檢查: tx={transaction_id} | 原始={balance} | 型別={type(balance)} | 解析後={safe_balance}"
-                        )
+    async def _check_and_stop_if_balance_low(self, transaction_id, cp_id):
+        """
+        檢查卡片餘額，若 <= 0.01 則自動觸發 RemoteStopTransaction。
+        """
+        try:
+            with sqlite3.connect(DB_FILE) as _c3:
+                _cur3 = _c3.cursor()
+                _cur3.execute("""
+                    SELECT t.id_tag, c.balance
+                    FROM transactions t
+                    JOIN cards c ON t.id_tag = c.card_id
+                    WHERE t.transaction_id = ?
+                """, (transaction_id,))
+                row = _cur3.fetchone()
 
-                        # --- 餘額不足自動停充（僅在 balance < 0.01 時觸發） ---
-                        if safe_balance < 0.01 and transaction_id not in stop_requested:
-                            stop_requested.add(transaction_id)
-                            logging.warning(
-                                f"⚡ 餘額不足，自動發送 RemoteStopTransaction | CP={cp_id} | tx={transaction_id} | balance={safe_balance}"
-                            )
+                if not row:
+                    return
 
-                            cp = connected_charge_points.get(cp_id)
-                            if cp:
-                                try:
-                                    from ocpp.v16 import call
-                                    req = call.RemoteStopTransaction(transaction_id=int(transaction_id))
-                                    resp = await cp.call(req)
-                                    logging.info(f"🔧 RemoteStopTransaction 回應: {resp}")
-                                except Exception as e:
-                                    logging.error(f"❌ 發送 RemoteStopTransaction 失敗: {e}")
-                            else:
-                                logging.warning(f"⚠️ 找不到連線中的充電樁 {cp_id}，無法自動停充")
+                id_tag, balance = row
+                try:
+                    safe_balance = float(balance or 0)
+                except Exception:
+                    safe_balance = 0.0
 
-            except Exception as e:
-                logging.error(f"⚠️ 餘額自動停充檢查失敗: {e}")
+                logging.info(f"[DEBUG] 餘額檢查: tx={transaction_id} | balance={safe_balance}")
+
+                # --- 餘額不足自動停充（僅在 balance < 0.01 時觸發） ---
+                if safe_balance < 0.01 and transaction_id not in stop_requested:
+                    stop_requested.add(transaction_id)
+                    logging.warning(
+                        f"⚡ 餘額不足，自動發送 RemoteStopTransaction | CP={cp_id} | tx={transaction_id} | balance={safe_balance}"
+                    )
+
+                    cp = connected_charge_points.get(cp_id)
+                    if cp:
+                        try:
+                            from ocpp.v16 import call
+                            req = call.RemoteStopTransaction(transaction_id=int(transaction_id))
+                            resp = await cp.call(req)
+                            logging.info(f"🔧 RemoteStopTransaction 回應: {resp}")
+                        except Exception as e:
+                            logging.error(f"❌ 發送 RemoteStopTransaction 失敗: {e}")
+                    else:
+                        logging.warning(f"⚠️ 找不到連線中的充電樁 {cp_id}，無法自動停充")
+
+        except Exception as e:
+            logging.error(f"⚠️ 餘額自動停充檢查失敗: {e}")
+
 
 
 
