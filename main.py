@@ -967,52 +967,61 @@ class ChargePoint(OcppChargePoint):
                                         )
                                         continue
 
-                                _upsert_live(cp_id, energy=round(kwh, 6), timestamp=ts)
-
-                                # 計算用電量與金額
+                                # === 統一資料庫連線區塊 ===
                                 try:
-                                    with sqlite3.connect(DB_FILE) as _c2:
-                                        _cur2 = _c2.cursor()
-                                        _cur2.execute("SELECT meter_start FROM transactions WHERE transaction_id = ?", (transaction_id,))
-                                        row_tx = _cur2.fetchone()
+                                    with sqlite3.connect(DB_FILE, timeout=5.0) as conn:
+                                        cur = conn.cursor()
+
+                                        # 更新即時能量
+                                        _upsert_live(cp_id, energy=round(kwh, 6), timestamp=ts)
+
+                                        # 計算預估電量與金額
+                                        cur.execute("""
+                                            SELECT meter_start, id_tag
+                                            FROM transactions
+                                            WHERE transaction_id = ?
+                                        """, (transaction_id,))
+                                        row_tx = cur.fetchone()
                                         if row_tx:
-                                            meter_start_wh = float(row_tx[0] or 0)
+                                            meter_start_wh, id_tag = row_tx
+                                            meter_start_wh = float(meter_start_wh or 0)
                                             used_kwh = max(0.0, (kwh - (meter_start_wh / 1000.0)))
                                             unit_price = float(_price_for_timestamp(ts)) if ts else 6.0
                                             est_amount = round(used_kwh * unit_price, 2)
+
+                                            # 更新 live cache
                                             _upsert_live(cp_id,
                                                          estimated_energy=round(used_kwh, 6),
                                                          estimated_amount=est_amount,
                                                          price_per_kwh=unit_price,
                                                          timestamp=ts)
 
+                                            # --- ⭐ 即時扣款（同一連線完成）---
+                                            cur.execute("""
+                                                SELECT balance FROM cards WHERE card_id = ?
+                                            """, (id_tag,))
+                                            row_bal = cur.fetchone()
+                                            if row_bal:
+                                                current_balance = float(row_bal[0] or 0)
+                                                new_balance = max(0.0, current_balance - est_amount)
+                                                cur.execute("""
+                                                    UPDATE cards SET balance=? WHERE card_id=?
+                                                """, (new_balance, id_tag))
+                                                logging.info(f"💳 即時更新卡片餘額 | idTag={id_tag} | 新餘額={new_balance:.2f}")
 
+                                        conn.commit()
 
-                                            # --- ⭐ 新增：即時更新卡片餘額 ---
-                                            try:
-                                                with sqlite3.connect(DB_FILE) as _c4:
-                                                    _cur4 = _c4.cursor()
-                                                    _cur4.execute("""
-                                                        SELECT t.id_tag, c.balance
-                                                        FROM transactions t
-                                                        JOIN cards c ON t.id_tag = c.card_id
-                                                        WHERE t.transaction_id = ?
-                                                    """, (transaction_id,))
-                                                    row4 = _cur4.fetchone()
-                                                    if row4:
-                                                        id_tag, current_balance = row4
-                                                        new_balance = max(0.0, float(current_balance) - float(est_amount))
-                                                        _cur4.execute("UPDATE cards SET balance=? WHERE card_id=?", (new_balance, id_tag))
-                                                        _c4.commit()
-                                                        logging.info(f"💳 即時更新卡片餘額 | idTag={id_tag} | 新餘額={new_balance:.2f}")
-                                            except Exception as e:
-                                                logging.error(f"⚠️ 即時扣款更新失敗: {e}")
-
-
-
-
+                                except sqlite3.OperationalError as e:
+                                    if "locked" in str(e).lower():
+                                        logging.warning("⚠️ 資料庫忙碌，略過本輪即時扣款（等待下一輪）")
+                                    else:
+                                        logging.error(f"⚠️ 即時扣款更新失敗: {e}")
                                 except Exception as e:
-                                    logging.warning(f"⚠️ 預估金額計算失敗: {e}")
+                                    logging.error(f"⚠️ 預估金額或扣款失敗: {e}")
+
+                        # Debug log
+                        logging.info(f"[DEBUG][MeterValues] tx={transaction_id} | measurand={meas} | value={val}{unit} | ts={ts}")
+
 
                         # Debug log
                         logging.info(f"[DEBUG][MeterValues] tx={transaction_id} | measurand={meas} | value={val}{unit} | ts={ts}")
