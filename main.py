@@ -562,7 +562,7 @@ class ChargePoint(OcppChargePoint):
                     "timestamp": datetime.utcnow().isoformat()
                 }
                 # → 補一筆 0 kWh 到 DB
-                with sqlite3.connect(DB_FILE) as _c:
+                with sqlite3.connect(DB_FILE, timeout=20) as _c:
                     _cur = _c.cursor()
                     _cur.execute('''
                         INSERT INTO meter_values (charge_point_id, connector_id, transaction_id,
@@ -958,7 +958,7 @@ class ChargePoint(OcppChargePoint):
 
                                 # 計算用電量與金額
                                 try:
-                                    with sqlite3.connect(DB_FILE) as _c2:
+                                    with sqlite3.connect(DB_FILE, timeout=20) as _c2:
                                         _cur2 = _c2.cursor()
                                         _cur2.execute("SELECT meter_start FROM transactions WHERE transaction_id = ?", (transaction_id,))
                                         row_tx = _cur2.fetchone()
@@ -1020,7 +1020,7 @@ class ChargePoint(OcppChargePoint):
 
             # ⭐ 新增：餘額保護機制（餘額 ≤ 0 時自動停充）
             try:
-                with sqlite3.connect(DB_FILE) as _c3:
+                with sqlite3.connect(DB_FILE, timeout=20) as _c3:
                     _cur3 = _c3.cursor()
                     _cur3.execute("""
                         SELECT t.id_tag, c.balance
