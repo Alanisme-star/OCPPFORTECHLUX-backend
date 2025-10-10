@@ -2776,18 +2776,18 @@ async def get_daily_by_chargepoint_range(
     result_map = {}
     cur = global_conn.cursor()
     cursor = global_conn.cursor()
-        cursor.execute("""
-            SELECT strftime('%Y-%m-%d', start_timestamp) as day,
-                   charge_point_id,
-                   SUM(meter_stop - meter_start) as total_energy
-            FROM transactions
-            WHERE meter_stop IS NOT NULL
-              AND start_timestamp >= ?
-              AND start_timestamp <= ?
-            GROUP BY day, charge_point_id
-            ORDER BY day ASC
-        """, (start, end))
-        rows = cursor.fetchall()
+    cursor.execute("""
+        SELECT strftime('%Y-%m-%d', start_timestamp) as day,
+               charge_point_id,
+               SUM(meter_stop - meter_start) as total_energy
+        FROM transactions
+        WHERE meter_stop IS NOT NULL
+          AND start_timestamp >= ?
+          AND start_timestamp <= ?
+        GROUP BY day, charge_point_id
+        ORDER BY day ASC
+    """, (start, end))
+    rows = cursor.fetchall()
 
     for day, cp_id, energy in rows:
         if day not in result_map:
