@@ -165,8 +165,9 @@ async def _accept_or_reject_ws(websocket: WebSocket, raw_cp_id: str):
     supplied_token = qs.get("token")
 
     # 查白名單
-    with get_conn() as _c:
-        cur = _c.cursor()
+    with db_lock:
+        cur = global_conn.cursor()
+
         cur.execute("SELECT charge_point_id FROM charge_points")
         allowed_ids = [row[0] for row in cur.fetchall()]
 
@@ -258,13 +259,16 @@ async def get_status(cp_id: str):
 # 初始化 SQLite 資料庫
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_FILE = os.path.join(BASE_DIR, "ocpp_data.db")  # ✅ 固定資料庫絕對路徑
-conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-cursor = conn.cursor()
+import threading
 
+# === 全域資料庫連線與鎖 ===
+db_lock = threading.Lock()
+global_conn = sqlite3.connect(DB_FILE, check_same_thread=False, isolation_level=None)
 
 def get_conn():
-    # 為每次查詢建立新的連線與游標，避免共用全域 cursor 造成並發問題
-    return sqlite3.connect(DB_FILE, check_same_thread=False)
+    """回傳統一的全域連線"""
+    return global_conn
+
 
 
 
@@ -483,8 +487,8 @@ class ChargePoint(OcppChargePoint):
         from datetime import datetime, timezone
 
         # 讀取交易資訊
-        with sqlite3.connect(DB_FILE) as conn:
-            cursor = conn.cursor()
+        with db_lock:
+            cursor = global_conn.cursor()
             cursor.execute('''
                 SELECT meter_stop, id_tag FROM transactions WHERE transaction_id = ?
             ''', (transaction_id,))
@@ -827,7 +831,7 @@ class ChargePoint(OcppChargePoint):
                         VALUES (?, ?, ?, ?, ?, ?)
                     ''', (transaction_id, 0.0, total_amount, 0.0, total_amount, stop_ts))
 
-                _conn.commit()
+                global_conn.commit()
                 # ====== ⭐ 新增結束 ======
 
             # ⭐ 清除快取
@@ -970,7 +974,7 @@ class ChargePoint(OcppChargePoint):
                                 # === 改為統一資料庫連線 ===
                                 try:
                                     with sqlite3.connect(DB_FILE, timeout=5.0) as conn:
-                                        cur = conn.cursor()
+                                        cur = global_conn.cursor()
 
                                         # 更新即時能量
                                         _upsert_live(cp_id, energy=round(kwh, 6), timestamp=ts)
@@ -1007,7 +1011,7 @@ class ChargePoint(OcppChargePoint):
                                                 cur.execute("UPDATE cards SET balance=? WHERE card_id=?", (new_balance, id_tag))
                                                 logging.info(f"💳 即時更新卡片餘額 | idTag={id_tag} | 新餘額={new_balance:.2f}")
 
-                                        conn.commit()
+                                        global_conn.commit()
 
                                 except sqlite3.OperationalError as e:
                                     if "locked" in str(e).lower():
