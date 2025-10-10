@@ -1017,50 +1017,7 @@ class ChargePoint(OcppChargePoint):
 
                 _c.commit()
 
-
-            # ⭐ 新增：餘額保護機制（餘額 ≤ 0 時自動停充）
-            try:
-                with sqlite3.connect(DB_FILE) as _c3:
-                    _cur3 = _c3.cursor()
-                    _cur3.execute("""
-                        SELECT t.id_tag, c.balance
-                        FROM transactions t
-                        JOIN cards c ON t.id_tag = c.card_id
-                        WHERE t.transaction_id = ?
-                    """, (transaction_id,))
-                    row = _cur3.fetchone()
-                    if row:
-                        id_tag, balance = row
-                        balance = float(balance or 0)
-                        if balance <= 0.01 and transaction_id not in stop_requested:
-                            stop_requested.add(transaction_id)
-                            logging.warning(f"⚡ 餘額不足，自動發送 RemoteStopTransaction | CP={cp_id} | tx={transaction_id}")
-                            cp = connected_charge_points.get(cp_id)
-                            if cp:
-                                await cp.send_stop_transaction(transaction_id)
-                            else:
-                                logging.warning(f"⚠️ 找不到連線中的充電樁 {cp_id}，無法自動停充")
-            except Exception as e:
-                logging.error(f"⚠️ 餘額自動停充檢查失敗: {e}")
-
-
-            from ocpp.v16 import call
-            logging.info(f"[DEBUG] 餘額檢查: tx={transaction_id} balance={balance}")
-            if balance <= 0.01 and transaction_id not in stop_requested:
-                stop_requested.add(transaction_id)
-                logging.warning(f"⚡ 餘額不足，自動發送 RemoteStopTransaction | CP={cp_id} | tx={transaction_id}")
-                cp = connected_charge_points.get(cp_id)
-                if cp:
-                    try:
-                        req = call.RemoteStopTransactionPayload(transaction_id=int(transaction_id))
-                        resp = await cp.call(req)
-                        logging.info(f"🔧 RemoteStopTransaction 回應: {resp}")
-                    except Exception as e:
-                        logging.error(f"❌ 發送 RemoteStopTransaction 失敗: {e}")
-                else:
-                    logging.warning(f"⚠️ 找不到連線中的充電樁 {cp_id}，無法自動停充")
-
-
+        
             logging.info(f"📊 MeterValues 寫入完成，共 {insert_count} 筆 | tx={transaction_id}")
 
             return call_result.MeterValuesPayload()
