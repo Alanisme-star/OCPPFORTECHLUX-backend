@@ -985,6 +985,32 @@ class ChargePoint(OcppChargePoint):
                                                          estimated_amount=est_amount,
                                                          price_per_kwh=unit_price,
                                                          timestamp=ts)
+
+
+
+                                            # --- ⭐ 新增：即時更新卡片餘額 ---
+                                            try:
+                                                with sqlite3.connect(DB_FILE) as _c4:
+                                                    _cur4 = _c4.cursor()
+                                                    _cur4.execute("""
+                                                        SELECT t.id_tag, c.balance
+                                                        FROM transactions t
+                                                        JOIN cards c ON t.id_tag = c.card_id
+                                                        WHERE t.transaction_id = ?
+                                                    """, (transaction_id,))
+                                                    row4 = _cur4.fetchone()
+                                                    if row4:
+                                                        id_tag, current_balance = row4
+                                                        new_balance = max(0.0, float(current_balance) - float(est_amount))
+                                                        _cur4.execute("UPDATE cards SET balance=? WHERE card_id=?", (new_balance, id_tag))
+                                                        _c4.commit()
+                                                        logging.info(f"💳 即時更新卡片餘額 | idTag={id_tag} | 新餘額={new_balance:.2f}")
+                                            except Exception as e:
+                                                logging.error(f"⚠️ 即時扣款更新失敗: {e}")
+
+
+
+
                                 except Exception as e:
                                     logging.warning(f"⚠️ 預估金額計算失敗: {e}")
 
