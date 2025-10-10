@@ -1003,7 +1003,9 @@ class ChargePoint(OcppChargePoint):
                 _c.commit()
 
 
-            # ⭐ 改良版：餘額保護機制（balance < 0.01 時自動停充，含型別檢查）
+
+
+            # ⭐ 改良版：餘額保護機制（balance < 0.01 時自動停充）
             try:
                 with sqlite3.connect(DB_FILE) as _c3:
                     _cur3 = _c3.cursor()
@@ -1051,8 +1053,6 @@ class ChargePoint(OcppChargePoint):
 
             except Exception as e:
                 logging.error(f"⚠️ 餘額自動停充檢查失敗: {e}")
-
-
 
 
 
