@@ -1041,6 +1041,11 @@ class ChargePoint(OcppChargePoint):
             logging.info(f"📊 MeterValues 寫入完成，共 {insert_count} 筆 | tx={transaction_id}")
             return call_result.MeterValuesPayload()
 
+        except Exception as e:
+            logging.exception(f"❌ 處理 MeterValues 例外：{e}")
+            return call_result.MeterValuesPayload()
+
+
 
 
 
