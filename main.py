@@ -961,13 +961,13 @@ class ChargePoint(OcppChargePoint):
                                 prev_energy = (live_status_cache.get(cp_id) or {}).get("energy")
                                 if prev_energy is not None:
                                     diff = kwh - prev_energy
-                                    if diff < 0 or diff > 10:  # 閾值可調整
+                                    if diff < 0 or diff > 10:
                                         logging.warning(
                                             f"⚠️ 棄用異常能量值：{kwh} kWh (diff={diff}，prev={prev_energy})"
                                         )
                                         continue
 
-                                # === 統一資料庫連線區塊 ===
+                                # === 改為統一資料庫連線 ===
                                 try:
                                     with sqlite3.connect(DB_FILE, timeout=5.0) as conn:
                                         cur = conn.cursor()
@@ -975,7 +975,7 @@ class ChargePoint(OcppChargePoint):
                                         # 更新即時能量
                                         _upsert_live(cp_id, energy=round(kwh, 6), timestamp=ts)
 
-                                        # 計算預估電量與金額
+                                        # 取得交易資訊
                                         cur.execute("""
                                             SELECT meter_start, id_tag
                                             FROM transactions
@@ -989,14 +989,14 @@ class ChargePoint(OcppChargePoint):
                                             unit_price = float(_price_for_timestamp(ts)) if ts else 6.0
                                             est_amount = round(used_kwh * unit_price, 2)
 
-                                            # 更新 live cache
+                                            # 更新 live 資訊
                                             _upsert_live(cp_id,
                                                          estimated_energy=round(used_kwh, 6),
                                                          estimated_amount=est_amount,
                                                          price_per_kwh=unit_price,
                                                          timestamp=ts)
 
-                                            # --- ⭐ 即時扣款（同一連線完成）---
+                                            # --- ⭐ 即時扣款：使用同一連線 ---
                                             cur.execute("""
                                                 SELECT balance FROM cards WHERE card_id = ?
                                             """, (id_tag,))
@@ -1004,9 +1004,7 @@ class ChargePoint(OcppChargePoint):
                                             if row_bal:
                                                 current_balance = float(row_bal[0] or 0)
                                                 new_balance = max(0.0, current_balance - est_amount)
-                                                cur.execute("""
-                                                    UPDATE cards SET balance=? WHERE card_id=?
-                                                """, (new_balance, id_tag))
+                                                cur.execute("UPDATE cards SET balance=? WHERE card_id=?", (new_balance, id_tag))
                                                 logging.info(f"💳 即時更新卡片餘額 | idTag={id_tag} | 新餘額={new_balance:.2f}")
 
                                         conn.commit()
@@ -1019,12 +1017,8 @@ class ChargePoint(OcppChargePoint):
                                 except Exception as e:
                                     logging.error(f"⚠️ 預估金額或扣款失敗: {e}")
 
-                        # Debug log
                         logging.info(f"[DEBUG][MeterValues] tx={transaction_id} | measurand={meas} | value={val}{unit} | ts={ts}")
 
-
-                        # Debug log
-                        logging.info(f"[DEBUG][MeterValues] tx={transaction_id} | measurand={meas} | value={val}{unit} | ts={ts}")
 
                     # (推算功率)
                     live_now = live_status_cache.get(cp_id) or {}
