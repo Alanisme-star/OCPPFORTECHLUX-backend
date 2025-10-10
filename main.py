@@ -165,9 +165,8 @@ async def _accept_or_reject_ws(websocket: WebSocket, raw_cp_id: str):
     supplied_token = qs.get("token")
 
     # 查白名單
-    with db_lock:
-        cur = global_conn.cursor()
-
+    with get_conn() as _c:
+        cur = _c.cursor()
         cur.execute("SELECT charge_point_id FROM charge_points")
         allowed_ids = [row[0] for row in cur.fetchall()]
 
@@ -227,22 +226,9 @@ async def websocket_endpoint(websocket: WebSocket, charge_point_id: str):
             await websocket.close()
         except Exception:
             pass
-
     finally:
-        norm_id = _normalize_cp_id(charge_point_id)
-
-        # 保留 connected_charge_points，以便 RemoteStopTransaction 能找到對應對象
-        if norm_id in connected_charge_points:
-            logging.info(f"🔌 連線已關閉：{norm_id}（連線物件暫留以便停充）")
-        else:
-            logging.info(f"🔌 連線已關閉：{norm_id}（無對應物件）")
-
-        # ✅ 僅清除即時快取，避免下次啟動殘留數值
-        if norm_id in live_status_cache:
-            live_status_cache.pop(norm_id, None)
-            logging.info(f"🧹 清除中斷樁的即時快取資料：{norm_id}")
-        else:
-            logging.info(f"ℹ️ 無快取可清（可能尚未啟動交易）：{norm_id}")
+        # 3) 清理連線狀態
+        connected_charge_points.pop(_normalize_cp_id(charge_point_id), None)
 
 
 
@@ -259,19 +245,14 @@ async def get_status(cp_id: str):
 # 初始化 SQLite 資料庫
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_FILE = os.path.join(BASE_DIR, "ocpp_data.db")  # ✅ 固定資料庫絕對路徑
-import threading
+conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+cursor = conn.cursor()
 
-# === 全域資料庫連線與鎖 ===
-db_lock = threading.Lock()
-global_conn = sqlite3.connect(DB_FILE, check_same_thread=False, isolation_level=None)
 
 def get_conn():
-    """回傳統一的全域連線"""
-    return global_conn
+    # 為每次查詢建立新的連線與游標，避免共用全域 cursor 造成並發問題
+    return sqlite3.connect(DB_FILE, check_same_thread=False)
 
-# === 新增這兩行，供下面建表用 ===
-conn = global_conn
-cursor = conn.cursor()
 
 
 
@@ -489,8 +470,8 @@ class ChargePoint(OcppChargePoint):
         from datetime import datetime, timezone
 
         # 讀取交易資訊
-        with db_lock:
-            cursor = global_conn.cursor()
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
             cursor.execute('''
                 SELECT meter_stop, id_tag FROM transactions WHERE transaction_id = ?
             ''', (transaction_id,))
@@ -550,13 +531,13 @@ class ChargePoint(OcppChargePoint):
                 logging.error(f"❌ 欄位遺失 | cp_id={cp_id} | connector_id={connector_id} | status={status}")
                 return call_result.StatusNotificationPayload()
 
-            with db_lock:
-                cursor = global_conn.cursor()
+            with sqlite3.connect(DB_FILE) as conn:
+                cursor = conn.cursor()
                 cursor.execute('''
                     INSERT INTO status_logs (charge_point_id, connector_id, status, timestamp)
                     VALUES (?, ?, ?, ?)
                 ''', (cp_id, connector_id, status, timestamp))
-                global_conn.commit()
+                conn.commit()
 
             charging_point_status[cp_id] = {
                 "connector_id": connector_id,
@@ -581,15 +562,15 @@ class ChargePoint(OcppChargePoint):
                     "timestamp": datetime.utcnow().isoformat()
                 }
                 # → 補一筆 0 kWh 到 DB
-                with db_lock:
-                    _cur = global_c.cursor()
+                with sqlite3.connect(DB_FILE) as _c:
+                    _cur = _c.cursor()
                     _cur.execute('''
                         INSERT INTO meter_values (charge_point_id, connector_id, transaction_id,
                                                   value, measurand, unit, timestamp)
                         VALUES (?, ?, ?, ?, ?, ?, ?)
                     ''', (cp_id, connector_id, None, 0.0,
                           "Energy.Active.Import.Register", "kWh", datetime.utcnow().isoformat()))
-                    global_c.commit()
+                    _c.commit()
 
                 logging.debug(f"🔍 [DEBUG] Status=Available 後快取: {live_status_cache.get(cp_id)}")
 
@@ -662,8 +643,8 @@ class ChargePoint(OcppChargePoint):
 
     @on(Action.StartTransaction)
     async def on_start_transaction(self, connector_id, id_tag, meter_start, timestamp, **kwargs):
-        with db_lock:
-            cursor = global_conn.cursor()
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
 
             # 驗證 idTag
             with get_conn() as _c:
@@ -739,7 +720,7 @@ class ChargePoint(OcppChargePoint):
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (transaction_id, self.id, connector_id, id_tag, meter_start, start_ts, None, None, None))
 
-            global_conn.commit()
+            conn.commit()
             logging.info(f"🚗 StartTransaction 成功 | CP={self.id} | idTag={id_tag} | transactionId={transaction_id} | start_ts={start_ts} | meter_start={meter_start_val} kWh")
 
             # ⭐ 重置快取，避免沿用上一筆交易的電費/電量
@@ -780,8 +761,8 @@ class ChargePoint(OcppChargePoint):
 
             reason = kwargs.get("reason")
 
-            with db_lock:
-                _cur = global_conn.cursor()
+            with sqlite3.connect(DB_FILE) as _conn:
+                _cur = _conn.cursor()
 
                 # 更新 stop_transactions & transactions
                 _cur.execute('''
@@ -833,7 +814,7 @@ class ChargePoint(OcppChargePoint):
                         VALUES (?, ?, ?, ?, ?, ?)
                     ''', (transaction_id, 0.0, total_amount, 0.0, total_amount, stop_ts))
 
-                global_conn.commit()
+                _conn.commit()
                 # ====== ⭐ 新增結束 ======
 
             # ⭐ 清除快取
@@ -879,8 +860,8 @@ class ChargePoint(OcppChargePoint):
 
             transaction_id = pick(kwargs, "transactionId", "transaction_id", "TransactionId", default="")
             if not transaction_id:
-                with db_lock:
-                    _cur = global_c.cursor()
+                with sqlite3.connect(DB_FILE) as _c:
+                    _cur = _c.cursor()
                     _cur.execute("""
                         SELECT transaction_id FROM transactions
                         WHERE charge_point_id=? AND stop_timestamp IS NULL
@@ -897,7 +878,7 @@ class ChargePoint(OcppChargePoint):
             insert_count = 0
             last_ts_in_batch = None
 
-            
+            with sqlite3.connect(DB_FILE) as _c:
                 _cur = _c.cursor()
 
                 for mv in meter_value_list:
@@ -967,64 +948,35 @@ class ChargePoint(OcppChargePoint):
                                 prev_energy = (live_status_cache.get(cp_id) or {}).get("energy")
                                 if prev_energy is not None:
                                     diff = kwh - prev_energy
-                                    if diff < 0 or diff > 10:
+                                    if diff < 0 or diff > 10:  # 閾值可調整
                                         logging.warning(
                                             f"⚠️ 棄用異常能量值：{kwh} kWh (diff={diff}，prev={prev_energy})"
                                         )
                                         continue
 
-                                # === 改為統一資料庫連線 ===
+                                _upsert_live(cp_id, energy=round(kwh, 6), timestamp=ts)
+
+                                # 計算用電量與金額
                                 try:
-                                    with sqlite3.connect(DB_FILE, timeout=5.0) as conn:
-                                        cur = global_conn.cursor()
-
-                                        # 更新即時能量
-                                        _upsert_live(cp_id, energy=round(kwh, 6), timestamp=ts)
-
-                                        # 取得交易資訊
-                                        cur.execute("""
-                                            SELECT meter_start, id_tag
-                                            FROM transactions
-                                            WHERE transaction_id = ?
-                                        """, (transaction_id,))
-                                        row_tx = cur.fetchone()
+                                    with sqlite3.connect(DB_FILE) as _c2:
+                                        _cur2 = _c2.cursor()
+                                        _cur2.execute("SELECT meter_start FROM transactions WHERE transaction_id = ?", (transaction_id,))
+                                        row_tx = _cur2.fetchone()
                                         if row_tx:
-                                            meter_start_wh, id_tag = row_tx
-                                            meter_start_wh = float(meter_start_wh or 0)
+                                            meter_start_wh = float(row_tx[0] or 0)
                                             used_kwh = max(0.0, (kwh - (meter_start_wh / 1000.0)))
                                             unit_price = float(_price_for_timestamp(ts)) if ts else 6.0
                                             est_amount = round(used_kwh * unit_price, 2)
-
-                                            # 更新 live 資訊
                                             _upsert_live(cp_id,
                                                          estimated_energy=round(used_kwh, 6),
                                                          estimated_amount=est_amount,
                                                          price_per_kwh=unit_price,
                                                          timestamp=ts)
-
-                                            # --- ⭐ 即時扣款：使用同一連線 ---
-                                            cur.execute("""
-                                                SELECT balance FROM cards WHERE card_id = ?
-                                            """, (id_tag,))
-                                            row_bal = cur.fetchone()
-                                            if row_bal:
-                                                current_balance = float(row_bal[0] or 0)
-                                                new_balance = max(0.0, current_balance - est_amount)
-                                                cur.execute("UPDATE cards SET balance=? WHERE card_id=?", (new_balance, id_tag))
-                                                logging.info(f"💳 即時更新卡片餘額 | idTag={id_tag} | 新餘額={new_balance:.2f}")
-
-                                        global_conn.commit()
-
-                                except sqlite3.OperationalError as e:
-                                    if "locked" in str(e).lower():
-                                        logging.warning("⚠️ 資料庫忙碌，略過本輪即時扣款（等待下一輪）")
-                                    else:
-                                        logging.error(f"⚠️ 即時扣款更新失敗: {e}")
                                 except Exception as e:
-                                    logging.error(f"⚠️ 預估金額或扣款失敗: {e}")
+                                    logging.warning(f"⚠️ 預估金額計算失敗: {e}")
 
+                        # Debug log
                         logging.info(f"[DEBUG][MeterValues] tx={transaction_id} | measurand={meas} | value={val}{unit} | ts={ts}")
-
 
                     # (推算功率)
                     live_now = live_status_cache.get(cp_id) or {}
@@ -1038,8 +990,7 @@ class ChargePoint(OcppChargePoint):
                 _c.commit()
 
 
-
-            # ⭐ 餘額保護機制（餘額 ≤ 0 時自動停充）
+            # ⭐ 新增：餘額保護機制（餘額 ≤ 0 時自動停充）
             try:
                 with sqlite3.connect(DB_FILE) as _c3:
                     _cur3 = _c3.cursor()
@@ -1053,37 +1004,42 @@ class ChargePoint(OcppChargePoint):
                     if row:
                         id_tag, balance = row
                         balance = float(balance or 0)
-                        logging.info(f"[DEBUG] 餘額檢查: tx={transaction_id} balance={balance}")
-
-                        # --- 餘額不足自動停充 ---
                         if balance <= 0.01 and transaction_id not in stop_requested:
                             stop_requested.add(transaction_id)
                             logging.warning(f"⚡ 餘額不足，自動發送 RemoteStopTransaction | CP={cp_id} | tx={transaction_id}")
-
                             cp = connected_charge_points.get(cp_id)
                             if cp:
-                                try:
-                                    from ocpp.v16 import call
-                                    req = call.RemoteStopTransaction(transaction_id=int(transaction_id))
-                                    resp = await cp.call(req)
-                                    logging.info(f"🔧 RemoteStopTransaction 回應: {resp}")
-                                except Exception as e:
-                                    logging.error(f"❌ 發送 RemoteStopTransaction 失敗: {e}")
+                                await cp.send_stop_transaction(transaction_id)
                             else:
                                 logging.warning(f"⚠️ 找不到連線中的充電樁 {cp_id}，無法自動停充")
             except Exception as e:
                 logging.error(f"⚠️ 餘額自動停充檢查失敗: {e}")
 
+
+            from ocpp.v16 import call
+            logging.info(f"[DEBUG] 餘額檢查: tx={transaction_id} balance={balance}")
+            if balance <= 0.01 and transaction_id not in stop_requested:
+                stop_requested.add(transaction_id)
+                logging.warning(f"⚡ 餘額不足，自動發送 RemoteStopTransaction | CP={cp_id} | tx={transaction_id}")
+                cp = connected_charge_points.get(cp_id)
+                if cp:
+                    try:
+                        req = call.RemoteStopTransactionPayload(transaction_id=int(transaction_id))
+                        resp = await cp.call(req)
+                        logging.info(f"🔧 RemoteStopTransaction 回應: {resp}")
+                    except Exception as e:
+                        logging.error(f"❌ 發送 RemoteStopTransaction 失敗: {e}")
+                else:
+                    logging.warning(f"⚠️ 找不到連線中的充電樁 {cp_id}，無法自動停充")
+
+
             logging.info(f"📊 MeterValues 寫入完成，共 {insert_count} 筆 | tx={transaction_id}")
+
             return call_result.MeterValuesPayload()
 
         except Exception as e:
             logging.exception(f"❌ 處理 MeterValues 例外：{e}")
             return call_result.MeterValuesPayload()
-
-
-
-
 
 
 
@@ -2990,29 +2946,9 @@ conn.commit()
 
 
 
-@app.websocket("/{cp_id}")
-async def websocket_endpoint(websocket: WebSocket, cp_id: str):
-    """
-    OCPP WebSocket entry point.
-    用於接收充電樁連線，例如:
-    wss://ocppfortechlux-backend.onrender.com/TW*MSI*E000100
-    """
-    await websocket.accept()
-    logging.info(f"🔌 Charge Point connected: {cp_id}")
-
-    try:
-        while True:
-            data = await websocket.receive_text()
-            logging.debug(f"📥 Received from {cp_id}: {data}")
-            # 這裡可以呼叫你的 OCPP handler，例如：
-            # await handle_ocpp_message(cp_id, data, websocket)
-            await websocket.send_text(f"ACK from backend for {cp_id}")
-    except Exception as e:
-        logging.warning(f"⚠️ WebSocket disconnected | {cp_id}: {e}")
-    finally:
-        await websocket.close()
-        logging.info(f"🔌 Disconnected: {cp_id}")
-
+@app.get("/")
+async def root():
+    return {"status": "API is running"}
 
 
 
@@ -3544,4 +3480,3 @@ if __name__ == "__main__":
     import os, uvicorn
     port = int(os.getenv("PORT", "10000"))
     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
-
