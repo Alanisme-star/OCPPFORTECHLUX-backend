@@ -35,6 +35,38 @@ from ocpp.routing import on
 from urllib.parse import urlparse, parse_qsl
 from reportlab.pdfgen import canvas
 
+
+
+# === 優先寫入佇列機制（Priority Write Queue） ===
+import asyncio
+import sqlite3
+import logging
+
+DB_FILE = "ocpp_data.db"
+write_queue = asyncio.PriorityQueue()
+
+async def db_writer():
+    """背景寫入任務：統一管理 SQLite 寫入"""
+    conn = sqlite3.connect(DB_FILE, timeout=30)
+    conn.execute("PRAGMA journal_mode=WAL;")  # 啟用 WAL 模式以支援併發
+    while True:
+        try:
+            priority, sql, params = await write_queue.get()
+            conn.execute(sql, params)
+            conn.commit()
+            write_queue.task_done()
+        except Exception as e:
+            logging.warning(f"⚠️ DB 寫入失敗: {e}")
+            await asyncio.sleep(0.1)  # 避免 busy-loop
+
+async def add_write_task(priority: int, sql: str, params: tuple = ()):
+    """加入寫入任務（priority 數字越小優先級越高）"""
+    await write_queue.put((priority, sql, params))
+
+
+
+
+
 app = FastAPI()
 
 # === WebSocket 連線驗證設定（可選）===
@@ -714,13 +746,7 @@ class ChargePoint(OcppChargePoint):
 
             # 寫入交易紀錄
             cursor.execute("""
-                INSERT INTO transactions (
-                    transaction_id, charge_point_id, connector_id, id_tag,
-                    meter_start, start_timestamp, meter_stop, stop_timestamp, reason
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (transaction_id, self.id, connector_id, id_tag, meter_start, start_ts, None, None, None))
-
-            conn.commit()
+                await add_write_task(2, "INSERT INTO transactions (transaction_id, cp_id, id_tag, start_timestamp) VALUES (?, ?, ?, ?)", (...))
             logging.info(f"🚗 StartTransaction 成功 | CP={self.id} | idTag={id_tag} | transactionId={transaction_id} | start_ts={start_ts} | meter_start={meter_start_val} kWh")
 
             # ⭐ 重置快取，避免沿用上一筆交易的電費/電量
@@ -977,7 +1003,7 @@ class ChargePoint(OcppChargePoint):
 
 
 
-                                    # ⭐ 即時扣款：每次 MeterValues 來時更新卡片餘額
+                                    # ⭐ 改良版：即時扣款（按差額扣款，防止重複扣）
                                     try:
                                         _cur2.execute("""
                                             SELECT t.id_tag, c.balance
@@ -988,12 +1014,25 @@ class ChargePoint(OcppChargePoint):
                                         row_card = _cur2.fetchone()
                                         if row_card:
                                             id_tag, balance = row_card
-                                            new_balance = max(0.0, balance - est_amount)
-                                            _cur2.execute("UPDATE cards SET balance=? WHERE card_id=?", (new_balance, id_tag))
-                                            logging.info(f"💰 即時扣款 | idTag={id_tag} | 扣款至今={est_amount} | 剩餘餘額={new_balance}")
-                                            _c2.commit()
+
+                                            # 取得上次記錄的估算金額（若無則視為 0）
+                                            prev_est = (live_status_cache.get(cp_id) or {}).get("prev_est_amount", 0)
+
+                                            # 計算差額（本次累積 - 上次累積）
+                                            diff_amount = max(0.0, est_amount - prev_est)
+
+                                            if diff_amount > 0:
+                                                new_balance = max(0.0, balance - diff_amount)
+                                                await add_write_task(1, "UPDATE cards SET balance=? WHERE card_id=?", (new_balance, id_tag))
+                                                logging.info(f"💰 即時扣款 | idTag={id_tag} | 本次扣={diff_amount} | 累積估算={est_amount} | 餘額={new_balance}")
+                                                
+
+                                            # 更新快取中的上次累積金額
+                                            _upsert_live(cp_id, prev_est_amount=est_amount)
+
                                     except Exception as e:
                                         logging.warning(f"⚠️ 即時扣款失敗: {e}")
+
 
 
 
