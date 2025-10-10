@@ -972,6 +972,34 @@ class ChargePoint(OcppChargePoint):
                                                          estimated_amount=est_amount,
                                                          price_per_kwh=unit_price,
                                                          timestamp=ts)
+
+
+
+
+
+                                    # ⭐ 即時扣款：每次 MeterValues 來時更新卡片餘額
+                                    try:
+                                        _cur2.execute("""
+                                            SELECT t.id_tag, c.balance
+                                            FROM transactions t
+                                            JOIN cards c ON t.id_tag = c.card_id
+                                            WHERE t.transaction_id = ?
+                                        """, (transaction_id,))
+                                        row_card = _cur2.fetchone()
+                                        if row_card:
+                                            id_tag, balance = row_card
+                                            new_balance = max(0.0, balance - est_amount)
+                                            _cur2.execute("UPDATE cards SET balance=? WHERE card_id=?", (new_balance, id_tag))
+                                            logging.info(f"💰 即時扣款 | idTag={id_tag} | 扣款至今={est_amount} | 剩餘餘額={new_balance}")
+                                            _c2.commit()
+                                    except Exception as e:
+                                        logging.warning(f"⚠️ 即時扣款失敗: {e}")
+
+
+
+
+
+
                                 except Exception as e:
                                     logging.warning(f"⚠️ 預估金額計算失敗: {e}")
 
