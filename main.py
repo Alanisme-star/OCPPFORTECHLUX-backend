@@ -2775,7 +2775,7 @@ async def get_daily_by_chargepoint_range(
 ):
     result_map = {}
     cur = global_conn.cursor()
-        cursor = global_conn.cursor()
+    cursor = global_conn.cursor()
         cursor.execute("""
             SELECT strftime('%Y-%m-%d', start_timestamp) as day,
                    charge_point_id,
