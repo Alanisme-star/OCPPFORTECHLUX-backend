@@ -269,7 +269,9 @@ def get_conn():
     """回傳統一的全域連線"""
     return global_conn
 
-
+# === 新增這兩行，供下面建表用 ===
+conn = global_conn
+cursor = conn.cursor()
 
 
 
