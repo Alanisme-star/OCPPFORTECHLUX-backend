@@ -1029,7 +1029,7 @@ class ChargePoint(OcppChargePoint):
                             if cp:
                                 try:
                                     from ocpp.v16 import call
-                                    req = call.RemoteStopTransactionPayload(transaction_id=int(transaction_id))
+                                    req = call.RemoteStopTransaction(transaction_id=int(transaction_id))
                                     resp = await cp.call(req)
                                     logging.info(f"🔧 RemoteStopTransaction 回應: {resp}")
                                 except Exception as e:
