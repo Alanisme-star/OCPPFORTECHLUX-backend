@@ -1892,28 +1892,29 @@ def get_charge_point_status(charge_point_id: str):
 
 
 
-
 @app.get("/api/charge-points/{charge_point_id}/latest-status")
-def get_latest_status(charge_point_id: str):
+async def get_latest_status(charge_point_id: str):
+    """查詢資料庫中最新的樁狀態（不使用快取）"""
     cp_id = _normalize_cp_id(charge_point_id)
-    with sqlite3.connect(DB_FILE) as conn:
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT status, last_update FROM charge_points
-            WHERE charge_point_id = ?
-        """, (cp_id,))
-        row = cur.fetchone()
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT status, last_update
+                FROM charge_points
+                WHERE charge_point_id = ?
+            """, (cp_id,))
+            row = cur.fetchone()
 
-    if row:
-        return {
-            "status": row[0],
-            "timestamp": row[1]
-        }
-    else:
-        return {
-            "status": "Unknown",
-            "timestamp": None
-        }
+        if row:
+            status, last_update = row
+            return {"status": status, "timestamp": last_update}
+        else:
+            return {"status": "Unknown", "timestamp": None}
+    except Exception as e:
+        logging.error(f"❌ 讀取最新樁狀態失敗: {e}")
+        return {"status": "Unknown", "timestamp": None}
+
 
 
 
