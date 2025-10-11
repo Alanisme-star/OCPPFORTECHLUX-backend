@@ -1122,6 +1122,32 @@ def force_add_charge_point(
     }
 
 
+# ------------------------------------------------------------
+# ⭐ 當充電樁（或模擬器）斷線時，更新狀態為 Available
+# ------------------------------------------------------------
+async def on_disconnect(self, websocket, close_code):
+    try:
+        # 嘗試從 websocket 物件中取得充電樁 ID
+        cp_id = getattr(websocket, "cp_id", None)
+        if cp_id:
+            # 從已連線清單中移除
+            connected_charge_points.pop(cp_id, None)
+            logging.warning(f"⚠️ 充電樁已斷線: {cp_id}")
+
+            # 更新資料庫中該樁狀態為 Available
+            with sqlite3.connect(DB_FILE, timeout=15) as conn:
+                cur = conn.cursor()
+                cur.execute("""
+                    UPDATE charge_points
+                    SET status = 'Available'
+                    WHERE charge_point_id = ?
+                """, (cp_id,))
+                conn.commit()
+                logging.info(f"✅ 已將 {cp_id} 狀態更新為 Available")
+        else:
+            logging.warning("⚠️ 無法辨識斷線的充電樁 ID")
+    except Exception as e:
+        logging.error(f"❌ on_disconnect 更新狀態時發生錯誤: {e}")
 
 
 
