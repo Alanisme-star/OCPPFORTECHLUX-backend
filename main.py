@@ -116,16 +116,6 @@ def get_whitelist():
     }
 
 
-# 🔧 新增：即時電價查詢 API
-@app.get("/api/debug/price")
-def get_debug_price():
-    """回傳目前後端實際使用的電價"""
-    try:
-        price = get_current_price()
-        return {"current_price": price}
-    except Exception as e:
-        return {"error": str(e)}
-
 
 
 
@@ -264,6 +254,49 @@ def get_conn():
     # 為每次查詢建立新的連線與游標，避免共用全域 cursor 造成並發問題
     return sqlite3.connect(DB_FILE, check_same_thread=False, timeout=15)
 
+
+
+# 🔧 新增：根據時間戳查詢當前適用電價
+def _price_for_timestamp(ts: str) -> float:
+    """
+    根據時間戳（ISO格式）從 daily_pricing_rules 表查出對應的電價。
+    若該時段未設定電價，則回傳預設值 6.0。
+    """
+    try:
+        dt = datetime.fromisoformat(ts)
+        date_str = dt.strftime("%Y-%m-%d")
+        time_str = dt.strftime("%H:%M")
+
+        with sqlite3.connect(DB_FILE) as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT price FROM daily_pricing_rules
+                WHERE date = ?
+                  AND start_time <= ?
+                  AND end_time > ?
+                ORDER BY start_time DESC LIMIT 1
+            """, (date_str, time_str, time_str))
+            row = cur.fetchone()
+            if row:
+                return float(row[0])
+    except Exception as e:
+        logging.warning(f"⚠️ 電價查詢失敗: {e}")
+
+    # 若查無設定則給預設值
+    return 6.0
+
+
+# 🔧 新增：即時查詢目前後端實際使用電價的 API
+@app.get("/api/debug/price")
+def debug_price():
+    """
+    回傳目前後端根據 daily_pricing_rules 所採用的電價。
+    可用 curl 查詢：
+    curl https://ocppfortechlux-backend.onrender.com/api/debug/price
+    """
+    now = datetime.utcnow().isoformat()
+    price = _price_for_timestamp(now)
+    return {"current_price": price}
 
 
 
