@@ -19,7 +19,7 @@ import uvicorn
 import asyncio
 pending_stop_transactions = {}
 # 針對每筆交易做「已送停充」去重，避免前端/後端重複送
-stop_requested = set()
+
 
 logger = logging.getLogger(__name__)
 
