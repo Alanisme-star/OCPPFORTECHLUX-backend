@@ -1900,20 +1900,22 @@ async def get_latest_status(charge_point_id: str):
         with sqlite3.connect(DB_FILE) as conn:
             cur = conn.cursor()
             cur.execute("""
-                SELECT status, last_update
+                SELECT status
                 FROM charge_points
                 WHERE charge_point_id = ?
             """, (cp_id,))
             row = cur.fetchone()
 
         if row:
-            status, last_update = row
-            return {"status": status, "timestamp": last_update}
+            status = row[0]
+            return {"status": status}
         else:
-            return {"status": "Unknown", "timestamp": None}
+            return {"status": "Unknown"}
     except Exception as e:
         logging.error(f"❌ 讀取最新樁狀態失敗: {e}")
-        return {"status": "Unknown", "timestamp": None}
+        return {"status": "Unknown"}
+
+
 
 
 
