@@ -1895,24 +1895,29 @@ def get_charge_point_status(charge_point_id: str):
 
 @app.get("/api/charge-points/{charge_point_id}/latest-status")
 def get_latest_status(charge_point_id: str):
-    charge_point_id = _normalize_cp_id(charge_point_id)
-    c = conn.cursor()
-    # 優先取充電樁傳來的最新 StatusNotification 紀錄
-    c.execute(
-        """
-        SELECT status, timestamp
-        FROM status_logs
-        WHERE charge_point_id = ?
-        ORDER BY timestamp DESC
-        LIMIT 1
-        """,
-        (charge_point_id,),
-    )
-    row = c.fetchone()
+    cp_id = _normalize_cp_id(charge_point_id)
+    with sqlite3.connect(DB_FILE) as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT status, last_update FROM charge_points
+            WHERE charge_point_id = ?
+        """, (cp_id,))
+        row = cur.fetchone()
+
     if row:
-        return {"status": row[0], "timestamp": row[1]}
-    # 找不到就回 Unknown
-    return {"status": "Unknown"}
+        return {
+            "status": row[0],
+            "timestamp": row[1]
+        }
+    else:
+        return {
+            "status": "Unknown",
+            "timestamp": None
+        }
+
+
+
+
 
 
 @app.get("/api/transactions/{transaction_id}/summary")
