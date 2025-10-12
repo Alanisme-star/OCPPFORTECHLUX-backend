@@ -1024,7 +1024,7 @@ class ChargePoint(OcppChargePoint):
                         if est_amount is not None:
                             est_amount = float(est_amount)
                             prev_amount = float(prev_amount or 0)
-                            diff = max(0.0, est_amount - prev_amount)  # ← 只扣新增加的部分
+                            diff = max(0.0, est_amount - prev_amount)  # ← 只扣新增部分
 
                             old_balance = float(old_balance or 0)
                             new_balance = max(0.0, old_balance - diff)
@@ -1047,9 +1047,11 @@ class ChargePoint(OcppChargePoint):
                                 f"💳 [即時扣款Δ] idTag={id_tag} | 原餘額={old_balance:.3f} → 新餘額={new_balance:.3f} | "
                                 f"本次新增={diff:.3f} | 累積預估={est_amount:.3f} | 累積扣款={total_deducted:.3f}"
                             )
+
             except Exception as e:
                 logging.error(f"⚠️ 即時扣款失敗: {e}")
             # ===============================================================
+
 
 
 
