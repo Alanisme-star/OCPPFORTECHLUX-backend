@@ -635,10 +635,6 @@ class ChargePoint(OcppChargePoint):
         try:
             now = datetime.utcnow().replace(tzinfo=timezone.utc)
             logging.info(f"🔌 BootNotification | 模型={charge_point_model} | 廠商={charge_point_vendor}")
-            return call_result.BootNotificationPayload(
-                current_time=now.isoformat(),
-                interval=10,
-                status=RegistrationStatus.accepted
 
 
 
@@ -653,9 +649,11 @@ class ChargePoint(OcppChargePoint):
                 conn.commit()
                 logging.info(f"✅ Boot 後更新 {self.id} 狀態為 Available")
 
-
-
-
+            # ✅ 最後才 return 結果
+            return call_result.BootNotificationPayload(
+                current_time=now.isoformat(),
+                interval=10,
+                status=RegistrationStatus.accepted
             )
         except Exception as e:
             logging.exception(f"BootNotification handler error: {e}")
@@ -906,7 +904,7 @@ class ChargePoint(OcppChargePoint):
                         WHERE charge_point_id = ?
                     """, (cp_id,))
                     _c3.commit()
-                   logging.info(f"✅ StopTransaction 更新 {cp_id} 狀態為 Available")
+                    logging.info(f"✅ StopTransaction 更新 {cp_id} 狀態為 Available")
 
 
 
