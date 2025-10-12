@@ -635,21 +635,6 @@ class ChargePoint(OcppChargePoint):
         try:
             now = datetime.utcnow().replace(tzinfo=timezone.utc)
             logging.info(f"🔌 BootNotification | 模型={charge_point_model} | 廠商={charge_point_vendor}")
-
-
-
-            # ⭐ 新增：Boot 後更新資料庫狀態為 Available
-            with sqlite3.connect(DB_FILE, timeout=15) as conn:
-                cur = conn.cursor()
-                cur.execute("""
-                    UPDATE charge_points
-                    SET status = 'Available'
-                    WHERE charge_point_id = ?
-                """, (self.id,))
-                conn.commit()
-                logging.info(f"✅ Boot 後更新 {self.id} 狀態為 Available")
-
-            # ✅ 最後才 return 結果
             return call_result.BootNotificationPayload(
                 current_time=now.isoformat(),
                 interval=10,
@@ -782,23 +767,6 @@ class ChargePoint(OcppChargePoint):
             conn.commit()
             logging.info(f"🚗 StartTransaction 成功 | CP={self.id} | idTag={id_tag} | transactionId={transaction_id} | start_ts={start_ts} | meter_start={meter_start_val} kWh")
 
-
-
-
-            # ⭐ 新增：開始交易 → 更新樁狀態為 Charging
-            with sqlite3.connect(DB_FILE, timeout=15) as _c:
-                _cur = _c.cursor()
-                _cur.execute("""
-                    UPDATE charge_points
-                    SET status = 'Charging'
-                    WHERE charge_point_id = ?
-                """, (self.id,))
-                _c.commit()
-                logging.info(f"✅ StartTransaction 更新 {self.id} 狀態為 Charging")
-
-
-
-
             # ⭐ 重置快取，避免沿用上一筆交易的電費/電量
             live_status_cache[self.id] = {
                 "power": 0,
@@ -892,23 +860,6 @@ class ChargePoint(OcppChargePoint):
 
                 _conn.commit()
                 # ====== ⭐ 新增結束 ======
-
-
-
-                # ⭐ 新增：結束交易 → 更新樁狀態為 Available
-                with sqlite3.connect(DB_FILE, timeout=15) as _c3:
-                    _cur3 = _c3.cursor()
-                    _cur3.execute("""
-                        UPDATE charge_points
-                        SET status = 'Available'
-                        WHERE charge_point_id = ?
-                    """, (cp_id,))
-                    _c3.commit()
-                    logging.info(f"✅ StopTransaction 更新 {cp_id} 狀態為 Available")
-
-
-
-
 
             # ⭐ 清除快取
             logging.debug(f"🔍 [DEBUG] StopTransaction 前快取: {live_status_cache.get(cp_id)}")
@@ -1188,11 +1139,11 @@ async def on_disconnect(self, websocket, close_code):
                 cur = conn.cursor()
                 cur.execute("""
                     UPDATE charge_points
-                    SET status = 'Unavailable'
+                    SET status = 'Available'
                     WHERE charge_point_id = ?
                 """, (cp_id,))
                 conn.commit()
-                logging.info(f"✅ 已將 {cp_id} 狀態更新為 Unavailable（斷線）")
+                logging.info(f"✅ 已將 {cp_id} 狀態更新為 Available")
         else:
             logging.warning("⚠️ 無法辨識斷線的充電樁 ID")
     except Exception as e:
