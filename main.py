@@ -2673,19 +2673,6 @@ def get_holiday(date: str):
 
 
 
-@app.get("/api/cards")
-def get_all_cards():
-    """回傳所有卡片的最新餘額（直接查資料庫）"""
-    with sqlite3.connect(DB_FILE) as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT card_id, balance FROM cards")
-        rows = cur.fetchall()
-    result = [{"card_id": row[0], "balance": float(row[1] or 0)} for row in rows]
-    return result
-
-
-
-
 
 @app.get("/api/charge-points")
 async def list_charge_points():
