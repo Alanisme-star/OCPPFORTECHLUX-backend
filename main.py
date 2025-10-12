@@ -19,7 +19,7 @@ import uvicorn
 import asyncio
 pending_stop_transactions = {}
 # 針對每筆交易做「已送停充」去重，避免前端/後端重複送
-stop_requested = set()
+
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +42,7 @@ REQUIRED_TOKEN = os.getenv("OCPP_WS_TOKEN", None)
 
 
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.WARNING)
 
 # 允許跨域（若前端使用）
 app.add_middleware(
@@ -114,6 +114,7 @@ def get_whitelist():
             {"charge_point_id": row[0], "name": row[1]} for row in rows
         ]
     }
+
 
 
 
@@ -245,14 +246,57 @@ async def get_status(cp_id: str):
 # 初始化 SQLite 資料庫
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_FILE = os.path.join(BASE_DIR, "ocpp_data.db")  # ✅ 固定資料庫絕對路徑
-conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+conn = sqlite3.connect(DB_FILE, check_same_thread=False, timeout=15)
 cursor = conn.cursor()
 
 
 def get_conn():
     # 為每次查詢建立新的連線與游標，避免共用全域 cursor 造成並發問題
-    return sqlite3.connect(DB_FILE, check_same_thread=False)
+    return sqlite3.connect(DB_FILE, check_same_thread=False, timeout=15)
 
+
+
+# 🔧 新增：根據時間戳查詢當前適用電價
+def _price_for_timestamp(ts: str) -> float:
+    """
+    根據時間戳（ISO格式）從 daily_pricing_rules 表查出對應的電價。
+    若該時段未設定電價，則回傳預設值 6.0。
+    """
+    try:
+        dt = datetime.fromisoformat(ts)
+        date_str = dt.strftime("%Y-%m-%d")
+        time_str = dt.strftime("%H:%M")
+
+        with sqlite3.connect(DB_FILE) as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT price FROM daily_pricing_rules
+                WHERE date = ?
+                  AND start_time <= ?
+                  AND end_time > ?
+                ORDER BY start_time DESC LIMIT 1
+            """, (date_str, time_str, time_str))
+            row = cur.fetchone()
+            if row:
+                return float(row[0])
+    except Exception as e:
+        logging.warning(f"⚠️ 電價查詢失敗: {e}")
+
+    # 若查無設定則給預設值
+    return 6.0
+
+
+# 🔧 新增：即時查詢目前後端實際使用電價的 API
+@app.get("/api/debug/price")
+def debug_price():
+    """
+    回傳目前後端根據 daily_pricing_rules 所採用的電價。
+    可用 curl 查詢：
+    curl https://ocppfortechlux-backend.onrender.com/api/debug/price
+    """
+    now = datetime.utcnow().isoformat()
+    price = _price_for_timestamp(now)
+    return {"current_price": price}
 
 
 
@@ -977,7 +1021,7 @@ class ChargePoint(OcppChargePoint):
 
 
 
-                                    # ⭐ 即時扣款：每次 MeterValues 來時更新卡片餘額
+                                    # ⭐ 改良版：即時扣款（按差額扣款，防止重複扣）
                                     try:
                                         _cur2.execute("""
                                             SELECT t.id_tag, c.balance
@@ -988,12 +1032,25 @@ class ChargePoint(OcppChargePoint):
                                         row_card = _cur2.fetchone()
                                         if row_card:
                                             id_tag, balance = row_card
-                                            new_balance = max(0.0, balance - est_amount)
-                                            _cur2.execute("UPDATE cards SET balance=? WHERE card_id=?", (new_balance, id_tag))
-                                            logging.info(f"💰 即時扣款 | idTag={id_tag} | 扣款至今={est_amount} | 剩餘餘額={new_balance}")
-                                            _c2.commit()
+
+                                            # 取得上次記錄的估算金額（若無則視為 0）
+                                            prev_est = (live_status_cache.get(cp_id) or {}).get("prev_est_amount", 0)
+
+                                            # 計算差額（本次累積 - 上次累積）
+                                            diff_amount = max(0.0, est_amount - prev_est)
+
+                                            if diff_amount > 0:
+                                                new_balance = max(0.0, balance - diff_amount)
+                                                _cur2.execute("UPDATE cards SET balance=? WHERE card_id=?", (new_balance, id_tag))
+                                                logging.info(f"💰 即時扣款 | idTag={id_tag} | 本次扣={diff_amount} | 累積估算={est_amount} | 餘額={new_balance}")
+                                                _c2.commit()
+
+                                            # 更新快取中的上次累積金額
+                                            _upsert_live(cp_id, prev_est_amount=est_amount)
+
                                     except Exception as e:
                                         logging.warning(f"⚠️ 即時扣款失敗: {e}")
+
 
 
 
@@ -1017,50 +1074,7 @@ class ChargePoint(OcppChargePoint):
 
                 _c.commit()
 
-
-            # ⭐ 新增：餘額保護機制（餘額 ≤ 0 時自動停充）
-            try:
-                with sqlite3.connect(DB_FILE) as _c3:
-                    _cur3 = _c3.cursor()
-                    _cur3.execute("""
-                        SELECT t.id_tag, c.balance
-                        FROM transactions t
-                        JOIN cards c ON t.id_tag = c.card_id
-                        WHERE t.transaction_id = ?
-                    """, (transaction_id,))
-                    row = _cur3.fetchone()
-                    if row:
-                        id_tag, balance = row
-                        balance = float(balance or 0)
-                        if balance <= 0.01 and transaction_id not in stop_requested:
-                            stop_requested.add(transaction_id)
-                            logging.warning(f"⚡ 餘額不足，自動發送 RemoteStopTransaction | CP={cp_id} | tx={transaction_id}")
-                            cp = connected_charge_points.get(cp_id)
-                            if cp:
-                                await cp.send_stop_transaction(transaction_id)
-                            else:
-                                logging.warning(f"⚠️ 找不到連線中的充電樁 {cp_id}，無法自動停充")
-            except Exception as e:
-                logging.error(f"⚠️ 餘額自動停充檢查失敗: {e}")
-
-
-            from ocpp.v16 import call
-            logging.info(f"[DEBUG] 餘額檢查: tx={transaction_id} balance={balance}")
-            if balance <= 0.01 and transaction_id not in stop_requested:
-                stop_requested.add(transaction_id)
-                logging.warning(f"⚡ 餘額不足，自動發送 RemoteStopTransaction | CP={cp_id} | tx={transaction_id}")
-                cp = connected_charge_points.get(cp_id)
-                if cp:
-                    try:
-                        req = call.RemoteStopTransactionPayload(transaction_id=int(transaction_id))
-                        resp = await cp.call(req)
-                        logging.info(f"🔧 RemoteStopTransaction 回應: {resp}")
-                    except Exception as e:
-                        logging.error(f"❌ 發送 RemoteStopTransaction 失敗: {e}")
-                else:
-                    logging.warning(f"⚠️ 找不到連線中的充電樁 {cp_id}，無法自動停充")
-
-
+        
             logging.info(f"📊 MeterValues 寫入完成，共 {insert_count} 筆 | tx={transaction_id}")
 
             return call_result.MeterValuesPayload()
@@ -1108,6 +1122,32 @@ def force_add_charge_point(
     }
 
 
+# ------------------------------------------------------------
+# ⭐ 當充電樁（或模擬器）斷線時，更新狀態為 Available
+# ------------------------------------------------------------
+async def on_disconnect(self, websocket, close_code):
+    try:
+        # 嘗試從 websocket 物件中取得充電樁 ID
+        cp_id = getattr(websocket, "cp_id", None)
+        if cp_id:
+            # 從已連線清單中移除
+            connected_charge_points.pop(cp_id, None)
+            logging.warning(f"⚠️ 充電樁已斷線: {cp_id}")
+
+            # 更新資料庫中該樁狀態為 Available
+            with sqlite3.connect(DB_FILE, timeout=15) as conn:
+                cur = conn.cursor()
+                cur.execute("""
+                    UPDATE charge_points
+                    SET status = 'Available'
+                    WHERE charge_point_id = ?
+                """, (cp_id,))
+                conn.commit()
+                logging.info(f"✅ 已將 {cp_id} 狀態更新為 Available")
+        else:
+            logging.warning("⚠️ 無法辨識斷線的充電樁 ID")
+    except Exception as e:
+        logging.error(f"❌ on_disconnect 更新狀態時發生錯誤: {e}")
 
 
 
@@ -1855,24 +1895,29 @@ def get_charge_point_status(charge_point_id: str):
 
 @app.get("/api/charge-points/{charge_point_id}/latest-status")
 def get_latest_status(charge_point_id: str):
-    charge_point_id = _normalize_cp_id(charge_point_id)
-    c = conn.cursor()
-    # 優先取充電樁傳來的最新 StatusNotification 紀錄
-    c.execute(
-        """
-        SELECT status, timestamp
-        FROM status_logs
-        WHERE charge_point_id = ?
-        ORDER BY timestamp DESC
-        LIMIT 1
-        """,
-        (charge_point_id,),
-    )
-    row = c.fetchone()
+    cp_id = _normalize_cp_id(charge_point_id)
+    with sqlite3.connect(DB_FILE) as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT status, last_update FROM charge_points
+            WHERE charge_point_id = ?
+        """, (cp_id,))
+        row = cur.fetchone()
+
     if row:
-        return {"status": row[0], "timestamp": row[1]}
-    # 找不到就回 Unknown
-    return {"status": "Unknown"}
+        return {
+            "status": row[0],
+            "timestamp": row[1]
+        }
+    else:
+        return {
+            "status": "Unknown",
+            "timestamp": None
+        }
+
+
+
+
 
 
 @app.get("/api/transactions/{transaction_id}/summary")
