@@ -1747,6 +1747,19 @@ def get_latest_energy(charge_point_id: str):
     return result
 
 
+@app.get("/api/cards/{card_id}/balance")
+def get_card_balance(card_id: str):
+    """回傳該卡片目前最新餘額（直接查資料庫）"""
+    with sqlite3.connect(DB_FILE) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT balance FROM cards WHERE card_id=?", (card_id,))
+        row = cur.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="卡片不存在")
+    return {"balance": float(row[0] or 0)}
+
+
+
 @app.get("/api/cards/{card_id}/history")
 def get_card_history(card_id: str, limit: int = 20):
     """
@@ -1858,20 +1871,6 @@ def delete_daily_pricing(date: str = Query(..., description="要刪除的日期 
         conn.commit()
     return {"message": f"✅ 已刪除 {date} 的所有規則"}
 
-
-
-
-
-
-# 新增獨立的卡片餘額查詢 API（修正縮排）
-@app.get("/api/cards/{id_tag}/balance")
-def get_card_balance(id_tag: str):
-    cursor = conn.cursor()
-    cursor.execute("SELECT balance FROM cards WHERE card_id = ?", (id_tag,))
-    row = cursor.fetchone()
-    if not row:
-        return {"balance": 0, "found": False}
-    return {"balance": row[0], "found": True}
 
    
 
