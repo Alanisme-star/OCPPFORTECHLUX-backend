@@ -1003,7 +1003,7 @@ class ChargePoint(OcppChargePoint):
                 _c.commit()
 
 
-            # ====== ⭐ 新增：即時扣款機制（每次 MeterValues 更新即扣＋累積紀錄） ======
+            # ====== ✅ 改良版：即時扣款（僅扣新增差額） ======
             try:
                 with sqlite3.connect(DB_FILE) as _c4:
                     _cur4 = _c4.cursor()
@@ -1016,18 +1016,27 @@ class ChargePoint(OcppChargePoint):
                     row = _cur4.fetchone()
                     if row:
                         id_tag, old_balance = row
-                        # 從快取取出即時預估金額
+
+                        # 從快取取出目前累積預估金額
                         est_amount = (live_status_cache.get(cp_id) or {}).get("estimated_amount", 0)
+                        prev_amount = (live_status_cache.get(cp_id) or {}).get("prev_est_amount", 0)
+
                         if est_amount is not None:
                             est_amount = float(est_amount)
-                            old_balance = float(old_balance or 0)
-                            new_balance = max(0.0, old_balance - est_amount)
+                            prev_amount = float(prev_amount or 0)
+                            diff = max(0.0, est_amount - prev_amount)  # ← 只扣新增加的部分
 
-                            # 寫回資料庫
+                            old_balance = float(old_balance or 0)
+                            new_balance = max(0.0, old_balance - diff)
+
+                            # 更新卡片餘額
                             _cur4.execute("UPDATE cards SET balance=? WHERE card_id=?", (new_balance, id_tag))
                             _c4.commit()
 
-                            # 取得累積扣款金額
+                            # 更新快取紀錄供下次比較
+                            live_status_cache.setdefault(cp_id, {})["prev_est_amount"] = est_amount
+
+                            # 查詢累積扣款（僅用於 debug log）
                             _cur4.execute("""
                                 SELECT SUM(estimated_amount) FROM meter_values
                                 WHERE transaction_id = ?
@@ -1035,12 +1044,14 @@ class ChargePoint(OcppChargePoint):
                             total_deducted = _cur4.fetchone()[0] or 0.0
 
                             logging.info(
-                                f"💳 [即時扣款] idTag={id_tag} | 原餘額={old_balance:.3f} → 新餘額={new_balance:.3f} | "
-                                f"本次預估={est_amount:.3f} | 累積扣款={total_deducted:.3f}"
+                                f"💳 [即時扣款Δ] idTag={id_tag} | 原餘額={old_balance:.3f} → 新餘額={new_balance:.3f} | "
+                                f"本次新增={diff:.3f} | 累積預估={est_amount:.3f} | 累積扣款={total_deducted:.3f}"
                             )
             except Exception as e:
                 logging.error(f"⚠️ 即時扣款失敗: {e}")
             # ===============================================================
+
+
 
 
             # ⭐ 餘額保護機制（餘額 ≤ 0 時自動停充）
