@@ -42,7 +42,7 @@ REQUIRED_TOKEN = os.getenv("OCPP_WS_TOKEN", None)
 
 
 
-logging.basicConfig(level=logging.WARNING)
+logging.basicConfig(level=logging.INFO)
 
 # 允許跨域（若前端使用）
 app.add_middleware(
@@ -226,9 +226,22 @@ async def websocket_endpoint(websocket: WebSocket, charge_point_id: str):
             await websocket.close()
         except Exception:
             pass
+
     finally:
-        # 3) 清理連線狀態
-        connected_charge_points.pop(_normalize_cp_id(charge_point_id), None)
+        norm_id = _normalize_cp_id(charge_point_id)
+
+        # 保留 connected_charge_points，以便 RemoteStopTransaction 能找到對應對象
+        if norm_id in connected_charge_points:
+            logging.info(f"🔌 連線已關閉：{norm_id}（連線物件暫留以便停充）")
+        else:
+            logging.info(f"🔌 連線已關閉：{norm_id}（無對應物件）")
+
+        # ✅ 僅清除即時快取，避免下次啟動殘留數值
+        if norm_id in live_status_cache:
+            live_status_cache.pop(norm_id, None)
+            logging.info(f"🧹 清除中斷樁的即時快取資料：{norm_id}")
+        else:
+            logging.info(f"ℹ️ 無快取可清（可能尚未啟動交易）：{norm_id}")
 
 
 
@@ -245,13 +258,13 @@ async def get_status(cp_id: str):
 # 初始化 SQLite 資料庫
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_FILE = os.path.join(BASE_DIR, "ocpp_data.db")  # ✅ 固定資料庫絕對路徑
-conn = sqlite3.connect(DB_FILE, check_same_thread=False, timeout=15)
+conn = sqlite3.connect(DB_FILE, check_same_thread=False)
 cursor = conn.cursor()
 
 
 def get_conn():
     # 為每次查詢建立新的連線與游標，避免共用全域 cursor 造成並發問題
-    return sqlite3.connect(DB_FILE, check_same_thread=False, timeout=15)
+    return sqlite3.connect(DB_FILE, check_same_thread=False)
 
 
 
@@ -972,47 +985,6 @@ class ChargePoint(OcppChargePoint):
                                                          estimated_amount=est_amount,
                                                          price_per_kwh=unit_price,
                                                          timestamp=ts)
-
-
-
-
-
-                                    # ⭐ 改良版：即時扣款（按差額扣款，防止重複扣）
-                                    try:
-                                        _cur2.execute("""
-                                            SELECT t.id_tag, c.balance
-                                            FROM transactions t
-                                            JOIN cards c ON t.id_tag = c.card_id
-                                            WHERE t.transaction_id = ?
-                                        """, (transaction_id,))
-                                        row_card = _cur2.fetchone()
-                                        if row_card:
-                                            id_tag, balance = row_card
-
-                                            # 取得上次記錄的估算金額（若無則視為 0）
-                                            prev_est = (live_status_cache.get(cp_id) or {}).get("prev_est_amount", 0)
-
-                                            # 計算差額（本次累積 - 上次累積）
-                                            diff_amount = max(0.0, est_amount - prev_est)
-
-                                            if diff_amount > 0:
-                                                new_balance = max(0.0, balance - diff_amount)
-                                                _cur2.execute("UPDATE cards SET balance=? WHERE card_id=?", (new_balance, id_tag))
-                                                logging.info(f"💰 即時扣款 | idTag={id_tag} | 本次扣={diff_amount} | 累積估算={est_amount} | 餘額={new_balance}")
-                                                _c2.commit()
-
-                                            # 更新快取中的上次累積金額
-                                            _upsert_live(cp_id, prev_est_amount=est_amount)
-
-                                    except Exception as e:
-                                        logging.warning(f"⚠️ 即時扣款失敗: {e}")
-
-
-
-
-
-
-
                                 except Exception as e:
                                     logging.warning(f"⚠️ 預估金額計算失敗: {e}")
 
@@ -1030,14 +1002,50 @@ class ChargePoint(OcppChargePoint):
 
                 _c.commit()
 
-        
-            logging.info(f"📊 MeterValues 寫入完成，共 {insert_count} 筆 | tx={transaction_id}")
 
+            # ⭐ 餘額保護機制（餘額 ≤ 0 時自動停充）
+            try:
+                with sqlite3.connect(DB_FILE) as _c3:
+                    _cur3 = _c3.cursor()
+                    _cur3.execute("""
+                        SELECT t.id_tag, c.balance
+                        FROM transactions t
+                        JOIN cards c ON t.id_tag = c.card_id
+                        WHERE t.transaction_id = ?
+                    """, (transaction_id,))
+                    row = _cur3.fetchone()
+                    if row:
+                        id_tag, balance = row
+                        balance = float(balance or 0)
+                        logging.info(f"[DEBUG] 餘額檢查: tx={transaction_id} balance={balance}")
+
+                        # --- 餘額不足自動停充 ---
+                        if balance <= 0.01 and transaction_id not in stop_requested:
+                            stop_requested.add(transaction_id)
+                            logging.warning(f"⚡ 餘額不足，自動發送 RemoteStopTransaction | CP={cp_id} | tx={transaction_id}")
+
+                            cp = connected_charge_points.get(cp_id)
+                            if cp:
+                                try:
+                                    from ocpp.v16 import call
+                                    req = call.RemoteStopTransaction(transaction_id=int(transaction_id))
+                                    resp = await cp.call(req)
+                                    logging.info(f"🔧 RemoteStopTransaction 回應: {resp}")
+                                except Exception as e:
+                                    logging.error(f"❌ 發送 RemoteStopTransaction 失敗: {e}")
+                            else:
+                                logging.warning(f"⚠️ 找不到連線中的充電樁 {cp_id}，無法自動停充")
+            except Exception as e:
+                logging.error(f"⚠️ 餘額自動停充檢查失敗: {e}")
+
+            logging.info(f"📊 MeterValues 寫入完成，共 {insert_count} 筆 | tx={transaction_id}")
             return call_result.MeterValuesPayload()
 
         except Exception as e:
             logging.exception(f"❌ 處理 MeterValues 例外：{e}")
             return call_result.MeterValuesPayload()
+
+
 
 
 
