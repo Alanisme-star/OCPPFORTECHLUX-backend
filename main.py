@@ -2674,10 +2674,16 @@ def get_holiday(date: str):
 
 
 @app.get("/api/cards")
-async def get_cards():
-    cursor.execute("SELECT card_id, balance FROM cards")
-    rows = cursor.fetchall()
-    return [{"id": row[0], "card_id": row[0], "balance": row[1]} for row in rows]
+def get_all_cards():
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT card_id, balance FROM cards")
+        rows = cur.fetchall()
+    return [{"card_id": r[0], "balance": r[1]} for r in rows]
+
+
+
+
 
 @app.get("/api/charge-points")
 async def list_charge_points():
