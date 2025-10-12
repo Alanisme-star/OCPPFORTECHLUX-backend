@@ -226,22 +226,9 @@ async def websocket_endpoint(websocket: WebSocket, charge_point_id: str):
             await websocket.close()
         except Exception:
             pass
-
     finally:
-        norm_id = _normalize_cp_id(charge_point_id)
-
-        # 保留 connected_charge_points，以便 RemoteStopTransaction 能找到對應對象
-        if norm_id in connected_charge_points:
-            logging.info(f"🔌 連線已關閉：{norm_id}（連線物件暫留以便停充）")
-        else:
-            logging.info(f"🔌 連線已關閉：{norm_id}（無對應物件）")
-
-        # ✅ 僅清除即時快取，避免下次啟動殘留數值
-        if norm_id in live_status_cache:
-            live_status_cache.pop(norm_id, None)
-            logging.info(f"🧹 清除中斷樁的即時快取資料：{norm_id}")
-        else:
-            logging.info(f"ℹ️ 無快取可清（可能尚未啟動交易）：{norm_id}")
+        # 3) 清理連線狀態
+        connected_charge_points.pop(_normalize_cp_id(charge_point_id), None)
 
 
 
@@ -985,6 +972,34 @@ class ChargePoint(OcppChargePoint):
                                                          estimated_amount=est_amount,
                                                          price_per_kwh=unit_price,
                                                          timestamp=ts)
+
+
+
+
+
+                                    # ⭐ 即時扣款：每次 MeterValues 來時更新卡片餘額
+                                    try:
+                                        _cur2.execute("""
+                                            SELECT t.id_tag, c.balance
+                                            FROM transactions t
+                                            JOIN cards c ON t.id_tag = c.card_id
+                                            WHERE t.transaction_id = ?
+                                        """, (transaction_id,))
+                                        row_card = _cur2.fetchone()
+                                        if row_card:
+                                            id_tag, balance = row_card
+                                            new_balance = max(0.0, balance - est_amount)
+                                            _cur2.execute("UPDATE cards SET balance=? WHERE card_id=?", (new_balance, id_tag))
+                                            logging.info(f"💰 即時扣款 | idTag={id_tag} | 扣款至今={est_amount} | 剩餘餘額={new_balance}")
+                                            _c2.commit()
+                                    except Exception as e:
+                                        logging.warning(f"⚠️ 即時扣款失敗: {e}")
+
+
+
+
+
+
                                 except Exception as e:
                                     logging.warning(f"⚠️ 預估金額計算失敗: {e}")
 
@@ -1003,60 +1018,7 @@ class ChargePoint(OcppChargePoint):
                 _c.commit()
 
 
-            # ====== ✅ 改良版：即時扣款（僅扣新增差額） ======
-            try:
-                with sqlite3.connect(DB_FILE) as _c4:
-                    _cur4 = _c4.cursor()
-                    _cur4.execute("""
-                        SELECT t.id_tag, c.balance
-                        FROM transactions t
-                        JOIN cards c ON t.id_tag = c.card_id
-                        WHERE t.transaction_id = ?
-                    """, (transaction_id,))
-                    row = _cur4.fetchone()
-                    if row:
-                        id_tag, old_balance = row
-
-                        # 從快取取出目前累積預估金額
-                        est_amount = (live_status_cache.get(cp_id) or {}).get("estimated_amount", 0)
-                        prev_amount = (live_status_cache.get(cp_id) or {}).get("prev_est_amount", 0)
-
-                        if est_amount is not None:
-                            est_amount = float(est_amount)
-                            prev_amount = float(prev_amount or 0)
-                            diff = max(0.0, est_amount - prev_amount)  # ← 只扣新增部分
-
-                            old_balance = float(old_balance or 0)
-                            new_balance = max(0.0, old_balance - diff)
-
-                            # 更新卡片餘額
-                            _cur4.execute("UPDATE cards SET balance=? WHERE card_id=?", (new_balance, id_tag))
-                            _c4.commit()
-
-                            # 更新快取紀錄供下次比較
-                            live_status_cache.setdefault(cp_id, {})["prev_est_amount"] = est_amount
-
-                            # 查詢累積扣款（僅用於 debug log）
-                            _cur4.execute("""
-                                SELECT SUM(estimated_amount) FROM meter_values
-                                WHERE transaction_id = ?
-                            """, (transaction_id,))
-                            total_deducted = _cur4.fetchone()[0] or 0.0
-
-                            logging.info(
-                                f"💳 [即時扣款Δ] idTag={id_tag} | 原餘額={old_balance:.3f} → 新餘額={new_balance:.3f} | "
-                                f"本次新增={diff:.3f} | 累積預估={est_amount:.3f} | 累積扣款={total_deducted:.3f}"
-                            )
-
-            except Exception as e:
-                logging.error(f"⚠️ 即時扣款失敗: {e}")
-            # ===============================================================
-
-
-
-
-
-            # ⭐ 餘額保護機制（餘額 ≤ 0 時自動停充）
+            # ⭐ 新增：餘額保護機制（餘額 ≤ 0 時自動停充）
             try:
                 with sqlite3.connect(DB_FILE) as _c3:
                     _cur3 = _c3.cursor()
@@ -1070,29 +1032,42 @@ class ChargePoint(OcppChargePoint):
                     if row:
                         id_tag, balance = row
                         balance = float(balance or 0)
-                        logging.info(f"[DEBUG] 餘額檢查: tx={transaction_id} balance={balance}")
-
-                        # --- 餘額不足自動停充 ---
                         if balance <= 0.01 and transaction_id not in stop_requested:
                             stop_requested.add(transaction_id)
                             logging.warning(f"⚡ 餘額不足，自動發送 RemoteStopTransaction | CP={cp_id} | tx={transaction_id}")
-
                             cp = connected_charge_points.get(cp_id)
                             if cp:
-                                try:
-                                    from ocpp.v16 import call
-                                    req = call.RemoteStopTransaction(transaction_id=int(transaction_id))
-                                    resp = await cp.call(req)
-                                    logging.info(f"🔧 RemoteStopTransaction 回應: {resp}")
-                                except Exception as e:
-                                    logging.error(f"❌ 發送 RemoteStopTransaction 失敗: {e}")
+                                await cp.send_stop_transaction(transaction_id)
                             else:
                                 logging.warning(f"⚠️ 找不到連線中的充電樁 {cp_id}，無法自動停充")
             except Exception as e:
                 logging.error(f"⚠️ 餘額自動停充檢查失敗: {e}")
 
 
+            from ocpp.v16 import call
+            logging.info(f"[DEBUG] 餘額檢查: tx={transaction_id} balance={balance}")
+            if balance <= 0.01 and transaction_id not in stop_requested:
+                stop_requested.add(transaction_id)
+                logging.warning(f"⚡ 餘額不足，自動發送 RemoteStopTransaction | CP={cp_id} | tx={transaction_id}")
+                cp = connected_charge_points.get(cp_id)
+                if cp:
+                    try:
+                        req = call.RemoteStopTransactionPayload(transaction_id=int(transaction_id))
+                        resp = await cp.call(req)
+                        logging.info(f"🔧 RemoteStopTransaction 回應: {resp}")
+                    except Exception as e:
+                        logging.error(f"❌ 發送 RemoteStopTransaction 失敗: {e}")
+                else:
+                    logging.warning(f"⚠️ 找不到連線中的充電樁 {cp_id}，無法自動停充")
 
+
+            logging.info(f"📊 MeterValues 寫入完成，共 {insert_count} 筆 | tx={transaction_id}")
+
+            return call_result.MeterValuesPayload()
+
+        except Exception as e:
+            logging.exception(f"❌ 處理 MeterValues 例外：{e}")
+            return call_result.MeterValuesPayload()
 
 
 
