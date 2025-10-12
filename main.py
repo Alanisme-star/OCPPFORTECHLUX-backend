@@ -19,7 +19,7 @@ import uvicorn
 import asyncio
 pending_stop_transactions = {}
 # 針對每筆交易做「已送停充」去重，避免前端/後端重複送
-
+stop_requested = set()
 
 logger = logging.getLogger(__name__)
 
@@ -114,7 +114,6 @@ def get_whitelist():
             {"charge_point_id": row[0], "name": row[1]} for row in rows
         ]
     }
-
 
 
 
@@ -254,49 +253,6 @@ def get_conn():
     # 為每次查詢建立新的連線與游標，避免共用全域 cursor 造成並發問題
     return sqlite3.connect(DB_FILE, check_same_thread=False, timeout=15)
 
-
-
-# 🔧 新增：根據時間戳查詢當前適用電價
-def _price_for_timestamp(ts: str) -> float:
-    """
-    根據時間戳（ISO格式）從 daily_pricing_rules 表查出對應的電價。
-    若該時段未設定電價，則回傳預設值 6.0。
-    """
-    try:
-        dt = datetime.fromisoformat(ts)
-        date_str = dt.strftime("%Y-%m-%d")
-        time_str = dt.strftime("%H:%M")
-
-        with sqlite3.connect(DB_FILE) as conn:
-            cur = conn.cursor()
-            cur.execute("""
-                SELECT price FROM daily_pricing_rules
-                WHERE date = ?
-                  AND start_time <= ?
-                  AND end_time > ?
-                ORDER BY start_time DESC LIMIT 1
-            """, (date_str, time_str, time_str))
-            row = cur.fetchone()
-            if row:
-                return float(row[0])
-    except Exception as e:
-        logging.warning(f"⚠️ 電價查詢失敗: {e}")
-
-    # 若查無設定則給預設值
-    return 6.0
-
-
-# 🔧 新增：即時查詢目前後端實際使用電價的 API
-@app.get("/api/debug/price")
-def debug_price():
-    """
-    回傳目前後端根據 daily_pricing_rules 所採用的電價。
-    可用 curl 查詢：
-    curl https://ocppfortechlux-backend.onrender.com/api/debug/price
-    """
-    now = datetime.utcnow().isoformat()
-    price = _price_for_timestamp(now)
-    return {"current_price": price}
 
 
 
@@ -1122,32 +1078,6 @@ def force_add_charge_point(
     }
 
 
-# ------------------------------------------------------------
-# ⭐ 當充電樁（或模擬器）斷線時，更新狀態為 Available
-# ------------------------------------------------------------
-async def on_disconnect(self, websocket, close_code):
-    try:
-        # 嘗試從 websocket 物件中取得充電樁 ID
-        cp_id = getattr(websocket, "cp_id", None)
-        if cp_id:
-            # 從已連線清單中移除
-            connected_charge_points.pop(cp_id, None)
-            logging.warning(f"⚠️ 充電樁已斷線: {cp_id}")
-
-            # 更新資料庫中該樁狀態為 Available
-            with sqlite3.connect(DB_FILE, timeout=15) as conn:
-                cur = conn.cursor()
-                cur.execute("""
-                    UPDATE charge_points
-                    SET status = 'Available'
-                    WHERE charge_point_id = ?
-                """, (cp_id,))
-                conn.commit()
-                logging.info(f"✅ 已將 {cp_id} 狀態更新為 Available")
-        else:
-            logging.warning("⚠️ 無法辨識斷線的充電樁 ID")
-    except Exception as e:
-        logging.error(f"❌ on_disconnect 更新狀態時發生錯誤: {e}")
 
 
 
@@ -1747,19 +1677,6 @@ def get_latest_energy(charge_point_id: str):
     return result
 
 
-@app.get("/api/cards/{card_id}/balance")
-def get_card_balance(card_id: str):
-    """回傳該卡片目前最新餘額（直接查資料庫）"""
-    with sqlite3.connect(DB_FILE) as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT balance FROM cards WHERE card_id=?", (card_id,))
-        row = cur.fetchone()
-    if not row:
-        raise HTTPException(status_code=404, detail="卡片不存在")
-    return {"balance": float(row[0] or 0)}
-
-
-
 @app.get("/api/cards/{card_id}/history")
 def get_card_history(card_id: str, limit: int = 20):
     """
@@ -1872,6 +1789,20 @@ def delete_daily_pricing(date: str = Query(..., description="要刪除的日期 
     return {"message": f"✅ 已刪除 {date} 的所有規則"}
 
 
+
+
+
+
+# 新增獨立的卡片餘額查詢 API（修正縮排）
+@app.get("/api/cards/{id_tag}/balance")
+def get_card_balance(id_tag: str):
+    cursor = conn.cursor()
+    cursor.execute("SELECT balance FROM cards WHERE card_id = ?", (id_tag,))
+    row = cursor.fetchone()
+    if not row:
+        return {"balance": 0, "found": False}
+    return {"balance": row[0], "found": True}
+
    
 
 @app.get("/api/charge-points/{charge_point_id}/status")
@@ -1894,29 +1825,24 @@ def get_charge_point_status(charge_point_id: str):
 
 @app.get("/api/charge-points/{charge_point_id}/latest-status")
 def get_latest_status(charge_point_id: str):
-    cp_id = _normalize_cp_id(charge_point_id)
-    with sqlite3.connect(DB_FILE) as conn:
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT status, last_update FROM charge_points
-            WHERE charge_point_id = ?
-        """, (cp_id,))
-        row = cur.fetchone()
-
+    charge_point_id = _normalize_cp_id(charge_point_id)
+    c = conn.cursor()
+    # 優先取充電樁傳來的最新 StatusNotification 紀錄
+    c.execute(
+        """
+        SELECT status, timestamp
+        FROM status_logs
+        WHERE charge_point_id = ?
+        ORDER BY timestamp DESC
+        LIMIT 1
+        """,
+        (charge_point_id,),
+    )
+    row = c.fetchone()
     if row:
-        return {
-            "status": row[0],
-            "timestamp": row[1]
-        }
-    else:
-        return {
-            "status": "Unknown",
-            "timestamp": None
-        }
-
-
-
-
+        return {"status": row[0], "timestamp": row[1]}
+    # 找不到就回 Unknown
+    return {"status": "Unknown"}
 
 
 @app.get("/api/transactions/{transaction_id}/summary")
@@ -2673,6 +2599,11 @@ def get_holiday(date: str):
 
 
 
+@app.get("/api/cards")
+async def get_cards():
+    cursor.execute("SELECT card_id, balance FROM cards")
+    rows = cursor.fetchall()
+    return [{"id": row[0], "card_id": row[0], "balance": row[1]} for row in rows]
 
 @app.get("/api/charge-points")
 async def list_charge_points():
