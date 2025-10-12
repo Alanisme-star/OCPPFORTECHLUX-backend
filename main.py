@@ -1003,6 +1003,46 @@ class ChargePoint(OcppChargePoint):
                 _c.commit()
 
 
+            # ====== ⭐ 新增：即時扣款機制（每次 MeterValues 更新即扣＋累積紀錄） ======
+            try:
+                with sqlite3.connect(DB_FILE) as _c4:
+                    _cur4 = _c4.cursor()
+                    _cur4.execute("""
+                        SELECT t.id_tag, c.balance
+                        FROM transactions t
+                        JOIN cards c ON t.id_tag = c.card_id
+                        WHERE t.transaction_id = ?
+                    """, (transaction_id,))
+                    row = _cur4.fetchone()
+                    if row:
+                        id_tag, old_balance = row
+                        # 從快取取出即時預估金額
+                        est_amount = (live_status_cache.get(cp_id) or {}).get("estimated_amount", 0)
+                        if est_amount is not None:
+                            est_amount = float(est_amount)
+                            old_balance = float(old_balance or 0)
+                            new_balance = max(0.0, old_balance - est_amount)
+
+                            # 寫回資料庫
+                            _cur4.execute("UPDATE cards SET balance=? WHERE card_id=?", (new_balance, id_tag))
+                            _c4.commit()
+
+                            # 取得累積扣款金額
+                            _cur4.execute("""
+                                SELECT SUM(estimated_amount) FROM meter_values
+                                WHERE transaction_id = ?
+                            """, (transaction_id,))
+                            total_deducted = _cur4.fetchone()[0] or 0.0
+
+                            logging.info(
+                                f"💳 [即時扣款] idTag={id_tag} | 原餘額={old_balance:.3f} → 新餘額={new_balance:.3f} | "
+                                f"本次預估={est_amount:.3f} | 累積扣款={total_deducted:.3f}"
+                            )
+            except Exception as e:
+                logging.error(f"⚠️ 即時扣款失敗: {e}")
+            # ===============================================================
+
+
             # ⭐ 餘額保護機制（餘額 ≤ 0 時自動停充）
             try:
                 with sqlite3.connect(DB_FILE) as _c3:
@@ -1038,12 +1078,6 @@ class ChargePoint(OcppChargePoint):
             except Exception as e:
                 logging.error(f"⚠️ 餘額自動停充檢查失敗: {e}")
 
-            logging.info(f"📊 MeterValues 寫入完成，共 {insert_count} 筆 | tx={transaction_id}")
-            return call_result.MeterValuesPayload()
-
-        except Exception as e:
-            logging.exception(f"❌ 處理 MeterValues 例外：{e}")
-            return call_result.MeterValuesPayload()
 
 
 
