@@ -209,18 +209,25 @@ async def _accept_or_reject_ws(websocket: WebSocket, raw_cp_id: str):
 @app.websocket("/{charge_point_id:path}")
 async def websocket_endpoint(websocket: WebSocket, charge_point_id: str):
     try:
-        # 1) 驗證 + accept(subprotocol="ocpp1.6")，並回傳標準化 cp_id
-        cp_id = await _accept_or_reject_ws(websocket, charge_point_id)
-        if cp_id is None:
-            return
+        # 1️⃣標準化 ID（移除 URL 編碼與斜線）
+        cp_id = _normalize_cp_id(charge_point_id)
 
-        # 2) 啟動 OCPP handler
+        # 2️⃣ 驗證白名單並接受 WebSocket
+        cp_id_checked = await _accept_or_reject_ws(websocket, cp_id)
+        if cp_id_checked is None:
+            return
+        cp_id = cp_id_checked
+
+        # 3️⃣ 建立 OCPP 連線並註冊
         cp = ChargePoint(cp_id, FastAPIWebSocketAdapter(websocket))
         connected_charge_points[cp_id] = cp
+        print(f"✅ WebSocket 已建立連線：{cp_id} | 現有={list(connected_charge_points.keys())}")
+
+        # 4️⃣ 啟動處理
         await cp.start()
 
     except WebSocketDisconnect:
-        logger.warning(f"⚠️ Disconnected: {charge_point_id}")
+        logger.warning(f"⚠️ WebSocket 中斷：{charge_point_id}")
     except Exception as e:
         logger.error(f"❌ WebSocket error for {charge_point_id}: {e}")
         try:
@@ -228,8 +235,11 @@ async def websocket_endpoint(websocket: WebSocket, charge_point_id: str):
         except Exception:
             pass
     finally:
-        # 3) 清理連線狀態
-        connected_charge_points.pop(_normalize_cp_id(charge_point_id), None)
+        norm_id = _normalize_cp_id(charge_point_id)
+        if norm_id in connected_charge_points:
+            connected_charge_points.pop(norm_id, None)
+            print(f"⚠️ 已移除連線：{norm_id}，剩餘={list(connected_charge_points.keys())}")
+
 
 
 
