@@ -209,25 +209,18 @@ async def _accept_or_reject_ws(websocket: WebSocket, raw_cp_id: str):
 @app.websocket("/{charge_point_id:path}")
 async def websocket_endpoint(websocket: WebSocket, charge_point_id: str):
     try:
-        # 1️⃣標準化 ID（移除 URL 編碼與斜線）
-        cp_id = _normalize_cp_id(charge_point_id)
-
-        # 2️⃣ 驗證白名單並接受 WebSocket
-        cp_id_checked = await _accept_or_reject_ws(websocket, cp_id)
-        if cp_id_checked is None:
+        # 1) 驗證 + accept(subprotocol="ocpp1.6")，並回傳標準化 cp_id
+        cp_id = await _accept_or_reject_ws(websocket, charge_point_id)
+        if cp_id is None:
             return
-        cp_id = cp_id_checked
 
-        # 3️⃣ 建立 OCPP 連線並註冊
+        # 2) 啟動 OCPP handler
         cp = ChargePoint(cp_id, FastAPIWebSocketAdapter(websocket))
         connected_charge_points[cp_id] = cp
-        print(f"✅ WebSocket 已建立連線：{cp_id} | 現有={list(connected_charge_points.keys())}")
-
-        # 4️⃣ 啟動處理
         await cp.start()
 
     except WebSocketDisconnect:
-        logger.warning(f"⚠️ WebSocket 中斷：{charge_point_id}")
+        logger.warning(f"⚠️ Disconnected: {charge_point_id}")
     except Exception as e:
         logger.error(f"❌ WebSocket error for {charge_point_id}: {e}")
         try:
@@ -235,11 +228,8 @@ async def websocket_endpoint(websocket: WebSocket, charge_point_id: str):
         except Exception:
             pass
     finally:
-        norm_id = _normalize_cp_id(charge_point_id)
-        if norm_id in connected_charge_points:
-            connected_charge_points.pop(norm_id, None)
-            print(f"⚠️ 已移除連線：{norm_id}，剩餘={list(connected_charge_points.keys())}")
-
+        # 3) 清理連線狀態
+        connected_charge_points.pop(_normalize_cp_id(charge_point_id), None)
 
 
 
@@ -1129,60 +1119,18 @@ from fastapi import HTTPException
 
 @app.post("/api/charge-points/{charge_point_id}/stop")
 async def stop_transaction_by_charge_point(charge_point_id: str):
-    """
-    處理前端 /stop 停充請求。
-    - 會自動正規化 cp_id（移除 URL 編碼星號）
-    - 若找不到連線中樁，會列出目前已連線清單協助除錯
-    """
-    # 🟢 Step 1: 正規化與偵錯輸出
+    # ← 先正規化，處理星號與 URL 編碼
     cp_id = _normalize_cp_id(charge_point_id)
-    print(f"🟢【API呼叫】收到停止充電請求：原始={charge_point_id} → 正規化後={cp_id}")
-    print(f"🟢【API呼叫】目前連線中樁清單：{list(connected_charge_points.keys())}")
-
-    # 🟢 Step 2: 檢查是否有連線
+    print(f"🟢【API呼叫】收到停止充電API請求, charge_point_id = {charge_point_id}")
     cp = connected_charge_points.get(cp_id)
+
     if not cp:
-        print(f"🔴【API異常】找不到連線中的充電樁：{cp_id}")
-        raise HTTPException(status_code=404, detail=f"⚠️ 找不到連線中的充電樁：{cp_id}")
-
-    # 🟢 Step 3: 查找進行中交易
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT transaction_id FROM transactions
-            WHERE charge_point_id = ? AND stop_timestamp IS NULL
-            ORDER BY start_timestamp DESC LIMIT 1
-        """, (cp_id,))
-        row = cursor.fetchone()
-        if not row:
-            print(f"🔴【API異常】無進行中交易 charge_point_id={cp_id}")
-            raise HTTPException(status_code=400, detail="⚠️ 無進行中交易")
-        transaction_id = row[0]
-        print(f"🟢【API呼叫】找到進行中交易 transaction_id={transaction_id}")
-
-    # 🟢 Step 4: 發送 RemoteStopTransaction
-    loop = asyncio.get_event_loop()
-    fut = loop.create_future()
-    pending_stop_transactions[str(transaction_id)] = fut
-
-    try:
-        print(f"🟢【API呼叫】發送 RemoteStopTransaction 給充電樁: cp_id={cp_id}")
-        req = call.RemoteStopTransaction(transaction_id=int(transaction_id))
-        resp = await cp.call(req)
-        print(f"🟢【API回應】RemoteStopTransaction 已送出，回應={resp}")
-
-        stop_result = await asyncio.wait_for(fut, timeout=10)
-        print(f"✅【API成功】StopTransaction 完成: {stop_result}")
-        return {"message": "充電已停止", "transaction_id": transaction_id, "stop_result": stop_result}
-
-    except asyncio.TimeoutError:
-        print(f"🔴【API異常】等待 StopTransaction 超時 (10 秒內未收到回覆)")
-        return JSONResponse(status_code=504, content={"message": "等待充電樁停止回覆逾時"})
-
-    finally:
-        pending_stop_transactions.pop(str(transaction_id), None)
-
-
+        print(f"🔴【API異常】找不到連線中的充電樁：{charge_point_id}")
+        raise HTTPException(
+            status_code=404,
+            detail=f"⚠️ 找不到連線中的充電樁：{charge_point_id}",
+            headers={"X-Connected-CPs": str(list(connected_charge_points.keys()))}
+        )
     # 查詢進行中的 transaction_id
     with sqlite3.connect(DB_FILE) as conn:
         cursor = conn.cursor()
@@ -1208,7 +1156,7 @@ async def stop_transaction_by_charge_point(charge_point_id: str):
     print(f"🟢【API呼叫】發送 RemoteStopTransaction 給充電樁")
     print(f"🟢【API呼叫】即將送出 RemoteStopTransaction | charge_point_id={charge_point_id} | transaction_id={transaction_id}")
     # 送 RemoteStopTransaction（使用 Payload）
-    req = call.RemoteStopTransaction(transaction_id=int(transaction_id))
+    req = call.RemoteStopTransactionPayload(transaction_id=int(transaction_id))
     resp = await cp.call(req)
     print(f"🟢【API回應】呼叫 RemoteStopTransaction 完成，resp={resp}")
 
