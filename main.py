@@ -1020,43 +1020,6 @@ class ChargePoint(OcppChargePoint):
 
 
 
-
-                                    # ⭐ 改良版：即時扣款（按差額扣款，防止重複扣）
-                                    try:
-                                        _cur2.execute("""
-                                            SELECT t.id_tag, c.balance
-                                            FROM transactions t
-                                            JOIN cards c ON t.id_tag = c.card_id
-                                            WHERE t.transaction_id = ?
-                                        """, (transaction_id,))
-                                        row_card = _cur2.fetchone()
-                                        if row_card:
-                                            id_tag, balance = row_card
-
-                                            # 取得上次記錄的估算金額（若無則視為 0）
-                                            prev_est = (live_status_cache.get(cp_id) or {}).get("prev_est_amount", 0)
-
-                                            # 計算差額（本次累積 - 上次累積）
-                                            diff_amount = max(0.0, est_amount - prev_est)
-
-                                            if diff_amount > 0:
-                                                new_balance = max(0.0, balance - diff_amount)
-                                                _cur2.execute("UPDATE cards SET balance=? WHERE card_id=?", (new_balance, id_tag))
-                                                logging.info(f"💰 即時扣款 | idTag={id_tag} | 本次扣={diff_amount} | 累積估算={est_amount} | 餘額={new_balance}")
-                                                _c2.commit()
-
-                                            # 更新快取中的上次累積金額
-                                            _upsert_live(cp_id, prev_est_amount=est_amount)
-
-                                    except Exception as e:
-                                        logging.warning(f"⚠️ 即時扣款失敗: {e}")
-
-
-
-
-
-
-
                                 except Exception as e:
                                     logging.warning(f"⚠️ 預估金額計算失敗: {e}")
 
