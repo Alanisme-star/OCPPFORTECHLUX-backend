@@ -1119,18 +1119,60 @@ from fastapi import HTTPException
 
 @app.post("/api/charge-points/{charge_point_id}/stop")
 async def stop_transaction_by_charge_point(charge_point_id: str):
-    # ← 先正規化，處理星號與 URL 編碼
+    """
+    處理前端 /stop 停充請求。
+    - 會自動正規化 cp_id（移除 URL 編碼星號）
+    - 若找不到連線中樁，會列出目前已連線清單協助除錯
+    """
+    # 🟢 Step 1: 正規化與偵錯輸出
     cp_id = _normalize_cp_id(charge_point_id)
-    print(f"🟢【API呼叫】收到停止充電API請求, charge_point_id = {charge_point_id}")
-    cp = connected_charge_points.get(cp_id)
+    print(f"🟢【API呼叫】收到停止充電請求：原始={charge_point_id} → 正規化後={cp_id}")
+    print(f"🟢【API呼叫】目前連線中樁清單：{list(connected_charge_points.keys())}")
 
+    # 🟢 Step 2: 檢查是否有連線
+    cp = connected_charge_points.get(cp_id)
     if not cp:
-        print(f"🔴【API異常】找不到連線中的充電樁：{charge_point_id}")
-        raise HTTPException(
-            status_code=404,
-            detail=f"⚠️ 找不到連線中的充電樁：{charge_point_id}",
-            headers={"X-Connected-CPs": str(list(connected_charge_points.keys()))}
-        )
+        print(f"🔴【API異常】找不到連線中的充電樁：{cp_id}")
+        raise HTTPException(status_code=404, detail=f"⚠️ 找不到連線中的充電樁：{cp_id}")
+
+    # 🟢 Step 3: 查找進行中交易
+    with sqlite3.connect(DB_FILE) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT transaction_id FROM transactions
+            WHERE charge_point_id = ? AND stop_timestamp IS NULL
+            ORDER BY start_timestamp DESC LIMIT 1
+        """, (cp_id,))
+        row = cursor.fetchone()
+        if not row:
+            print(f"🔴【API異常】無進行中交易 charge_point_id={cp_id}")
+            raise HTTPException(status_code=400, detail="⚠️ 無進行中交易")
+        transaction_id = row[0]
+        print(f"🟢【API呼叫】找到進行中交易 transaction_id={transaction_id}")
+
+    # 🟢 Step 4: 發送 RemoteStopTransaction
+    loop = asyncio.get_event_loop()
+    fut = loop.create_future()
+    pending_stop_transactions[str(transaction_id)] = fut
+
+    try:
+        print(f"🟢【API呼叫】發送 RemoteStopTransaction 給充電樁: cp_id={cp_id}")
+        req = call.RemoteStopTransactionPayload(transaction_id=int(transaction_id))
+        resp = await cp.call(req)
+        print(f"🟢【API回應】RemoteStopTransaction 已送出，回應={resp}")
+
+        stop_result = await asyncio.wait_for(fut, timeout=10)
+        print(f"✅【API成功】StopTransaction 完成: {stop_result}")
+        return {"message": "充電已停止", "transaction_id": transaction_id, "stop_result": stop_result}
+
+    except asyncio.TimeoutError:
+        print(f"🔴【API異常】等待 StopTransaction 超時 (10 秒內未收到回覆)")
+        return JSONResponse(status_code=504, content={"message": "等待充電樁停止回覆逾時"})
+
+    finally:
+        pending_stop_transactions.pop(str(transaction_id), None)
+
+
     # 查詢進行中的 transaction_id
     with sqlite3.connect(DB_FILE) as conn:
         cursor = conn.cursor()
