@@ -1070,7 +1070,7 @@ class ChargePoint(OcppChargePoint):
     @on(Action.RemoteStopTransaction)
     async def on_remote_stop_transaction(self, transaction_id, **kwargs):
         logging.info(f"✅ 收到遠端停止充電要求，transaction_id={transaction_id}")
-        return call_result.RemoteStopTransaction(status="Accepted")
+        return call_result.RemoteStopTransactionPayload(status="Accepted")
 
 
 
@@ -1173,7 +1173,7 @@ async def stop_transaction_by_charge_point(charge_point_id: str):
     print(f"🟢【API呼叫】發送 RemoteStopTransaction 給充電樁")
     print(f"🟢【API呼叫】即將送出 RemoteStopTransaction | charge_point_id={charge_point_id} | transaction_id={transaction_id}")
     # 送 RemoteStopTransaction（使用 Payload）
-    req = call.RemoteStopTransaction(transaction_id=int(transaction_id))
+    req = call.RemoteStopTransactionPayload(transaction_id=int(transaction_id))
     resp = await cp.call(req)
     print(f"🟢【API回應】呼叫 RemoteStopTransaction 完成，resp={resp}")
 
@@ -3340,7 +3340,7 @@ async def stop_transaction_by_charge_point(charge_point_id: str):
 
     # 發送 RemoteStopTransaction（新版類名，無 Payload）
     print(f"🟢【API呼叫】發送 RemoteStopTransaction 給充電樁")
-    req = call.RemoteStopTransaction(transaction_id=transaction_id)
+    req = call.RemoteStopTransactionPayload(transaction_id=transaction_id)
     resp = await cp.call(req)
     print(f"🟢【API回應】呼叫 RemoteStopTransaction 完成，resp={resp}")
 
@@ -3406,7 +3406,7 @@ async def stop_transaction_by_charge_point(charge_point_id: str):
 
     # 發送 RemoteStopTransaction
     print(f"🟢【API呼叫】發送 RemoteStopTransaction 給充電樁")
-    req = call.RemoteStopTransaction(transaction_id=transaction_id)
+    req = call.RemoteStopTransactionPayload(transaction_id=transaction_id)
     resp = await cp.call(req)
     print(f"🟢【API回應】呼叫 RemoteStopTransaction 完成，resp={resp}")
 
