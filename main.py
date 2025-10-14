@@ -875,6 +875,23 @@ class ChargePoint(OcppChargePoint):
             }
             logging.debug(f"🔍 [DEBUG] StopTransaction 後快取: {live_status_cache.get(cp_id)}")
 
+
+
+            # ✅ 新增：若有等待中的 fut，通知 /api/stop
+            fut = pending_stop_transactions.get(str(transaction_id))
+            if fut and not fut.done():
+                fut.set_result({
+                    "transaction_id": transaction_id,
+                    "meter_stop": meter_stop,
+                    "timestamp": stop_ts,
+                    "reason": reason
+                })
+                logging.info(f"🔔 已通知等待中的 StopTransaction Future | tx={transaction_id}")
+
+
+
+
+
             return call_result.StopTransactionPayload()
 
         except Exception as e:
