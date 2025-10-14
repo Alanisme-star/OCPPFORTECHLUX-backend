@@ -1134,7 +1134,7 @@ async def on_disconnect(self, websocket, close_code):
 
 from fastapi import HTTPException
 
-@app.post("/api/charge-points/{charge_point_id}/stop")
+@app.post("/api/charge-points/{charge_point_id:path}/stop")
 async def stop_transaction_by_charge_point(charge_point_id: str):
     # ← 先正規化，處理星號與 URL 編碼
     cp_id = _normalize_cp_id(charge_point_id)
