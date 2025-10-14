@@ -3527,6 +3527,41 @@ def last_transactions():
 
 
 
+# ✅ 除錯用：查詢目前資料庫中尚未結束的交易紀錄
+@app.get("/api/debug/active-transactions")
+def get_active_transactions():
+    import sqlite3
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT transaction_id, charge_point_id, id_tag, start_timestamp, stop_timestamp
+                FROM transactions
+                ORDER BY start_timestamp DESC
+                LIMIT 10
+            """)
+            rows = cur.fetchall()
+        result = [
+            {
+                "transaction_id": r[0],
+                "charge_point_id": r[1],
+                "id_tag": r[2],
+                "start_timestamp": r[3],
+                "stop_timestamp": r[4],
+                "status": "active" if r[4] is None else "stopped"
+            }
+            for r in rows
+        ]
+        return {
+            "count": len(result),
+            "transactions": result
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+
+
 
 
 if __name__ == "__main__":
