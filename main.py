@@ -1,6 +1,7 @@
-import sqlite3, logging
+import sqlite3, logging, os
 
-DB_FILE = "ocpp_data.db"  # 若你的檔名不同，改成實際檔案
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_FILE = os.path.join(BASE_DIR, "ocpp_data.db")  # ✅ 固定正確資料庫路徑
 
 def ensure_last_update_column():
     try:
@@ -21,6 +22,7 @@ def ensure_last_update_column():
 
 # 🔧 啟動時自動檢查修補
 ensure_last_update_column()
+
 
 from urllib.parse import unquote  # ← 新增
 
