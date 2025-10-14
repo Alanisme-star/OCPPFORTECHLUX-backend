@@ -1,3 +1,27 @@
+import sqlite3, logging
+
+DB_FILE = "ocpp_data.db"  # 若你的檔名不同，改成實際檔案
+
+def ensure_last_update_column():
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cur = conn.cursor()
+        cur.execute("PRAGMA table_info(charge_points)")
+        columns = [r[1] for r in cur.fetchall()]
+        if "last_update" not in columns:
+            cur.execute("ALTER TABLE charge_points ADD COLUMN last_update TEXT")
+            conn.commit()
+            logging.info("✅ 已自動新增欄位：charge_points.last_update")
+        else:
+            logging.info("✔️ 欄位 charge_points.last_update 已存在")
+    except Exception as e:
+        logging.error(f"⚠️ 檢查/新增欄位失敗: {e}")
+    finally:
+        conn.close()
+
+# 🔧 啟動時自動檢查修補
+ensure_last_update_column()
+
 from urllib.parse import unquote  # ← 新增
 
 def _normalize_cp_id(cp_id: str) -> str:
