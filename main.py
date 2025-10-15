@@ -1003,28 +1003,20 @@ class ChargePoint(OcppChargePoint):
                             except Exception:
                                 pass
 
-                        elif "Energy.Active.Import" in meas:
-                            # 支援多型態能量欄位，例如：
-                            # "Energy.Active.Import.Register"、"Energy.Active.Import.Total"、"Energy.Active.Import.Interval"
+                        elif meas in ("Energy.Active.Import.Register", "Energy.Active.Import"):
                             kwh = _energy_to_kwh(val, unit)
                             if kwh is not None:
-                                try:
-                                    # 嘗試取得目前電價
-                                    unit_price = float(_price_for_timestamp(datetime.utcnow().isoformat()))
-                                except Exception:
-                                    unit_price = 6.0  # 若查詢失敗則使用預設電價
+                                # === 過濾異常值：和上一筆比較 ===
+                                prev_energy = (live_status_cache.get(cp_id) or {}).get("energy")
+                                if prev_energy is not None:
+                                    diff = kwh - prev_energy
+                                    if diff < 0 or diff > 10:  # 閾值可調整
+                                        logging.warning(
+                                            f"⚠️ 棄用異常能量值：{kwh} kWh (diff={diff}，prev={prev_energy})"
+                                        )
+                                        continue
 
-                                est_amount = round(kwh * unit_price, 2)
-                                _upsert_live(
-                                    cp_id,
-                                    energy=round(kwh, 6),
-                                    estimated_amount=est_amount,
-                                    price_per_kwh=unit_price,
-                                    timestamp=ts
-                                )
-                                logging.info(
-                                    f"[LIVE] 更新能量 {cp_id}: {kwh:.4f} kWh, 電價 {unit_price}, 預估金額 {est_amount}"
-                                )
+                                _upsert_live(cp_id, energy=round(kwh, 6), timestamp=ts)
 
                                 # 計算用電量與金額
                                 try:
