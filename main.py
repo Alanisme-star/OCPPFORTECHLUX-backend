@@ -1,4 +1,3 @@
-
 from urllib.parse import unquote  # ← 新增
 
 def _normalize_cp_id(cp_id: str) -> str:
