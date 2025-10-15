@@ -1145,7 +1145,6 @@ from fastapi import HTTPException
 
 @app.post("/api/charge-points/{charge_point_id:path}/stop")
 async def stop_transaction_by_charge_point(charge_point_id: str):
-    # ← 先正規化，處理星號與 URL 編碼
     cp_id = _normalize_cp_id(charge_point_id)
     print(f"🟢【API呼叫】收到停止充電API請求, charge_point_id = {charge_point_id}")
     cp = connected_charge_points.get(cp_id)
@@ -1157,6 +1156,7 @@ async def stop_transaction_by_charge_point(charge_point_id: str):
             detail=f"⚠️ 找不到連線中的充電樁：{charge_point_id}",
             headers={"X-Connected-CPs": str(list(connected_charge_points.keys()))}
         )
+
     # 查詢進行中的 transaction_id
     with sqlite3.connect(DB_FILE) as conn:
         cursor = conn.cursor()
@@ -1172,17 +1172,14 @@ async def stop_transaction_by_charge_point(charge_point_id: str):
         transaction_id = row[0]
         print(f"🟢【API呼叫】找到進行中交易 transaction_id={transaction_id}")
 
-
     # 新增同步等待機制
     loop = asyncio.get_event_loop()
     fut = loop.create_future()
     pending_stop_transactions[str(transaction_id)] = fut
 
-    # 發送 RemoteStopTransaction
+    # ✅ 發送 RemoteStopTransaction（正確呼叫）
     print(f"🟢【API呼叫】發送 RemoteStopTransaction 給充電樁")
-    print(f"🟢【API呼叫】即將送出 RemoteStopTransaction | charge_point_id={charge_point_id} | transaction_id={transaction_id}")
-    # 送 RemoteStopTransaction（使用 Payload）
-    req = call.RemoteStopTransactionPayload(transaction_id=int(transaction_id))
+    req = call.RemoteStopTransaction(transaction_id=int(transaction_id))
     resp = await cp.call(req)
     print(f"🟢【API回應】呼叫 RemoteStopTransaction 完成，resp={resp}")
 
