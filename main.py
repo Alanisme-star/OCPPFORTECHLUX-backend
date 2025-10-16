@@ -1198,58 +1198,6 @@ async def stop_transaction_by_charge_point(charge_point_id: str):
         pending_stop_transactions.pop(str(transaction_id), None)
 
 
-
-@app.get("/api/transactions/{tx_id}/price-segments")
-def get_price_segments(tx_id: int):
-    """
-    根據交易期間分段統計各時段的充電時間與預估電費。
-    自動依據 daily_pricing_rules 連續分段。
-    """
-    with sqlite3.connect(DB_FILE) as conn:
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT timestamp, value FROM meter_values
-            WHERE transaction_id = ? AND measurand LIKE 'Energy.Active.Import%'
-            ORDER BY timestamp ASC
-        """, (tx_id,))
-        rows = cur.fetchall()
-
-    if not rows:
-        return {"segments": []}
-
-    segments = []
-    for i in range(len(rows) - 1):
-        t1, v1 = rows[i]
-        t2, v2 = rows[i + 1]
-        price = _price_for_timestamp(t1)
-        used_kwh = max(0, float(v2) - float(v1))
-        est_amount = round(used_kwh * price, 2)
-        seg = {
-            "start": datetime.fromisoformat(t1).strftime("%p %I:%M"),
-            "end": datetime.fromisoformat(t2).strftime("%p %I:%M"),
-            "price": price,
-            "used_kwh": round(used_kwh, 4),
-            "estimated_amount": est_amount
-        }
-        segments.append(seg)
-
-    # 合併相同電價連續時段
-    merged = []
-    for seg in segments:
-        if merged and merged[-1]["price"] == seg["price"]:
-            merged[-1]["end"] = seg["end"]
-            merged[-1]["used_kwh"] += seg["used_kwh"]
-            merged[-1]["estimated_amount"] += seg["estimated_amount"]
-        else:
-            merged.append(seg)
-
-    return {"segments": merged}
-
-
-
-
-
-
 @app.post("/api/charge-points/{charge_point_id}/start")
 async def start_transaction_by_charge_point(charge_point_id: str, data: dict = Body(...)):
     id_tag = data.get("idTag")
