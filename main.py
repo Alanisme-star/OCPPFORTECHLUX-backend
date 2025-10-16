@@ -3535,6 +3535,54 @@ def get_active_transactions():
         return {"error": str(e)}
 
 
+import asyncio
+
+async def monitor_balance_and_auto_stop():
+    """
+    後端監控任務：每 5 秒檢查所有進行中交易，
+    若發現卡片餘額 <= 0，自動呼叫停止充電 API。
+    """
+    while True:
+        try:
+            with get_conn() as conn:
+                cur = conn.cursor()
+                # 找出所有進行中交易
+                cur.execute("""
+                    SELECT t.charge_point_id, t.id_tag
+                    FROM transactions t
+                    WHERE t.stop_timestamp IS NULL
+                """)
+                active_tx = cur.fetchall()
+
+            for cp_id, id_tag in active_tx:
+                # 查詢卡片餘額
+                with get_conn() as conn:
+                    c2 = conn.cursor()
+                    c2.execute("SELECT balance FROM cards WHERE card_id=?", (id_tag,))
+                    row = c2.fetchone()
+
+                if not row:
+                    continue
+
+                balance = float(row[0] or 0)
+                if balance <= 0:
+                    print(f"⚠️ [自動停充監控] {cp_id} 餘額={balance}，執行停止命令")
+                    try:
+                        await stop_transaction_by_charge_point(cp_id)
+                    except Exception as e:
+                        print(f"❌ [自動停充監控] 無法停止 {cp_id}: {e}")
+            await asyncio.sleep(5)
+
+        except Exception as e:
+            print(f"❌ [監控例外] {e}")
+            await asyncio.sleep(10)
+
+
+# 啟動背景任務
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(monitor_balance_and_auto_stop())
+
 
 
 
