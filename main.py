@@ -1021,6 +1021,8 @@ class ChargePoint(OcppChargePoint):
                             logging.warning(f"⚠️ 無法轉換 value 為 float：{raw_val} | measurand={meas}")
                             continue
 
+
+
                         # === 存入 DB ===
                         _cur.execute("""
                             INSERT INTO meter_values
@@ -1029,6 +1031,14 @@ class ChargePoint(OcppChargePoint):
                             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                         """, (cp_id, connector_id, transaction_id, val, meas, unit, ts, phase))
                         insert_count += 1
+
+                        # === 插入後再進行即時多時段電價計算 ===
+                        try:
+                            multi_period_cost = _calculate_multi_period_cost(transaction_id)
+                            _upsert_live(cp_id, estimated_amount=multi_period_cost)
+                        except Exception as e:
+                            logging.warning(f"⚠️ 即時多時段電價計算失敗：{e}")
+
 
                         # === 更新快取 ===
                         if meas == "Power.Active.Import":
@@ -1067,7 +1077,6 @@ class ChargePoint(OcppChargePoint):
                                 _upsert_live(
                                     cp_id,
                                     energy=round(kwh, 6),
-                                    estimated_amount=est_amount,
                                     price_per_kwh=unit_price,
                                     timestamp=ts
                                 )
