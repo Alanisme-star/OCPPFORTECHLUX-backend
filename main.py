@@ -287,6 +287,39 @@ def _price_for_timestamp(ts: str) -> float:
     return 6.0
 
 
+# ============================================================
+# 多時段電價分段計算（依據每筆 meter_values 分段累加）
+# ============================================================
+def _calculate_multi_period_cost(transaction_id: int) -> float:
+    import sqlite3
+
+    with sqlite3.connect(DB_FILE) as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT timestamp, value FROM meter_values
+            WHERE transaction_id=? AND measurand LIKE 'Energy.Active.Import%'
+            ORDER BY timestamp ASC
+        """, (transaction_id,))
+        rows = cur.fetchall()
+
+    if len(rows) < 2:
+        return 0.0
+
+    total = 0.0
+    for i in range(1, len(rows)):
+        ts_prev, val_prev = rows[i - 1]
+        ts_curr, val_curr = rows[i]
+
+        diff_kwh = max(0.0, (float(val_curr) - float(val_prev)) / 1000.0)
+        price = _price_for_timestamp(ts_curr)  # 依各時間點電價查價
+        total += diff_kwh * price
+
+    return round(total, 2)
+
+
+
+
+
 # 🔧 新增：即時查詢目前後端實際使用電價的 API
 @app.get("/api/debug/price")
 def debug_price():
@@ -843,6 +876,22 @@ class ChargePoint(OcppChargePoint):
                     # 查單價
                     unit_price = float(_price_for_timestamp(stop_ts)) if stop_ts else 6.0
                     total_amount = round(used_kwh * unit_price, 2)
+
+
+
+                    # 🧩 新增：若有多筆量測紀錄，改用分段計算
+                    try:
+                        multi_period_amount = _calculate_multi_period_cost(transaction_id)
+                        if multi_period_amount > 0:
+                            total_amount = multi_period_amount
+                            logging.info(f"🧮 多時段電價計算結果：{multi_period_amount} 元")
+                    except Exception as e:
+                        logging.warning(f"⚠️ 多時段電價計算失敗，改用單一電價：{e}")
+
+
+
+
+
 
                     # 更新卡片餘額
                     _cur.execute("SELECT balance FROM cards WHERE card_id=?", (id_tag,))
