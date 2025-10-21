@@ -1081,7 +1081,11 @@ class ChargePoint(OcppChargePoint):
                         # === 插入後再進行即時多時段電價計算 ===
                         try:
                             res = _calculate_multi_period_cost_detailed(transaction_id)
-                            _upsert_live(cp_id, estimated_amount=res["total"])
+                            _upsert_live(cp_id,
+                                         estimated_energy=res["segments"][-1]["kwh"] if res["segments"] else 0,
+                                         estimated_amount=res["total"],
+                                         price_per_kwh=res["segments"][-1]["price"] if res["segments"] else 6.0,
+                                         timestamp=ts)
                         except Exception as e:
                             logging.warning(f"⚠️ 即時多時段電價計算失敗：{e}")
 
@@ -1109,23 +1113,24 @@ class ChargePoint(OcppChargePoint):
                                 pass
 
                         elif "Energy.Active.Import" in meas:
-                            # 支援多型態能量欄位，例如：
-                            # "Energy.Active.Import.Register"、"Energy.Active.Import.Total"、"Energy.Active.Import.Interval"
-                            kwh = _energy_to_kwh(val, unit)
-                            if kwh is not None:
-                                try:
-                                    # 嘗試取得目前電價
-                                    unit_price = float(_price_for_timestamp(datetime.utcnow().isoformat()))
-                                except Exception:
-                                    unit_price = 6.0  # 若查詢失敗則使用預設電價
+                            try:
+                                res = _calculate_multi_period_cost_detailed(transaction_id)
+                                total = res["total"]
+                                last_seg = res["segments"][-1] if res["segments"] else None
+                                price = last_seg["price"] if last_seg else _price_for_timestamp(ts)
+                                used_kwh = sum([s["kwh"] for s in res["segments"]]) if res["segments"] else 0
 
-                                est_amount = round(kwh * unit_price, 2)
                                 _upsert_live(
                                     cp_id,
-                                    energy=round(kwh, 6),
-                                    price_per_kwh=unit_price,
-                                    timestamp=ts
+                                    estimated_energy=round(used_kwh, 6),
+                                    estimated_amount=round(total, 2),
+                                    price_per_kwh=price,
+                                    timestamp=ts,
                                 )
+                                logging.info(f"✅ 即時計算多時段金額成功：{total} 元")
+                            except Exception as e:
+                                logging.warning(f"⚠️ 即時計算多時段金額失敗：{e}")
+
                                 logging.info(
                                     f"[LIVE] 更新能量 {cp_id}: {kwh:.4f} kWh, 電價 {unit_price}, 預估金額 {est_amount}"
                                 )
