@@ -316,6 +316,52 @@ def _calculate_multi_period_cost(transaction_id: int) -> float:
 
     return round(total, 2)
 
+def _calculate_multi_period_cost_detailed(transaction_id: int):
+    """
+    回傳：
+    {
+      "total": 123.45,
+      "segments": [
+        {"start": "...", "end": "...", "kwh": 0.12, "price": 5.5, "subtotal": 0.66},
+        ...
+      ]
+    }
+    """
+    import sqlite3
+    with sqlite3.connect(DB_FILE) as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT timestamp, value FROM meter_values
+            WHERE transaction_id=? AND measurand LIKE 'Energy.Active.Import%'
+            ORDER BY timestamp ASC
+        """, (transaction_id,))
+        rows = cur.fetchall()
+
+    if len(rows) < 2:
+        return {"total": 0.0, "segments": []}
+
+    total = 0.0
+    segments = []
+    for i in range(1, len(rows)):
+        ts_prev, val_prev = rows[i - 1]
+        ts_curr, val_curr = rows[i]
+
+        # 計算該區段用電量 (kWh)
+        diff_kwh = max(0.0, (float(val_curr) - float(val_prev)) / 1000.0)
+        price = _price_for_timestamp(ts_curr)
+        subtotal = round(diff_kwh * price, 4)
+        total += subtotal
+
+        segments.append({
+            "start": ts_prev,
+            "end": ts_curr,
+            "kwh": round(diff_kwh, 6),
+            "price": price,
+            "subtotal": subtotal
+        })
+
+    return {"total": round(total, 2), "segments": segments}
+
 
 
 
@@ -1034,8 +1080,8 @@ class ChargePoint(OcppChargePoint):
 
                         # === 插入後再進行即時多時段電價計算 ===
                         try:
-                            multi_period_cost = _calculate_multi_period_cost(transaction_id)
-                            _upsert_live(cp_id, estimated_amount=multi_period_cost)
+                            res = _calculate_multi_period_cost_detailed(transaction_id)
+                            _upsert_live(cp_id, estimated_amount=res["total"])
                         except Exception as e:
                             logging.warning(f"⚠️ 即時多時段電價計算失敗：{e}")
 
@@ -1520,6 +1566,19 @@ def get_last_tx_summary_by_cp(charge_point_id: str):
         }
 
 
+@app.get("/api/transactions/{transaction_id}/price-breakdown")
+def get_price_breakdown(transaction_id: int):
+    """
+    取得該交易的分段電價明細，用於前端顯示跨時段電價結果。
+    """
+    try:
+        result = _calculate_multi_period_cost_detailed(transaction_id)
+        return result
+    except Exception as e:
+        logging.exception(f"⚠️ price-breakdown 錯誤: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 
 # ✅ 新增 API：回傳單次充電的累積電量
 @app.get("/api/charge-points/{charge_point_id}/latest-energy")
@@ -1575,6 +1634,18 @@ def get_latest_energy(charge_point_id: str):
             "sessionEnergyKWh": round(session_kwh, 6)
         }
 
+
+@app.get("/api/transactions/{transaction_id}/price-breakdown")
+def get_price_breakdown(transaction_id: int):
+    """
+    取得該交易的分段電價明細，用於前端顯示跨時段電價結果。
+    """
+    try:
+        result = _calculate_multi_period_cost_detailed(transaction_id)
+        return result
+    except Exception as e:
+        logging.exception(f"⚠️ price-breakdown 錯誤: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 
@@ -2013,6 +2084,18 @@ def get_transaction_summary(transaction_id: str):
             "balance": round(balance, 2),
         }
 
+
+@app.get("/api/transactions/{transaction_id}/price-breakdown")
+def get_price_breakdown(transaction_id: int):
+    """
+    取得該交易的分段電價明細，用於前端顯示跨時段電價結果。
+    """
+    try:
+        result = _calculate_multi_period_cost_detailed(transaction_id)
+        return result
+    except Exception as e:
+        logging.exception(f"⚠️ price-breakdown 錯誤: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 
