@@ -317,17 +317,9 @@ def _calculate_multi_period_cost(transaction_id: int) -> float:
     return round(total, 2)
 
 def _calculate_multi_period_cost_detailed(transaction_id: int):
-    """
-    回傳：
-    {
-      "total": 123.45,
-      "segments": [
-        {"start": "...", "end": "...", "kwh": 0.12, "price": 5.5, "subtotal": 0.66},
-        ...
-      ]
-    }
-    """
     import sqlite3
+    from datetime import datetime
+
     with sqlite3.connect(DB_FILE) as conn:
         cur = conn.cursor()
         cur.execute("""
@@ -340,27 +332,65 @@ def _calculate_multi_period_cost_detailed(transaction_id: int):
     if len(rows) < 2:
         return {"total": 0.0, "segments": []}
 
+    segments_map = {}
     total = 0.0
-    segments = []
+
     for i in range(1, len(rows)):
         ts_prev, val_prev = rows[i - 1]
         ts_curr, val_curr = rows[i]
 
-        # 計算該區段用電量 (kWh)
         diff_kwh = max(0.0, (float(val_curr) - float(val_prev)) / 1000.0)
         price = _price_for_timestamp(ts_curr)
-        subtotal = round(diff_kwh * price, 4)
-        total += subtotal
 
-        segments.append({
-            "start": ts_prev,
-            "end": ts_curr,
-            "kwh": round(diff_kwh, 6),
-            "price": price,
-            "subtotal": subtotal
-        })
+        dt = datetime.fromisoformat(ts_curr)
+        date_key = dt.strftime("%Y-%m-%d")
+        time_str = dt.strftime("%H:%M")
 
-    return {"total": round(total, 2), "segments": segments}
+        # ★ 查電價時段（start_time, end_time）
+        with sqlite3.connect(DB_FILE) as conn:
+            c2 = conn.cursor()
+            c2.execute("""
+                SELECT start_time, end_time
+                FROM daily_pricing_rules
+                WHERE date = ?
+                  AND start_time <= ?
+                  AND end_time > ?
+                ORDER BY start_time DESC LIMIT 1
+            """, (date_key, time_str, time_str))
+            rule = c2.fetchone()
+
+        if rule:
+            start_t, end_t = rule
+        else:
+            start_t, end_t = "00:00", "23:59"  # 未設定電價區段時 fallback
+
+        key = (date_key, start_t, end_t, price)
+
+        if key not in segments_map:
+            segments_map[key] = {
+                "start": f"{date_key}T{start_t}:00",
+                "end": f"{date_key}T{end_t}:00",
+                "kwh": 0.0,
+                "price": price,
+                "subtotal": 0.0
+            }
+
+        seg = segments_map[key]
+        seg["kwh"] += diff_kwh
+        seg["subtotal"] += diff_kwh * price
+        total += diff_kwh * price
+
+    # 轉格式：按時間排序
+    segments = sorted(segments_map.values(), key=lambda s: s["start"])
+    for seg in segments:
+        seg["kwh"] = round(seg["kwh"], 6)
+        seg["subtotal"] = round(seg["subtotal"], 2)
+
+    return {
+        "total": round(total, 2),
+        "segments": segments
+    }
+
 
 
 
