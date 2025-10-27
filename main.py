@@ -353,9 +353,9 @@ def _calculate_multi_period_cost_detailed(transaction_id: int):
                 SELECT start_time, end_time
                 FROM daily_pricing_rules
                 WHERE date = ?
-                  AND start_time <= ?
-                  AND end_time > ?
-                ORDER BY start_time DESC LIMIT 1
+                  AND ? >= start_time
+                  AND ? < end_time
+                ORDER BY start_time ASC LIMIT 1
             """, (date_key, time_str, time_str))
             rule = c2.fetchone()
 
