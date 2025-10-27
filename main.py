@@ -3665,6 +3665,39 @@ def last_transactions():
         return {"last_transactions": result}
 
 
+# ⭐ 新增：查詢該樁進行中交易的分段電價明細
+@app.get("/api/charge-points/{charge_point_id}/current-transaction/price-breakdown")
+def get_current_price_breakdown(charge_point_id: str):
+    cp_id = _normalize_cp_id(charge_point_id)
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+        # 取得進行中的交易
+        cur.execute("""
+            SELECT transaction_id
+            FROM transactions
+            WHERE charge_point_id=? AND stop_timestamp IS NULL
+            ORDER BY start_timestamp DESC LIMIT 1
+        """, (cp_id,))
+        row = cur.fetchone()
+
+        if not row:
+            return {"found": False, "segments": []}
+
+        tx_id = row[0]
+
+    # 分段電價計算
+    try:
+        result = _calculate_multi_period_cost_detailed(tx_id)
+        return {
+            "found": True,
+            "transaction_id": tx_id,
+            **result   # 合併 total, segments
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 
 
 # ✅ 除錯用：查詢目前資料庫中尚未結束的交易紀錄

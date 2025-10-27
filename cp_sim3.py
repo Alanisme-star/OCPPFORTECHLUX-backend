@@ -1,15 +1,10 @@
 import asyncio
 import logging
 import random
-import signal
 import sys
 from datetime import datetime, timezone
-from urllib.parse import quote
-
 from websockets import connect
 from ocpp.v16 import ChargePoint as BaseChargePoint, call
-from ocpp.v16.enums import Action
-from ocpp.routing import on
 
 logging.basicConfig(
     level=logging.INFO,
@@ -17,14 +12,15 @@ logging.basicConfig(
     datefmt="%H:%M:%S"
 )
 
-# ====================== 使用者需確認的設定 ======================
-CHARGE_POINT_ID = "TW*MSI*E000100"   # ⚡ 與後端 charge_points 表一致
-ID_TAG = "6678B3EB"            # ⚡ 與後端 cards / id_tags 表中存在的卡號一致
-BACKEND_URL = "wss://ocppfortechlux-backend.onrender.com"
-WS_URL = BACKEND_URL.rstrip("/") + "/" + quote(CHARGE_POINT_ID, safe="")
-# ===============================================================
+# ====================== 使用者設定 ======================
+CHARGE_POINT_ID = "TW*MSI*E000100"
+ID_TAG = "6678B3EB"
+WS_URL = "wss://ocppfortechlux-backend.onrender.com/TW*MSI*E000100"
+# =======================================================
+
 
 def iso_utc():
+    """取得目前 UTC ISO 時間字串"""
     return datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
 
 
@@ -34,14 +30,6 @@ class SimChargePoint(BaseChargePoint):
         self.running = True
         self.tx_id = None
         self.energy_wh = 0
-
-    # ---- 後端主動事件 ----
-    @on(Action.remote_stop_transaction)
-    async def on_remote_stop_transaction(self, transaction_id=None, **kwargs):
-        logging.info(f"[SIM] 🛑 收到遠端停充指令: tx={transaction_id}")
-        self.running = False
-        await self._send_stop_tx(transaction_id)
-        return {"status": "Accepted"}
 
     # ---- 模擬器主動送出 ----
     async def send_boot(self):
@@ -72,13 +60,11 @@ class SimChargePoint(BaseChargePoint):
                 timestamp=iso_utc()
             )
         )
-        logging.info(f"[SIM] StartTransaction 原始回應: {res.__dict__ if hasattr(res, '__dict__') else res}")
         self.tx_id = getattr(res, "transaction_id", None) or getattr(res, "transactionId", None)
         logging.info(f"[SIM] >>> 取得 transaction_id = {self.tx_id}")
-        if not self.tx_id:
-            logging.warning("⚠️ StartTransaction 沒有回傳有效的 transaction_id，後續 MeterValues 可能被後端拒絕")
 
     async def send_meter_values(self):
+        """每秒送出一次即時量測"""
         power = random.randint(3000, 3500)
         voltage = random.uniform(220, 230)
         current = power / voltage
@@ -102,26 +88,35 @@ class SimChargePoint(BaseChargePoint):
             f"[SIM] → MeterValues (tx={self.tx_id}) | {power}W {voltage:.1f}V {current:.1f}A total={self.energy_wh:.1f}Wh"
         )
         try:
-            res = await self.call(
+            await self.call(
                 call.MeterValues(connector_id=1, transaction_id=self.tx_id, meter_value=[mv])
             )
-            logging.info(f"[SIM] MeterValues 回應: {res}")
         except Exception as e:
             logging.error(f"[SIM] 發送 MeterValues 失敗: {e}")
-
-    async def _send_stop_tx(self, transaction_id):
-        logging.info(f"[SIM] → StopTransaction: {transaction_id}, meter_stop={self.energy_wh:.1f}Wh")
-        await self.call(
-            call.StopTransaction(
-                transaction_id=transaction_id,
-                meter_stop=int(self.energy_wh),
-                timestamp=iso_utc()
-            )
-        )
 
     async def send_heartbeat(self):
         logging.info("[SIM] → Heartbeat")
         await self.call(call.Heartbeat())
+
+    async def send_stop_transaction(self, reason="Local"):
+        """模擬結束時送出 StopTransaction"""
+        if not self.tx_id:
+            logging.warning("[SIM] ⚠️ 無有效 transaction_id，略過 StopTransaction")
+            return
+        logging.info(f"[SIM] → StopTransaction tx_id={self.tx_id}")
+        try:
+            await self.call(
+                call.StopTransaction(
+                    transaction_id=int(self.tx_id),
+                    meter_stop=int(self.energy_wh),
+                    timestamp=iso_utc(),
+                    id_tag=ID_TAG,
+                    reason=reason
+                )
+            )
+            logging.info(f"[SIM] ✅ StopTransaction 已送出（tx={self.tx_id}, energy={self.energy_wh:.1f}Wh）")
+        except Exception as e:
+            logging.error(f"[SIM] StopTransaction 發送失敗: {e}")
 
 
 async def main():
@@ -130,13 +125,16 @@ async def main():
         cp = SimChargePoint(CHARGE_POINT_ID, ws)
         asyncio.create_task(cp.start())
 
+        # ====== 啟動階段 ======
         await cp.send_boot()
         await cp.send_status("Available")
         await cp.send_authorize()
         await cp.send_status("Preparing")
+        await asyncio.sleep(3)
         await cp.start_tx()
         await cp.send_status("Charging")
 
+        # ====== 維持心跳任務 ======
         async def heartbeat_task():
             while cp.running:
                 await asyncio.sleep(30)
@@ -145,23 +143,37 @@ async def main():
 
         asyncio.create_task(heartbeat_task())
 
-        while cp.running:
+        # ====== 主模擬迴圈 ======
+        try:
+            while cp.running:
+                await asyncio.sleep(1)
+                await cp.send_meter_values()
+        except KeyboardInterrupt:
+            logging.info("[SIM] 🛑 使用者中斷，準備送出 StopTransaction")
+            await cp.send_stop_transaction(reason="Local")
+            await cp.send_status("Finishing")
             await asyncio.sleep(1)
-            await cp.send_meter_values()
-
-        await cp.send_status("Finishing")
-        await cp.send_status("Available")
+            await cp.send_status("Available")
+        except Exception as e:
+            logging.error(f"[SIM] 發生例外：{e}")
+            await cp.send_stop_transaction(reason="Error")
+        finally:
+            logging.info("[SIM] ✅ 模擬器結束，關閉連線")
+            cp.running = False
+            try:
+                # 保險：結束前再送一次 StopTransaction（避免錯過）
+                await cp.send_stop_transaction(reason="PowerLoss")
+            except Exception:
+                pass
+            try:
+                await cp.send_status("Available")
+            except Exception:
+                pass
+            try:
+                await ws.close()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
-    loop = asyncio.get_event_loop()
-
-    def stop_loop(sig, frame):
-        logging.info("[SIM] 收到中斷訊號，結束模擬")
-        loop.stop()
-        sys.exit(0)
-
-    signal.signal(signal.SIGINT, stop_loop)
-    signal.signal(signal.SIGTERM, stop_loop)
-
     asyncio.run(main())
