@@ -36,6 +36,13 @@ from ocpp.routing import on
 from urllib.parse import urlparse, parse_qsl
 from reportlab.pdfgen import canvas
 
+
+
+# === 時區設定: 台北 ===
+from zoneinfo import ZoneInfo
+TZ_TAIPEI = ZoneInfo("Asia/Taipei")
+
+
 app = FastAPI()
 
 # === WebSocket 連線驗證設定（可選）===
@@ -342,9 +349,19 @@ def _calculate_multi_period_cost_detailed(transaction_id: int):
         diff_kwh = max(0.0, (float(val_curr) - float(val_prev)) / 1000.0)
         price = _price_for_timestamp(ts_curr)
 
-        dt = datetime.fromisoformat(ts_curr)
-        date_key = dt.strftime("%Y-%m-%d")
-        time_str = dt.strftime("%H:%M")
+        # 正規化 UTC timestamp → 轉換為台北時間
+        ts_norm = ts_curr.replace("Z", "+00:00")  # 處理帶 Z 格式
+        dt_parsed = datetime.fromisoformat(ts_norm)
+
+        # 若 timestamp 無 tzinfo，視為 UTC，再轉台北
+        if dt_parsed.tzinfo is None:
+            dt_parsed = dt_parsed.replace(tzinfo=timezone.utc)
+
+        dt_local = dt_parsed.astimezone(TZ_TAIPEI)
+
+        date_key = dt_local.strftime("%Y-%m-%d")
+        time_str = dt_local.strftime("%H:%M")
+
 
         # ★ 查電價時段（start_time, end_time）
         with sqlite3.connect(DB_FILE) as conn:
