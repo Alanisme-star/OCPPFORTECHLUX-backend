@@ -379,7 +379,26 @@ def _calculate_multi_period_cost_detailed(transaction_id: int):
         if rule:
             start_t, end_t = rule
         else:
-            start_t, end_t = "00:00", "23:59"  # 未設定電價區段時 fallback
+            # 🩵 新增：若當天查不到規則，嘗試往前一天查
+            prev_date = (dt_local - timedelta(days=1)).strftime("%Y-%m-%d")
+            with sqlite3.connect(DB_FILE) as conn_prev:
+                c_prev = conn_prev.cursor()
+                c_prev.execute("""
+                    SELECT start_time, end_time, price
+                    FROM daily_pricing_rules
+                    WHERE date = ?
+                      AND ? >= start_time
+                      AND ? < end_time
+                    ORDER BY start_time ASC LIMIT 1
+                """, (prev_date, time_str, time_str))
+                rule_prev = c_prev.fetchone()
+            if rule_prev:
+                start_t, end_t, price = rule_prev
+            else:
+                # 最終 fallback（完全查不到）
+                start_t, end_t = "00:00", "23:59"
+                price = 6.0
+
 
         key = (date_key, start_t, end_t, price)
 
@@ -399,14 +418,19 @@ def _calculate_multi_period_cost_detailed(transaction_id: int):
 
     # 轉格式：按時間排序
     segments = sorted(segments_map.values(), key=lambda s: s["start"])
+
+    # 🔧 延後 round，避免四捨五入誤差
+    raw_total = sum(seg["subtotal"] for seg in segments)
     for seg in segments:
         seg["kwh"] = round(seg["kwh"], 6)
-        seg["subtotal"] = round(seg["subtotal"], 2)
+        seg["subtotal"] = round(seg["kwh"] * seg["price"], 2)  # 精確以最新 kWh×單價計算
 
     return {
-        "total": round(total, 2),
+        "total": round(sum(seg["subtotal"] for seg in segments), 2),  # 最後一次統一 round
         "segments": segments
     }
+
+
 
 
 
@@ -721,6 +745,20 @@ class ChargePoint(OcppChargePoint):
 
             # ⭐ 當狀態切換成 Available，清空快取並補 0 到 DB
             if status == "Available":
+                # ✅ 先確認是否仍有進行中交易
+                with sqlite3.connect(DB_FILE) as _conn_check:
+                    _cur_check = _conn_check.cursor()
+                    _cur_check.execute("""
+                        SELECT COUNT(*) FROM transactions
+                        WHERE charge_point_id = ? AND stop_timestamp IS NULL
+                    """, (cp_id,))
+                    active_tx = _cur_check.fetchone()[0]
+
+                if active_tx > 0:
+                    logging.warning(f"⚠️ 忽略不合理的 Available 狀態（仍有交易進行中）| CP={cp_id}")
+                    return call_result.StatusNotificationPayload()
+
+                # ✅ 沒有交易才真的清除
                 logging.debug(f"🔍 [DEBUG] Status=Available 前快取: {live_status_cache.get(cp_id)}")
                 live_status_cache[cp_id] = {
                     "power": 0,
@@ -732,7 +770,6 @@ class ChargePoint(OcppChargePoint):
                     "price_per_kwh": 0,
                     "timestamp": datetime.utcnow().isoformat()
                 }
-                # → 補一筆 0 kWh 到 DB
                 with sqlite3.connect(DB_FILE) as _c:
                     _cur = _c.cursor()
                     _cur.execute('''
@@ -742,6 +779,7 @@ class ChargePoint(OcppChargePoint):
                     ''', (cp_id, connector_id, None, 0.0,
                           "Energy.Active.Import.Register", "kWh", datetime.utcnow().isoformat()))
                     _c.commit()
+
 
                 logging.debug(f"🔍 [DEBUG] Status=Available 後快取: {live_status_cache.get(cp_id)}")
 
@@ -1279,16 +1317,26 @@ async def on_disconnect(self, websocket, close_code):
             connected_charge_points.pop(cp_id, None)
             logging.warning(f"⚠️ 充電樁已斷線: {cp_id}")
 
-            # 更新資料庫中該樁狀態為 Available
+            # ✅ 僅在沒有進行中交易時才更新為 Available
             with sqlite3.connect(DB_FILE, timeout=15) as conn:
                 cur = conn.cursor()
                 cur.execute("""
-                    UPDATE charge_points
-                    SET status = 'Available'
-                    WHERE charge_point_id = ?
+                    SELECT COUNT(*) FROM transactions
+                    WHERE charge_point_id = ? AND stop_timestamp IS NULL
                 """, (cp_id,))
-                conn.commit()
-                logging.info(f"✅ 已將 {cp_id} 狀態更新為 Available")
+                active_tx = cur.fetchone()[0]
+
+                if active_tx == 0:
+                    cur.execute("""
+                        UPDATE charge_points
+                        SET status = 'Available'
+                        WHERE charge_point_id = ?
+                    """, (cp_id,))
+                    conn.commit()
+                    logging.info(f"✅ 已將 {cp_id} 狀態更新為 Available（無進行中交易）")
+                else:
+                    logging.warning(f"⚠️ 忽略斷線狀態更新：{cp_id} 仍有 {active_tx} 筆交易進行中")
+
         else:
             logging.warning("⚠️ 無法辨識斷線的充電樁 ID")
     except Exception as e:
