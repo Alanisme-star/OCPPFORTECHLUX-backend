@@ -284,11 +284,15 @@ def _price_for_timestamp(ts: str) -> float:
                 SELECT price FROM daily_pricing_rules
                 WHERE date = ?
                   AND (
-                        (start_time <= end_time AND start_time <= ? AND end_time > ?)
-                     OR (start_time > end_time AND ( ? >= start_time OR ? < end_time ))
+                        -- ✅ 一般時段（同一天內）
+                        (start_time <= end_time AND start_time <= ? AND end_time >= ?)
+
+                        -- ✅ 跨午夜時段（例如 23:30~00:30）
+                     OR (start_time > end_time AND ( ? >= start_time OR ? <= end_time ))
                   )
                 ORDER BY start_time DESC LIMIT 1
             """, (date_str, time_str, time_str, time_str, time_str))
+
 
             row = cur.fetchone()
             if row:
