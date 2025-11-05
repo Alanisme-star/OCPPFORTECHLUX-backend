@@ -264,34 +264,53 @@ def get_conn():
 
 
 
-# 🔧 新增：根據時間戳查詢當前適用電價
 def _price_for_timestamp(ts: str) -> float:
     """
-    根據時間戳（ISO格式）從 daily_pricing_rules 表查出對應的電價。
-    若該時段未設定電價，則回傳預設值 6.0。
+    根據時間戳（ISO格式）從 daily_pricing_rules 查出對應電價。
+    支援跨午夜（例如 23:30~00:30），並在查無資料時回傳預設值 6.0。
     """
     try:
-        dt = datetime.fromisoformat(ts)
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00")) if "Z" in ts else datetime.fromisoformat(ts)
         date_str = dt.strftime("%Y-%m-%d")
         time_str = dt.strftime("%H:%M")
 
         with sqlite3.connect(DB_FILE) as conn:
             cur = conn.cursor()
+
+            # ✅ 支援跨午夜 + 一般時段
             cur.execute("""
                 SELECT price FROM daily_pricing_rules
                 WHERE date = ?
-                  AND start_time <= ?
-                  AND end_time > ?
+                  AND (
+                        (start_time <= end_time AND start_time <= ? AND end_time > ?)
+                     OR (start_time > end_time AND ( ? >= start_time OR ? < end_time ))
+                  )
                 ORDER BY start_time DESC LIMIT 1
-            """, (date_str, time_str, time_str))
+            """, (date_str, time_str, time_str, time_str, time_str))
+
             row = cur.fetchone()
             if row:
                 return float(row[0])
+
+            # 🩵 若查不到 → 檢查前一天跨午夜延伸段
+            prev_date = (dt - timedelta(days=1)).strftime("%Y-%m-%d")
+            cur.execute("""
+                SELECT price FROM daily_pricing_rules
+                WHERE date = ?
+                  AND start_time > end_time
+                  AND ? < end_time
+                ORDER BY start_time DESC LIMIT 1
+            """, (prev_date, time_str))
+            row_prev = cur.fetchone()
+            if row_prev:
+                return float(row_prev[0])
+
     except Exception as e:
         logging.warning(f"⚠️ 電價查詢失敗: {e}")
 
-    # 若查無設定則給預設值
-    return 6.0
+    return 6.0  # 預設值
+
+
 
 
 # ============================================================
@@ -3791,6 +3810,15 @@ def get_current_price_breakdown(charge_point_id: str):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+
+# ✅ 要讓除錯更直觀，在 /api/debug/price 增加目前伺服器時間顯示
+@app.get("/api/debug/price")
+def debug_price():
+    now = datetime.now(TZ_TAIPEI)
+    price = _price_for_timestamp(now.isoformat())
+    return {"now": now.strftime("%Y-%m-%d %H:%M:%S"), "current_price": price}
 
 
 
