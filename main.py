@@ -270,14 +270,16 @@ def _price_for_timestamp(ts: str) -> float:
     支援跨午夜（例如 23:30~00:30），並在查無資料時回傳預設值 6.0。
     """
     try:
+        # ⭐ 解析 ISO 格式並將 UTC 轉為台灣時間
         dt = datetime.fromisoformat(ts.replace("Z", "+00:00")) if "Z" in ts else datetime.fromisoformat(ts)
+        dt = dt.astimezone(ZoneInfo("Asia/Taipei"))  # ← 這一行是造成你現在電價整天變 6 的關鍵
+
         date_str = dt.strftime("%Y-%m-%d")
         time_str = dt.strftime("%H:%M")
 
         with sqlite3.connect(DB_FILE) as conn:
             cur = conn.cursor()
 
-            # ✅ 支援跨午夜 + 一般時段
             cur.execute("""
                 SELECT price FROM daily_pricing_rules
                 WHERE date = ?
@@ -292,23 +294,10 @@ def _price_for_timestamp(ts: str) -> float:
             if row:
                 return float(row[0])
 
-            # 🩵 若查不到 → 檢查前一天跨午夜延伸段
-            prev_date = (dt - timedelta(days=1)).strftime("%Y-%m-%d")
-            cur.execute("""
-                SELECT price FROM daily_pricing_rules
-                WHERE date = ?
-                  AND start_time > end_time
-                  AND ? < end_time
-                ORDER BY start_time DESC LIMIT 1
-            """, (prev_date, time_str))
-            row_prev = cur.fetchone()
-            if row_prev:
-                return float(row_prev[0])
-
     except Exception as e:
         logging.warning(f"⚠️ 電價查詢失敗: {e}")
 
-    return 6.0  # 預設值
+    return 6.0
 
 
 
