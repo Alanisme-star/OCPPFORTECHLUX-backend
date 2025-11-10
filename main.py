@@ -510,6 +510,19 @@ CREATE TABLE IF NOT EXISTS cards (
 )
 ''')
 
+
+# ✅ 新增 card_cp_permissions 資料表（卡片可使用哪些充電樁）
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS card_cp_permissions (
+    id_tag TEXT NOT NULL,
+    charge_point_id TEXT NOT NULL,
+    PRIMARY KEY (id_tag, charge_point_id)
+)
+''')
+
+
+
+
 # 建立 daily_pricing 表（若尚未存在）
 cursor.execute('''
 CREATE TABLE IF NOT EXISTS daily_pricing (
@@ -1435,6 +1448,27 @@ async def start_transaction_by_charge_point(charge_point_id: str, data: dict = B
     response = await cp.send_remote_start_transaction(id_tag=id_tag, connector_id=connector_id)
     print(f"🟢【API】回應 RemoteStartTransaction: {response}")
     return {"message": "已送出啟動充電請求", "response": response}
+
+
+
+@app.post("/api/cards/{id_tag}/allowed-cps")
+def set_allowed_cps(id_tag: str, charge_points: list[str]):
+    with get_conn() as conn:
+        cur = conn.cursor()
+
+        # 先清空舊的
+        cur.execute("DELETE FROM card_cp_permissions WHERE id_tag=?", (id_tag,))
+
+        # 寫入新的
+        for cp in charge_points:
+            cur.execute("""
+                INSERT OR IGNORE INTO card_cp_permissions (id_tag, charge_point_id)
+                VALUES (?, ?)
+            """, (id_tag, cp))
+
+        conn.commit()
+    return {"status": "ok"}
+
 
 
 from fastapi import FastAPI, HTTPException
@@ -3812,6 +3846,31 @@ def debug_price():
     now = datetime.now(TZ_TAIPEI)
     price = _price_for_timestamp(now.isoformat())
     return {"now": now.strftime("%Y-%m-%d %H:%M:%S"), "current_price": price}
+
+
+
+@app.get("/api/cards/{id_tag}/allowed-cps")
+def get_allowed_cps(id_tag: str):
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT charge_point_id
+            FROM card_cp_permissions
+            WHERE id_tag=?
+        """, (id_tag,))
+        rows = cur.fetchall()
+    return [r[0] for r in rows]
+
+
+
+
+@app.get("/api/charge-points")
+def get_all_charge_points():
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT charge_point_id, name FROM charge_points ORDER BY charge_point_id")
+        rows = cur.fetchall()
+    return [{"id": r[0], "name": r[1]} for r in rows]
 
 
 
