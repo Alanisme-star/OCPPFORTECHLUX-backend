@@ -125,6 +125,21 @@ def get_whitelist():
 
 
 
+@app.get("/api/cards/{id_tag}/whitelist")
+def get_card_whitelist(id_tag: str):
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT charge_point_id
+            FROM card_cp_permissions
+            WHERE id_tag = ?
+        """, (id_tag,))
+        rows = cur.fetchall()
+
+    return {"allowed": [r[0] for r in rows]}
+
+
+
 
 
 # ==== Live 快取工具 ====
@@ -1452,39 +1467,24 @@ async def start_transaction_by_charge_point(charge_point_id: str, data: dict = B
 
 
 @app.post("/api/cards/{id_tag}/whitelist")
-def update_card_whitelist(id_tag: str, allowed_points: list[str]):
-    """
-    更新卡片允許的充電樁清單（白名單）。
-    1. 更新 card_cp_permissions（卡片 → 充電樁）
-    2. 確保 charge_points 中至少存在該充電樁（供 WebSocket 白名單驗證使用）
-    """
+async def update_whitelist(id_tag: str, payload: list):
     with get_conn() as conn:
         cur = conn.cursor()
 
-        # 1. 清空舊的允許清單
+        # 先清空舊白名單
         cur.execute("DELETE FROM card_cp_permissions WHERE id_tag=?", (id_tag,))
 
-        # 2. 寫入新的允許清單
-        for cp in allowed_points:
-            # 卡片 → 充電樁
+        # 寫入新白名單
+        for cp in payload:
             cur.execute("""
-                INSERT OR IGNORE INTO card_cp_permissions (id_tag, charge_point_id)
+                INSERT INTO card_cp_permissions (id_tag, charge_point_id)
                 VALUES (?, ?)
             """, (id_tag, cp))
 
-            # 確保 charge_points 中有該充電樁
-            cur.execute("""
-                INSERT OR IGNORE INTO charge_points (charge_point_id, name, status)
-                VALUES (?, ?, 'enabled')
-            """, (cp, cp))
-
         conn.commit()
 
-    return {
-        "status": "ok",
-        "id_tag": id_tag,
-        "allowed_points": allowed_points
-    }
+    return {"message": "ok"}
+
 
 
 
@@ -3012,29 +3012,22 @@ def get_charge_points():
 
 
 @app.post("/api/charge-points")
-async def add_charge_point(data: dict = Body(...)):
-    # 兼容前端的兩種字段命名：chargePointId / charge_point_id
-    cp_id = data.get("chargePointId") or data.get("charge_point_id")
-    name = data.get("name") or ""
-    status = (data.get("status") or "enabled").lower()
+def add_charge_point(data: dict = Body(...)):
+    cp_id = data.get("charge_point_id") or data.get("chargePointId")
+    name = data.get("name") or None
 
     if not cp_id:
-        raise HTTPException(status_code=400, detail="chargePointId is required")
+        raise HTTPException(status_code=400, detail="charge_point_id 不可空白")
 
-    try:
-        cursor.execute("""
-            INSERT INTO charge_points (charge_point_id, name, status)
-            VALUES (?, ?, ?)
-        """, (cp_id, name, status))
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT OR IGNORE INTO charge_points (charge_point_id, name, status)
+            VALUES (?, ?, 'enabled')
+        """, (cp_id, name))
         conn.commit()
 
-        return {"message": "ok"}
-
-    except sqlite3.IntegrityError:
-        # 主鍵重複
-        raise HTTPException(status_code=409, detail="充電樁已存在")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    return {"message": "ok"}
 
 
 @app.put("/api/charge-points/{cp_id}")
@@ -3060,13 +3053,11 @@ async def update_charge_point(cp_id: str = Path(...), data: dict = Body(...)):
 def delete_charge_point(cp_id: str):
     with get_conn() as conn:
         cur = conn.cursor()
-        cur.execute(
-            "DELETE FROM charge_points WHERE charge_point_id=?",
-            (cp_id,)
-        )
+        cur.execute("DELETE FROM charge_points WHERE charge_point_id=?", (cp_id,))
         conn.commit()
 
     return {"message": "deleted"}
+
 
 
 @app.delete("/api/cards/{card_id}")
