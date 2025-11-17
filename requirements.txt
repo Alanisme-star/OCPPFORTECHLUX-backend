@@ -5,6 +5,3 @@ ocpp==0.24.0
 requests
 reportlab
 python-dateutil
-python-socketio
-python-engineio
-python-dotenv

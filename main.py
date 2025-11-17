@@ -3007,35 +3007,6 @@ async def delete_charge_point(cp_id: str = Path(...)):
     conn.commit()
     return {"message": "已刪除"}
 
-@app.get("/api/cards/{id_tag}/whitelist")
-def get_card_whitelist(id_tag: str):
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT charge_point_id FROM card_cp_permissions
-            WHERE id_tag=?
-        """, (id_tag,))
-        rows = cur.fetchall()
-
-    return {"allowed": [r[0] for r in rows]}
-
-@app.post("/api/cards/{id_tag}/whitelist")
-def update_card_whitelist(id_tag: str, allowed: list):
-    with get_conn() as conn:
-        cur = conn.cursor()
-        # 清空舊資料
-        cur.execute("DELETE FROM card_cp_permissions WHERE id_tag=?", (id_tag,))
-        # 重建
-        for cp_id in allowed:
-            cur.execute("""
-                INSERT INTO card_cp_permissions (id_tag, charge_point_id)
-                VALUES (?, ?)
-            """, (id_tag, cp_id))
-        conn.commit()
-
-    return {"message": "白名單已更新", "id_tag": id_tag}
-
-
 
 
 @app.delete("/api/cards/{card_id}")
