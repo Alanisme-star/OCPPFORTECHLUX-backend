@@ -125,21 +125,6 @@ def get_whitelist():
 
 
 
-@app.get("/api/cards/{id_tag}/whitelist")
-def get_card_whitelist(id_tag: str):
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT charge_point_id
-            FROM card_cp_permissions
-            WHERE id_tag = ?
-        """, (id_tag,))
-        rows = cur.fetchall()
-
-    return {"allowed": [r[0] for r in rows]}
-
-
-
 
 
 # ==== Live 快取工具 ====
@@ -524,19 +509,6 @@ CREATE TABLE IF NOT EXISTS cards (
     balance REAL DEFAULT 0
 )
 ''')
-
-
-# ✅ 新增 card_cp_permissions 資料表（卡片可使用哪些充電樁）
-cursor.execute('''
-CREATE TABLE IF NOT EXISTS card_cp_permissions (
-    id_tag TEXT NOT NULL,
-    charge_point_id TEXT NOT NULL,
-    PRIMARY KEY (id_tag, charge_point_id)
-)
-''')
-
-
-
 
 # 建立 daily_pricing 表（若尚未存在）
 cursor.execute('''
@@ -1463,30 +1435,6 @@ async def start_transaction_by_charge_point(charge_point_id: str, data: dict = B
     response = await cp.send_remote_start_transaction(id_tag=id_tag, connector_id=connector_id)
     print(f"🟢【API】回應 RemoteStartTransaction: {response}")
     return {"message": "已送出啟動充電請求", "response": response}
-
-
-
-@app.post("/api/cards/{id_tag}/whitelist")
-async def update_whitelist(id_tag: str, payload: list):
-    with get_conn() as conn:
-        cur = conn.cursor()
-
-        # 先清空舊白名單
-        cur.execute("DELETE FROM card_cp_permissions WHERE id_tag=?", (id_tag,))
-
-        # 寫入新白名單
-        for cp in payload:
-            cur.execute("""
-                INSERT INTO card_cp_permissions (id_tag, charge_point_id)
-                VALUES (?, ?)
-            """, (id_tag, cp))
-
-        conn.commit()
-
-    return {"message": "ok"}
-
-
-
 
 
 from fastapi import FastAPI, HTTPException
@@ -2994,40 +2942,44 @@ async def get_cards():
     return [{"id": row[0], "card_id": row[0], "balance": row[1]} for row in rows]
 
 @app.get("/api/charge-points")
-def get_charge_points():
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT charge_point_id, name, status, created_at FROM charge_points ORDER BY charge_point_id")
-        rows = cur.fetchall()
-
+async def list_charge_points():
+    cursor.execute("SELECT id, charge_point_id, name, status, created_at FROM charge_points")
+    rows = cursor.fetchall()
     return [
         {
-            "charge_point_id": r[0],
-            "name": r[1],
-            "status": r[2],
-            "created_at": r[3],
-        }
-        for r in rows
+            "id": r[0],
+            "chargePointId": r[1],  # 注意：這是駝峰命名，對應前端
+            "name": r[2],
+            "status": r[3],
+            "createdAt": r[4]
+        } for r in rows
     ]
 
-
 @app.post("/api/charge-points")
-def add_charge_point(data: dict = Body(...)):
-    cp_id = data.get("charge_point_id") or data.get("chargePointId")
-    name = data.get("name") or None
-
+async def add_charge_point(data: dict = Body(...)):
+    print("🔥 payload=", data)  # 新增，除錯用
+    cp_id = data.get("chargePointId") or data.get("charge_point_id")
+    name = data.get("name", "")
+    status = (data.get("status") or "enabled").lower()
     if not cp_id:
-        raise HTTPException(status_code=400, detail="charge_point_id 不可空白")
-
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("""
-            INSERT OR IGNORE INTO charge_points (charge_point_id, name, status)
-            VALUES (?, ?, 'enabled')
-        """, (cp_id, name))
+        raise HTTPException(status_code=400, detail="chargePointId is required")
+    try:
+        cursor.execute(
+            "INSERT INTO charge_points (charge_point_id, name, status) VALUES (?, ?, ?)",
+            (cp_id, name, status)
+        )
         conn.commit()
+        print(f"✅ 新增白名單到資料庫: {cp_id}, {name}, {status}")  # 新增，除錯用
+        cursor.execute("SELECT * FROM charge_points")
+        print("所有白名單=", cursor.fetchall())  # 新增，除錯用
+        return {"message": "新增成功"}
+    except sqlite3.IntegrityError as e:
+        print("❌ IntegrityError:", e)
+        raise HTTPException(status_code=409, detail="充電樁已存在")
+    except Exception as e:
+        print("❌ 其他新增錯誤:", e)
+        raise HTTPException(status_code=500, detail="內部錯誤")
 
-    return {"message": "ok"}
 
 
 @app.put("/api/charge-points/{cp_id}")
@@ -3050,13 +3002,12 @@ async def update_charge_point(cp_id: str = Path(...), data: dict = Body(...)):
     return {"message": "已更新"}
 
 @app.delete("/api/charge-points/{cp_id}")
-def delete_charge_point(cp_id: str):
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("DELETE FROM charge_points WHERE charge_point_id=?", (cp_id,))
-        conn.commit()
+async def delete_charge_point(cp_id: str = Path(...)):
+    cursor.execute("DELETE FROM charge_points WHERE charge_point_id = ?", (cp_id,))
+    conn.commit()
+    return {"message": "已刪除"}
 
-    return {"message": "deleted"}
+
 
 
 
@@ -3861,20 +3812,6 @@ def debug_price():
     now = datetime.now(TZ_TAIPEI)
     price = _price_for_timestamp(now.isoformat())
     return {"now": now.strftime("%Y-%m-%d %H:%M:%S"), "current_price": price}
-
-
-
-@app.get("/api/cards/{id_tag}/allowed-cps")
-def get_allowed_cps(id_tag: str):
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT charge_point_id
-            FROM card_cp_permissions
-            WHERE id_tag=?
-        """, (id_tag,))
-        rows = cur.fetchall()
-    return [r[0] for r in rows]
 
 
 
