@@ -7,3 +7,4 @@ reportlab
 python-dateutil
 python-socketio
 python-engineio
+python-dotenv
