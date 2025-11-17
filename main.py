@@ -1451,23 +1451,41 @@ async def start_transaction_by_charge_point(charge_point_id: str, data: dict = B
 
 
 
-@app.post("/api/cards/{id_tag}/allowed-cps")
-def set_allowed_cps(id_tag: str, charge_points: list[str]):
+@app.post("/api/cards/{id_tag}/whitelist")
+def update_card_whitelist(id_tag: str, allowed_points: list[str]):
+    """
+    更新卡片允許的充電樁清單（白名單）。
+    1. 更新 card_cp_permissions（卡片 → 充電樁）
+    2. 確保 charge_points 中至少存在該充電樁（供 WebSocket 白名單驗證使用）
+    """
     with get_conn() as conn:
         cur = conn.cursor()
 
-        # 先清空舊的
+        # 1. 清空舊的允許清單
         cur.execute("DELETE FROM card_cp_permissions WHERE id_tag=?", (id_tag,))
 
-        # 寫入新的
-        for cp in charge_points:
+        # 2. 寫入新的允許清單
+        for cp in allowed_points:
+            # 卡片 → 充電樁
             cur.execute("""
                 INSERT OR IGNORE INTO card_cp_permissions (id_tag, charge_point_id)
                 VALUES (?, ?)
             """, (id_tag, cp))
 
+            # 確保 charge_points 中有該充電樁
+            cur.execute("""
+                INSERT OR IGNORE INTO charge_points (charge_point_id, name, status)
+                VALUES (?, ?, 'enabled')
+            """, (cp, cp))
+
         conn.commit()
-    return {"status": "ok"}
+
+    return {
+        "status": "ok",
+        "id_tag": id_tag,
+        "allowed_points": allowed_points
+    }
+
 
 
 
