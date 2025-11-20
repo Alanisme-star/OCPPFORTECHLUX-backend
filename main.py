@@ -2152,6 +2152,28 @@ def delete_daily_pricing(date: str = Query(..., description="要刪除的日期 
     return {"message": f"✅ 已刪除 {date} 的所有規則"}
 
 
+# === 刪除卡片（完整刪除 id_tags + cards + card_whitelist） ===
+@app.delete("/api/cards/{id_tag}")
+async def delete_card(id_tag: str):
+    try:
+        with get_conn() as conn:
+            cur = conn.cursor()
+
+            # 刪除白名單
+            cur.execute("DELETE FROM card_whitelist WHERE card_id = ?", (id_tag,))
+
+            # 刪除餘額卡片資料
+            cur.execute("DELETE FROM cards WHERE card_id = ?", (id_tag,))
+
+            # 刪除 id_tags 主表（最重要）
+            cur.execute("DELETE FROM id_tags WHERE id_tag = ?", (id_tag,))
+
+            conn.commit()
+
+        return {"message": f"Card {id_tag} deleted"}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 
