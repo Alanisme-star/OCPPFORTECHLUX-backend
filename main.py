@@ -1388,10 +1388,10 @@ async def update_card_whitelist(card_id: str, data: dict = Body(...)):
     with get_conn() as conn:
         cur = conn.cursor()
 
-        # 清空舊白名單
+        # 清掉舊白名單
         cur.execute("DELETE FROM card_whitelist WHERE card_id = ?", (card_id,))
 
-        # 寫入新白名單
+        # 寫入新的
         for cp_id in allowed:
             cur.execute(
                 "INSERT INTO card_whitelist (card_id, charge_point_id) VALUES (?, ?)",
@@ -1401,6 +1401,7 @@ async def update_card_whitelist(card_id: str, data: dict = Body(...)):
         conn.commit()
 
     return {"message": "Whitelist updated", "allowed": allowed}
+
 
 
 
