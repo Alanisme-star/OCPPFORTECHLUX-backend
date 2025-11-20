@@ -663,9 +663,24 @@ CREATE TABLE IF NOT EXISTS status_logs (
     timestamp TEXT
 )
 ''')
-
-
 conn.commit()
+
+
+
+# === 卡片白名單：卡片可使用哪些充電樁 ===
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS card_whitelist (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    card_id TEXT NOT NULL,
+    charge_point_id TEXT NOT NULL
+)
+""")
+conn.commit()
+
+
+
+
+
 
 from ocpp.v16 import call
 
@@ -3602,6 +3617,36 @@ async def stop_transaction(charge_point_id: str):
 
 
 
+@app.post("/api/cards/{card_id}/whitelist")
+def update_card_whitelist(card_id: str, allowed: list):
+    """
+    更新該卡允許的充電樁清單。
+    allowed: ["CP01", "CP02"]
+    """
+    if not isinstance(allowed, list):
+        raise HTTPException(status_code=400, detail="Body 必須為陣列")
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+
+        # 卡片是否存在（確保不是亂傳 idTag）
+        cur.execute("SELECT 1 FROM id_tags WHERE id_tag=? LIMIT 1", (card_id,))
+        if not cur.fetchone():
+            raise HTTPException(status_code=404, detail="卡片不存在")
+
+        # 清除舊白名單
+        cur.execute("DELETE FROM card_whitelist WHERE card_id=?", (card_id,))
+
+        # 插入新的
+        for cp in allowed:
+            cur.execute(
+                "INSERT INTO card_whitelist (card_id, charge_point_id) VALUES (?, ?)",
+                (card_id, cp),
+            )
+
+        conn.commit()
+
+    return {"message": "白名單已更新", "allowed": allowed}
 
 
 
@@ -3801,6 +3846,40 @@ def get_current_price_breakdown(charge_point_id: str):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+
+
+
+from fastapi import HTTPException
+
+@app.get("/api/cards/{card_id}/whitelist")
+def get_card_whitelist(card_id: str):
+    """
+    取得該卡允許使用的充電樁清單。
+    """
+    with get_conn() as conn:
+        cur = conn.cursor()
+        
+        # 確認卡片是否存在 id_tags or cards 表
+        cur.execute("SELECT 1 FROM id_tags WHERE id_tag=? LIMIT 1", (card_id,))
+        if not cur.fetchone():
+            return {"allowed": []}
+
+        # 撈該卡允許的充電樁
+        cur.execute("""
+            SELECT charge_point_id 
+            FROM card_whitelist 
+            WHERE card_id=?
+        """, (card_id,))
+        rows = cur.fetchall()
+
+    allowed = [r[0] for r in rows]
+    return {"allowed": allowed}
+
+
+
+
 
 
 
