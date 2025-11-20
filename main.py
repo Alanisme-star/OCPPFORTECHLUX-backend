@@ -462,6 +462,17 @@ def debug_price():
     return {"current_price": price}
 
 
+# === 卡片白名單 (card_whitelist) ===
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS card_whitelist (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        card_id TEXT NOT NULL,
+        charge_point_id TEXT NOT NULL
+    )
+""")
+conn.commit()
+
+
 
 # ✅ 確保資料表存在（若不存在則建立）
 cursor.execute("""
