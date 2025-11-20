@@ -1379,7 +1379,6 @@ async def on_disconnect(self, websocket, close_code):
         logging.error(f"❌ on_disconnect 更新狀態時發生錯誤: {e}")
 
 
-
 from fastapi import Body
 
 @app.post("/api/cards/{card_id}/whitelist")
@@ -1389,7 +1388,7 @@ async def update_card_whitelist(card_id: str, data: dict = Body(...)):
     with get_conn() as conn:
         cur = conn.cursor()
 
-        # 清除舊資料
+        # 清空舊白名單
         cur.execute("DELETE FROM card_whitelist WHERE card_id = ?", (card_id,))
 
         # 寫入新白名單
@@ -1402,6 +1401,7 @@ async def update_card_whitelist(card_id: str, data: dict = Body(...)):
         conn.commit()
 
     return {"message": "Whitelist updated", "allowed": allowed}
+
 
 
 
