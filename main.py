@@ -3803,6 +3803,19 @@ def get_current_price_breakdown(charge_point_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# === 取得特定卡片的白名單 ===
+@app.get("/api/cards/{id_tag}/whitelist")
+async def get_card_whitelist(id_tag: str):
+    """
+    目前暫時回傳空白白名單，確保前端不報錯。
+    後續若要做真正白名單功能，可加入資料表 card_whitelist。
+    """
+    return {
+        "idTag": id_tag,
+        "allowed": []  # 暫時回傳空白，不影響現有邏輯
+    }
+
+
 
 # ✅ 要讓除錯更直觀，在 /api/debug/price 增加目前伺服器時間顯示
 @app.get("/api/debug/price")
