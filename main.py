@@ -1380,6 +1380,26 @@ async def on_disconnect(self, websocket, close_code):
 
 
 
+from fastapi import Body
+
+@app.post("/api/cards/{card_id}/whitelist")
+async def update_card_whitelist(card_id: str, allowed: list = Body(...)):
+    # 清除舊資料
+    cursor.execute("DELETE FROM card_whitelist WHERE card_id = ?", (card_id,))
+    conn.commit()
+
+    # 寫入新白名單
+    for cp_id in allowed:
+        cursor.execute(
+            "INSERT INTO card_whitelist (card_id, charge_point_id) VALUES (?, ?)",
+            (card_id, cp_id)
+        )
+
+    conn.commit()
+
+    return {"message": "Whitelist updated", "allowed": allowed}
+
+
 
 from fastapi import HTTPException
 
