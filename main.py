@@ -444,6 +444,19 @@ def _calculate_multi_period_cost_detailed(transaction_id: int):
 
 
 
+@app.get("/api/cards/{card_id}/whitelist")
+async def get_card_whitelist(card_id: str):
+    cursor.execute(
+        "SELECT charge_point_id FROM card_whitelist WHERE card_id = ?",
+        (card_id,)
+    )
+    rows = cursor.fetchall()
+    allowed_list = [row[0] for row in rows]
+
+    return {
+        "idTag": card_id,
+        "allowed": allowed_list
+    }
 
 
 
