@@ -1,7 +1,7 @@
-fastapi
-uvicorn[standard]
-websockets>=10.4,<12
+fastapi==0.110.2
+uvicorn==0.23.2
+websockets==11.0.3
 ocpp==0.23.0
-requests
-python-dateutil
-fpdf2
+requests==2.31.0
+python-dateutil==2.8.2
+fpdf2==2.7.6
