@@ -1,7 +1,7 @@
 fastapi
 uvicorn[standard]
 websockets>=10.4,<12
-ocpp==0.24.0
+ocpp==0.23.0
 requests
 python-dateutil
 fpdf2
