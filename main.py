@@ -486,6 +486,14 @@ cursor.execute("""
 conn.commit()
 
 
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS card_owners (
+    card_id TEXT PRIMARY KEY,
+    name TEXT
+)
+""")
+conn.commit()
+
 
 # ✅ 確保資料表存在（若不存在則建立）
 cursor.execute("""
@@ -1310,6 +1318,29 @@ class ChargePoint(OcppChargePoint):
     async def on_remote_stop_transaction(self, transaction_id, **kwargs):
         logging.info(f"✅ 收到遠端停止充電要求，transaction_id={transaction_id}")
         return call_result.RemoteStopTransactionPayload(status="Accepted")
+
+
+
+from fastapi import Body
+
+@app.post("/api/card-owners/{card_id}")
+def update_card_owner(card_id: str, data: dict = Body(...)):
+    name = data.get("name", "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="名稱不可空白")
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO card_owners (card_id, name)
+            VALUES (?, ?)
+            ON CONFLICT(card_id) DO UPDATE SET name=excluded.name
+        """, (card_id, name))
+        conn.commit()
+
+    return {"message": "住戶名稱已更新", "card_id": card_id, "name": name}
+
+
 
 
 
@@ -3008,10 +3039,37 @@ def get_holiday(date: str):
 
 
 @app.get("/api/cards")
-async def get_cards():
-    cursor.execute("SELECT card_id, balance FROM cards")
-    rows = cursor.fetchall()
-    return [{"id": row[0], "card_id": row[0], "balance": row[1]} for row in rows]
+def get_cards():
+    with get_conn() as conn:
+        cur = conn.cursor()
+
+        cur.execute("""
+            SELECT 
+                c.card_id, 
+                c.balance,
+                t.status,
+                t.valid_until,
+                o.name
+            FROM cards c
+            LEFT JOIN id_tags t ON c.card_id = t.id_tag
+            LEFT JOIN card_owners o ON c.card_id = o.card_id
+            ORDER BY c.card_id
+        """)
+
+        rows = cur.fetchall()
+
+    result = []
+    for r in rows:
+        result.append({
+            "card_id": r[0],
+            "balance": r[1],
+            "status": r[2],
+            "validUntil": r[3],
+            "name": r[4]   # ⭐ 新增住戶名稱
+        })
+
+    return result
+
 
 @app.get("/api/charge-points")
 async def list_charge_points():
