@@ -530,12 +530,9 @@ cursor.execute('''
 CREATE TABLE IF NOT EXISTS cards (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     card_id TEXT UNIQUE,
-    balance REAL DEFAULT 0,
-    resident_name TEXT,
-    floor_number TEXT
+    balance REAL DEFAULT 0
 )
 ''')
-conn.commit()
 
 # 建立 daily_pricing 表（若尚未存在）
 cursor.execute('''
@@ -2567,8 +2564,6 @@ async def add_id_tag(data: dict = Body(...)):
     id_tag = data.get("idTag")
     status = data.get("status", "Accepted")
     valid_until = data.get("validUntil", "2099-12-31T23:59:59")
-    resident_name = data.get("residentName")      # ⭐ 新增
-    floor_number = data.get("floorNumber")        # ⭐ 新增
 
     if not id_tag:
         print("❌ idTag 缺失")
@@ -3014,22 +3009,9 @@ def get_holiday(date: str):
 
 @app.get("/api/cards")
 async def get_cards():
-    cursor.execute("""
-        SELECT card_id, balance, resident_name, floor_number
-        FROM cards
-    """)
+    cursor.execute("SELECT card_id, balance FROM cards")
     rows = cursor.fetchall()
-    return [
-        {
-            "id": row[0],
-            "card_id": row[0],
-            "balance": row[1],
-            "resident_name": row[2],
-            "floor_number": row[3]
-        }
-        for row in rows
-    ]
-
+    return [{"id": row[0], "card_id": row[0], "balance": row[1]} for row in rows]
 
 @app.get("/api/charge-points")
 async def list_charge_points():
@@ -3072,54 +3054,6 @@ async def add_charge_point(data: dict = Body(...)):
 
 
 
-
-from fastapi import Body, HTTPException
-
-@app.put("/api/cards/{card_id}")
-async def update_card(card_id: str, data: dict = Body(...)):
-    """
-    更新卡片資料：
-    - balance
-    - resident_name
-    - floor_number
-    """
-    balance = data.get("balance")
-    resident_name = data.get("resident_name")
-    floor_number = data.get("floor_number")
-
-    with get_conn() as conn:
-        cur = conn.cursor()
-
-        # 確認卡片存在
-        cur.execute("SELECT id FROM cards WHERE card_id = ?", (card_id,))
-        row = cur.fetchone()
-        if not row:
-            raise HTTPException(status_code=404, detail="Card not found")
-
-        # 部分更新（避免 None 造成覆蓋）
-        cur.execute("""
-            UPDATE cards
-            SET
-                balance = COALESCE(?, balance),
-                resident_name = COALESCE(?, resident_name),
-                floor_number = COALESCE(?, floor_number)
-            WHERE card_id = ?
-        """, (balance, resident_name, floor_number, card_id))
-
-        conn.commit()
-
-    return {
-        "message": "Card updated successfully",
-        "card_id": card_id,
-        "balance": balance,
-        "resident_name": resident_name,
-        "floor_number": floor_number
-    }
-
-
-
-
-
 @app.put("/api/charge-points/{cp_id}")
 async def update_charge_point(cp_id: str = Path(...), data: dict = Body(...)):
     name = data.get("name")
@@ -3153,6 +3087,15 @@ async def delete_card(card_id: str):
     conn.commit()
     return {"message": f"Card {card_id} deleted"}
 
+
+@app.put("/api/cards/{card_id}")
+async def update_card(card_id: str, payload: dict):
+    new_balance = payload.get("balance")
+    if new_balance is None:
+        raise HTTPException(status_code=400, detail="Missing balance")
+    cursor.execute("UPDATE cards SET balance = ? WHERE card_id = ?", (new_balance, card_id))
+    conn.commit()
+    return {"message": f"Card {card_id} updated", "new_balance": new_balance}
 
 
 
