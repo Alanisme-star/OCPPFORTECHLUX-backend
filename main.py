@@ -526,13 +526,16 @@ conn.commit()
 
 
 # === 新增 cards 資料表，用於管理卡片餘額 ===
+cursor.execute('''
 CREATE TABLE IF NOT EXISTS cards (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     card_id TEXT UNIQUE,
     balance REAL DEFAULT 0,
-    resident_name TEXT,      -- ⭐ 新增：住戶名稱
-    floor_number TEXT        -- ⭐ 新增：樓號
-);
+    resident_name TEXT,
+    floor_number TEXT
+)
+''')
+conn.commit()
 
 # 建立 daily_pricing 表（若尚未存在）
 cursor.execute('''
