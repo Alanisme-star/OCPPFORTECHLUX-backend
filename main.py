@@ -486,13 +486,23 @@ cursor.execute("""
 conn.commit()
 
 
+# === card_owners：加入 floor 欄位 ===
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS card_owners (
     card_id TEXT PRIMARY KEY,
-    name TEXT
+    name TEXT,
+    floor TEXT
 )
 """)
 conn.commit()
+
+# ★ 舊資料庫相容：如果原本沒有 floor 欄位 → 自動加入
+cursor.execute("PRAGMA table_info(card_owners)")
+cols = [r[1] for r in cursor.fetchall()]
+if "floor" not in cols:
+    cursor.execute("ALTER TABLE card_owners ADD COLUMN floor TEXT")
+    conn.commit()
+
 
 
 # ✅ 確保資料表存在（若不存在則建立）
