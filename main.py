@@ -1336,19 +1336,30 @@ from fastapi import Body
 @app.post("/api/card-owners/{card_id}")
 def update_card_owner(card_id: str, data: dict = Body(...)):
     name = data.get("name", "").strip()
+    floor = data.get("floor", "").strip()
+
     if not name:
         raise HTTPException(status_code=400, detail="名稱不可空白")
 
     with get_conn() as conn:
         cur = conn.cursor()
         cur.execute("""
-            INSERT INTO card_owners (card_id, name)
-            VALUES (?, ?)
-            ON CONFLICT(card_id) DO UPDATE SET name=excluded.name
-        """, (card_id, name))
+            INSERT INTO card_owners (card_id, name, floor)
+            VALUES (?, ?, ?)
+            ON CONFLICT(card_id)
+            DO UPDATE SET
+                name = excluded.name,
+                floor = excluded.floor
+        """, (card_id, name, floor))
         conn.commit()
 
-    return {"message": "住戶名稱已更新", "card_id": card_id, "name": name}
+    return {
+        "message": "住戶資料已更新",
+        "card_id": card_id,
+        "name": name,
+        "floor": floor
+    }
+
 
 
 
