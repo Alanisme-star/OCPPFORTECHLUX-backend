@@ -486,23 +486,13 @@ cursor.execute("""
 conn.commit()
 
 
-# === card_owners：加入 floor 欄位 ===
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS card_owners (
     card_id TEXT PRIMARY KEY,
-    name TEXT,
-    floor TEXT
+    name TEXT
 )
 """)
 conn.commit()
-
-# ★ 舊資料庫相容：如果原本沒有 floor 欄位 → 自動加入
-cursor.execute("PRAGMA table_info(card_owners)")
-cols = [r[1] for r in cursor.fetchall()]
-if "floor" not in cols:
-    cursor.execute("ALTER TABLE card_owners ADD COLUMN floor TEXT")
-    conn.commit()
-
 
 
 # ✅ 確保資料表存在（若不存在則建立）
@@ -1336,30 +1326,19 @@ from fastapi import Body
 @app.post("/api/card-owners/{card_id}")
 def update_card_owner(card_id: str, data: dict = Body(...)):
     name = data.get("name", "").strip()
-    floor = data.get("floor", "").strip()
-
     if not name:
         raise HTTPException(status_code=400, detail="名稱不可空白")
 
     with get_conn() as conn:
         cur = conn.cursor()
         cur.execute("""
-            INSERT INTO card_owners (card_id, name, floor)
-            VALUES (?, ?, ?)
-            ON CONFLICT(card_id)
-            DO UPDATE SET
-                name = excluded.name,
-                floor = excluded.floor
-        """, (card_id, name, floor))
+            INSERT INTO card_owners (card_id, name)
+            VALUES (?, ?)
+            ON CONFLICT(card_id) DO UPDATE SET name=excluded.name
+        """, (card_id, name))
         conn.commit()
 
-    return {
-        "message": "住戶資料已更新",
-        "card_id": card_id,
-        "name": name,
-        "floor": floor
-    }
-
+    return {"message": "住戶名稱已更新", "card_id": card_id, "name": name}
 
 
 
