@@ -1234,51 +1234,56 @@ class ChargePoint(OcppChargePoint):
                             except Exception:
                                 pass
 
-                        elif "Energy.Active.Import" in meas:
+                        elif meas.startswith("Energy.Active.Import"):
                             try:
-                                res = _calculate_multi_period_cost_detailed(transaction_id)
-                                total = res["total"]
-                                last_seg = res["segments"][-1] if res["segments"] else None
-                                price = last_seg["price"] if last_seg else _price_for_timestamp(ts)
-                                used_kwh = sum([s["kwh"] for s in res["segments"]]) if res["segments"] else 0
+                                # === 1) 自動解析 Wh 或 kWh ===
+                                if unit.lower() in ("wh", "w*h", "w_h"):
+                                    kwh = float(val) / 1000.0
+                                else:
+                                    kwh = float(val)
 
+                                # === 2) 讀取交易的 meter_start（Wh） ===
+                                with sqlite3.connect(DB_FILE) as _c2:
+                                    _cur2 = _c2.cursor()
+                                    _cur2.execute(
+                                        "SELECT meter_start FROM transactions WHERE transaction_id = ?",
+                                        (transaction_id,)
+                                    )
+                                    row_tx = _cur2.fetchone()
+                                    meter_start_wh = float(row_tx[0] or 0) if row_tx else 0
+
+                                # 本次使用量
+                                used_kwh = max(0.0, kwh - (meter_start_wh / 1000.0))
+
+                                # === 3) 多時段電價（優先）===
+                                try:
+                                    res = _calculate_multi_period_cost_detailed(transaction_id)
+                                    total = res["total"]
+                                    last_seg = res["segments"][-1] if res["segments"] else None
+                                    price = last_seg["price"] if last_seg else _price_for_timestamp(ts)
+                                    est_kwh = sum([s["kwh"] for s in res["segments"]]) if res["segments"] else used_kwh
+                                except Exception:
+                                    # fallback（單一時段）
+                                    price = float(_price_for_timestamp(ts))
+                                    total = round(used_kwh * price, 2)
+                                    est_kwh = used_kwh
+
+                                # === 4) 更新 live_status_cache ===
                                 _upsert_live(
                                     cp_id,
-                                    estimated_energy=round(used_kwh, 6),
-                                    estimated_amount=round(total, 2),
+                                    energy=round(kwh, 6),                  # 目前總讀值
+                                    estimated_energy=round(est_kwh, 6),    # 本次累積
+                                    estimated_amount=round(total, 2),      # 預估電費
                                     price_per_kwh=price,
                                     timestamp=ts,
                                 )
-                                logging.info(f"✅ 即時計算多時段金額成功：{total} 元")
-                            except Exception as e:
-                                logging.warning(f"⚠️ 即時計算多時段金額失敗：{e}")
 
                                 logging.info(
-                                    f"[LIVE] 更新能量 {cp_id}: {kwh:.4f} kWh, 電價 {unit_price}, 預估金額 {est_amount}"
+                                    f"[LIVE] 更新能量 {cp_id}: total={kwh:.4f} kWh | used={est_kwh:.4f} kWh | price={price} | amount={total}"
                                 )
 
-                                # 計算用電量與金額
-                                try:
-                                    with sqlite3.connect(DB_FILE) as _c2:
-                                        _cur2 = _c2.cursor()
-                                        _cur2.execute("SELECT meter_start FROM transactions WHERE transaction_id = ?", (transaction_id,))
-                                        row_tx = _cur2.fetchone()
-                                        if row_tx:
-                                            meter_start_wh = float(row_tx[0] or 0)
-                                            used_kwh = max(0.0, (kwh - (meter_start_wh / 1000.0)))
-                                            unit_price = float(_price_for_timestamp(ts)) if ts else 6.0
-                                            est_amount = round(used_kwh * unit_price, 2)
-                                            _upsert_live(cp_id,
-                                                         estimated_energy=round(used_kwh, 6),
-                                                         estimated_amount=est_amount,
-                                                         price_per_kwh=unit_price,
-                                                         timestamp=ts)
-
-
-
-
-                                except Exception as e:
-                                    logging.warning(f"⚠️ 預估金額計算失敗: {e}")
+                            except Exception as e:
+                                logging.warning(f"⚠️ Energy 無法解析（已 fallback）：{e}")
 
                         # Debug log
                         logging.info(f"[DEBUG][MeterValues] tx={transaction_id} | measurand={meas} | value={val}{unit} | ts={ts}")
