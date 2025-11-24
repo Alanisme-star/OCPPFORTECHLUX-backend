@@ -872,20 +872,15 @@ class ChargePoint(OcppChargePoint):
     async def on_authorize(self, id_tag, **kwargs):
         with get_conn() as _c:
             cur = _c.cursor()
-            cur.execute("SELECT status, valid_until FROM id_tags WHERE id_tag = ?", (id_tag,))
+            cur.execute("SELECT status FROM id_tags WHERE id_tag = ?", (id_tag,))
             row = cur.fetchone()
 
-        if not row:
-            status = "Invalid"
-        else:
-            status_db, valid_until = row
-            try:
-                valid_until_dt = datetime.fromisoformat(valid_until).replace(tzinfo=timezone.utc)
-            except ValueError:
-                logging.warning(f"⚠️ 無法解析 valid_until 格式：{valid_until}")
-                valid_until_dt = datetime.min.replace(tzinfo=timezone.utc)
-            now = datetime.utcnow().replace(tzinfo=timezone.utc)
-            status = "Accepted" if status_db == "Accepted" and valid_until_dt > now else "Expired"
+            if not row:
+                status = "Invalid"
+            else:
+                status_db = row[0]
+                status = "Accepted" if status_db == "Accepted" else "Blocked"
+
 
         logging.info(f"🆔 Authorize | idTag={id_tag} → {status}")
         return call_result.AuthorizePayload(id_tag_info={"status": status})
@@ -902,21 +897,18 @@ class ChargePoint(OcppChargePoint):
             # 驗證 idTag
             with get_conn() as _c:
                 cur = _c.cursor()
-                cur.execute("SELECT status, valid_until FROM id_tags WHERE id_tag = ?", (id_tag,))
+                cur.execute("SELECT status FROM id_tags WHERE id_tag = ?", (id_tag,))
                 row = cur.fetchone()
-            if not row:
-                return call_result.StartTransactionPayload(transaction_id=0, id_tag_info={"status": "Invalid"})
 
-            status_db, valid_until = row
-            try:
-                valid_until_dt = datetime.fromisoformat(valid_until).replace(tzinfo=timezone.utc)
-            except ValueError:
-                logging.warning(f"⚠️ 無法解析 valid_until：{valid_until}")
-                valid_until_dt = datetime.min.replace(tzinfo=timezone.utc)
-            now = datetime.utcnow().replace(tzinfo=timezone.utc)
-            status = "Accepted" if status_db == "Accepted" and valid_until_dt > now else "Expired"
-            if status != "Accepted":
-                return call_result.StartTransactionPayload(transaction_id=0, id_tag_info={"status": status})
+                if not row:
+                    return call_result.StartTransactionPayload(transaction_id=0, id_tag_info={"status": "Invalid"})
+
+                status_db = row[0]
+                status = "Accepted" if status_db == "Accepted" else "Blocked"
+
+                if status != "Accepted":
+                    return call_result.StartTransactionPayload(transaction_id=0, id_tag_info={"status": status})
+
 
             # 預約檢查
             now_str = datetime.utcnow().isoformat()
