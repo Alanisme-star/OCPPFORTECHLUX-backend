@@ -1751,19 +1751,6 @@ def get_last_tx_summary_by_cp(charge_point_id: str):
         }
 
 
-@app.get("/api/transactions/{transaction_id}/price-breakdown")
-def get_price_breakdown(transaction_id: int):
-    """
-    取得該交易的分段電價明細，用於前端顯示跨時段電價結果。
-    """
-    try:
-        result = _calculate_multi_period_cost_detailed(transaction_id)
-        return result
-    except Exception as e:
-        logging.exception(f"⚠️ price-breakdown 錯誤: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
 
 # ✅ 新增 API：回傳單次充電的累積電量
 @app.get("/api/charge-points/{charge_point_id}/latest-energy")
@@ -1819,18 +1806,6 @@ def get_latest_energy(charge_point_id: str):
             "sessionEnergyKWh": round(session_kwh, 6)
         }
 
-
-@app.get("/api/transactions/{transaction_id}/price-breakdown")
-def get_price_breakdown(transaction_id: int):
-    """
-    取得該交易的分段電價明細，用於前端顯示跨時段電價結果。
-    """
-    try:
-        result = _calculate_multi_period_cost_detailed(transaction_id)
-        return result
-    except Exception as e:
-        logging.exception(f"⚠️ price-breakdown 錯誤: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
 
 
 
@@ -2247,19 +2222,6 @@ def get_transaction_summary(transaction_id: str):
             "total_amount": round(total_amount, 2),
             "balance": round(balance, 2),
         }
-
-
-@app.get("/api/transactions/{transaction_id}/price-breakdown")
-def get_price_breakdown(transaction_id: int):
-    """
-    取得該交易的分段電價明細，用於前端顯示跨時段電價結果。
-    """
-    try:
-        result = _calculate_multi_period_cost_detailed(transaction_id)
-        return result
-    except Exception as e:
-        logging.exception(f"⚠️ price-breakdown 錯誤: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
 
 
 
