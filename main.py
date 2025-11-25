@@ -174,10 +174,10 @@ async def _accept_or_reject_ws(websocket: WebSocket, raw_cp_id: str):
     supplied_token = qs.get("token")
 
     # 查白名單
-    #with get_conn() as _c:
-        #cur = _c.cursor()
-        #cur.execute("SELECT charge_point_id FROM charge_points")
-        #allowed_ids = [row[0] for row in cur.fetchall()]
+    with get_conn() as _c:
+        cur = _c.cursor()
+        cur.execute("SELECT charge_point_id FROM charge_points")
+        allowed_ids = [cp_id]  # 永遠允許本次連線
 
 
     # === 驗證檢查 ===
