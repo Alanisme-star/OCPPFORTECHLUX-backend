@@ -444,19 +444,6 @@ def _calculate_multi_period_cost_detailed(transaction_id: int):
 
 
 
-@app.get("/api/cards/{card_id}/whitelist")
-async def get_card_whitelist(card_id: str):
-    cursor.execute(
-        "SELECT charge_point_id FROM card_whitelist WHERE card_id = ?",
-        (card_id,)
-    )
-    rows = cursor.fetchall()
-    allowed_list = [row[0] for row in rows]
-
-    return {
-        "idTag": card_id,
-        "allowed": allowed_list
-    }
 
 
 
@@ -473,17 +460,6 @@ def debug_price():
     now = datetime.utcnow().isoformat()
     price = _price_for_timestamp(now)
     return {"current_price": price}
-
-
-# === 卡片白名單 (card_whitelist) ===
-cursor.execute("""
-    CREATE TABLE IF NOT EXISTS card_whitelist (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        card_id TEXT NOT NULL,
-        charge_point_id TEXT NOT NULL
-    )
-""")
-conn.commit()
 
 
 
@@ -1379,32 +1355,6 @@ async def on_disconnect(self, websocket, close_code):
         logging.error(f"❌ on_disconnect 更新狀態時發生錯誤: {e}")
 
 
-from fastapi import Body
-
-@app.post("/api/cards/{card_id}/whitelist")
-async def update_card_whitelist(card_id: str, data: dict = Body(...)):
-    allowed = data.get("allowed", [])
-
-    with get_conn() as conn:
-        cur = conn.cursor()
-
-        # 清掉舊白名單
-        cur.execute("DELETE FROM card_whitelist WHERE card_id = ?", (card_id,))
-
-        # 寫入新的
-        for cp_id in allowed:
-            cur.execute(
-                "INSERT INTO card_whitelist (card_id, charge_point_id) VALUES (?, ?)",
-                (card_id, cp_id)
-            )
-
-        conn.commit()
-
-    return {"message": "Whitelist updated", "allowed": allowed}
-
-
-
-
 
 
 from fastapi import HTTPException
@@ -2158,28 +2108,6 @@ def delete_daily_pricing(date: str = Query(..., description="要刪除的日期 
     return {"message": f"✅ 已刪除 {date} 的所有規則"}
 
 
-# === 刪除卡片（完整刪除 id_tags + cards + card_whitelist） ===
-@app.delete("/api/cards/{id_tag}")
-async def delete_card(id_tag: str):
-    try:
-        with get_conn() as conn:
-            cur = conn.cursor()
-
-            # 刪除白名單
-            cur.execute("DELETE FROM card_whitelist WHERE card_id = ?", (id_tag,))
-
-            # 刪除餘額卡片資料
-            cur.execute("DELETE FROM cards WHERE card_id = ?", (id_tag,))
-
-            # 刪除 id_tags 主表（最重要）
-            cur.execute("DELETE FROM id_tags WHERE id_tag = ?", (id_tag,))
-
-            conn.commit()
-
-        return {"message": f"Card {id_tag} deleted"}
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
 
 
 
@@ -3081,6 +3009,8 @@ async def delete_charge_point(cp_id: str = Path(...)):
 
 
 
+
+
 @app.delete("/api/cards/{card_id}")
 async def delete_card(card_id: str):
     cursor.execute("DELETE FROM cards WHERE card_id = ?", (card_id,))
@@ -3873,19 +3803,6 @@ def get_current_price_breakdown(charge_point_id: str):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-
-# === 取得特定卡片的白名單 ===
-@app.get("/api/cards/{id_tag}/whitelist")
-async def get_card_whitelist(id_tag: str):
-    """
-    目前暫時回傳空白白名單，確保前端不報錯。
-    後續若要做真正白名單功能，可加入資料表 card_whitelist。
-    """
-    return {
-        "idTag": id_tag,
-        "allowed": []  # 暫時回傳空白，不影響現有邏輯
-    }
 
 
 
