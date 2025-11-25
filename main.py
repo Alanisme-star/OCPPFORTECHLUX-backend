@@ -177,7 +177,7 @@ async def _accept_or_reject_ws(websocket: WebSocket, raw_cp_id: str):
     with get_conn() as _c:
         cur = _c.cursor()
         cur.execute("SELECT charge_point_id FROM charge_points")
-        allowed_ids = [cp_id]  # 永遠允許本次連線
+        allowed_ids = [row[0] for row in cur.fetchall()]
 
 
     # === 驗證檢查 ===
@@ -191,10 +191,11 @@ async def _accept_or_reject_ws(websocket: WebSocket, raw_cp_id: str):
           #  await websocket.close(code=1008)
            # return None
     print(f"📝 白名單允許={allowed_ids}, 本次連線={cp_id}")
-    if cp_id not in allowed_ids:
-        print(f"❌ 拒絕：{cp_id} 不在白名單 {allowed_ids}")
-        await websocket.close(code=1008)
-        return None
+    # 🔵 暫時關閉白名單檢查（模擬器與真實樁都可連線）
+    #if cp_id not in allowed_ids:
+        #print(f"❌ 拒絕：{cp_id} 不在白名單 {allowed_ids}")
+        #await websocket.close(code=1008)
+        #return None
 
     # 接受連線（OCPP 1.6 子協定）
     await websocket.accept(subprotocol="ocpp1.6")
@@ -444,6 +445,19 @@ def _calculate_multi_period_cost_detailed(transaction_id: int):
 
 
 
+@app.get("/api/cards/{card_id}/whitelist")
+async def get_card_whitelist(card_id: str):
+    cursor.execute(
+        "SELECT charge_point_id FROM card_whitelist WHERE card_id = ?",
+        (card_id,)
+    )
+    rows = cursor.fetchall()
+    allowed_list = [row[0] for row in rows]
+
+    return {
+        "idTag": card_id,
+        "allowed": allowed_list
+    }
 
 
 
@@ -461,6 +475,25 @@ def debug_price():
     price = _price_for_timestamp(now)
     return {"current_price": price}
 
+
+# === 卡片白名單 (card_whitelist) ===
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS card_whitelist (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        card_id TEXT NOT NULL,
+        charge_point_id TEXT NOT NULL
+    )
+""")
+conn.commit()
+
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS card_owners (
+    card_id TEXT PRIMARY KEY,
+    name TEXT
+)
+""")
+conn.commit()
 
 
 # ✅ 確保資料表存在（若不存在則建立）
@@ -840,20 +873,15 @@ class ChargePoint(OcppChargePoint):
     async def on_authorize(self, id_tag, **kwargs):
         with get_conn() as _c:
             cur = _c.cursor()
-            cur.execute("SELECT status, valid_until FROM id_tags WHERE id_tag = ?", (id_tag,))
+            cur.execute("SELECT status FROM id_tags WHERE id_tag = ?", (id_tag,))
             row = cur.fetchone()
 
-        if not row:
-            status = "Invalid"
-        else:
-            status_db, valid_until = row
-            try:
-                valid_until_dt = datetime.fromisoformat(valid_until).replace(tzinfo=timezone.utc)
-            except ValueError:
-                logging.warning(f"⚠️ 無法解析 valid_until 格式：{valid_until}")
-                valid_until_dt = datetime.min.replace(tzinfo=timezone.utc)
-            now = datetime.utcnow().replace(tzinfo=timezone.utc)
-            status = "Accepted" if status_db == "Accepted" and valid_until_dt > now else "Expired"
+            if not row:
+                status = "Invalid"
+            else:
+                status_db = row[0]
+                status = "Accepted" if status_db == "Accepted" else "Blocked"
+
 
         logging.info(f"🆔 Authorize | idTag={id_tag} → {status}")
         return call_result.AuthorizePayload(id_tag_info={"status": status})
@@ -870,21 +898,18 @@ class ChargePoint(OcppChargePoint):
             # 驗證 idTag
             with get_conn() as _c:
                 cur = _c.cursor()
-                cur.execute("SELECT status, valid_until FROM id_tags WHERE id_tag = ?", (id_tag,))
+                cur.execute("SELECT status FROM id_tags WHERE id_tag = ?", (id_tag,))
                 row = cur.fetchone()
-            if not row:
-                return call_result.StartTransactionPayload(transaction_id=0, id_tag_info={"status": "Invalid"})
 
-            status_db, valid_until = row
-            try:
-                valid_until_dt = datetime.fromisoformat(valid_until).replace(tzinfo=timezone.utc)
-            except ValueError:
-                logging.warning(f"⚠️ 無法解析 valid_until：{valid_until}")
-                valid_until_dt = datetime.min.replace(tzinfo=timezone.utc)
-            now = datetime.utcnow().replace(tzinfo=timezone.utc)
-            status = "Accepted" if status_db == "Accepted" and valid_until_dt > now else "Expired"
-            if status != "Accepted":
-                return call_result.StartTransactionPayload(transaction_id=0, id_tag_info={"status": status})
+                if not row:
+                    return call_result.StartTransactionPayload(transaction_id=0, id_tag_info={"status": "Invalid"})
+
+                status_db = row[0]
+                status = "Accepted" if status_db == "Accepted" else "Blocked"
+
+                if status != "Accepted":
+                    return call_result.StartTransactionPayload(transaction_id=0, id_tag_info={"status": status})
+
 
             # 預約檢查
             now_str = datetime.utcnow().isoformat()
@@ -1289,6 +1314,29 @@ class ChargePoint(OcppChargePoint):
 
 
 
+from fastapi import Body
+
+@app.post("/api/card-owners/{card_id}")
+def update_card_owner(card_id: str, data: dict = Body(...)):
+    name = data.get("name", "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="名稱不可空白")
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO card_owners (card_id, name)
+            VALUES (?, ?)
+            ON CONFLICT(card_id) DO UPDATE SET name=excluded.name
+        """, (card_id, name))
+        conn.commit()
+
+    return {"message": "住戶名稱已更新", "card_id": card_id, "name": name}
+
+
+
+
+
 @app.post("/api/debug/force-add-charge-point")
 def force_add_charge_point(
     charge_point_id: str = "TW*MSI*E000100",
@@ -1353,6 +1401,32 @@ async def on_disconnect(self, websocket, close_code):
             logging.warning("⚠️ 無法辨識斷線的充電樁 ID")
     except Exception as e:
         logging.error(f"❌ on_disconnect 更新狀態時發生錯誤: {e}")
+
+
+from fastapi import Body
+
+@app.post("/api/cards/{card_id}/whitelist")
+async def update_card_whitelist(card_id: str, data: dict = Body(...)):
+    allowed = data.get("allowed", [])
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+
+        # 清掉舊白名單
+        cur.execute("DELETE FROM card_whitelist WHERE card_id = ?", (card_id,))
+
+        # 寫入新的
+        for cp_id in allowed:
+            cur.execute(
+                "INSERT INTO card_whitelist (card_id, charge_point_id) VALUES (?, ?)",
+                (card_id, cp_id)
+            )
+
+        conn.commit()
+
+    return {"message": "Whitelist updated", "allowed": allowed}
+
+
 
 
 
@@ -2108,6 +2182,28 @@ def delete_daily_pricing(date: str = Query(..., description="要刪除的日期 
     return {"message": f"✅ 已刪除 {date} 的所有規則"}
 
 
+# === 刪除卡片（完整刪除 id_tags + cards + card_whitelist） ===
+@app.delete("/api/cards/{id_tag}")
+async def delete_card(id_tag: str):
+    try:
+        with get_conn() as conn:
+            cur = conn.cursor()
+
+            # 刪除白名單
+            cur.execute("DELETE FROM card_whitelist WHERE card_id = ?", (id_tag,))
+
+            # 刪除餘額卡片資料
+            cur.execute("DELETE FROM cards WHERE card_id = ?", (id_tag,))
+
+            # 刪除 id_tags 主表（最重要）
+            cur.execute("DELETE FROM id_tags WHERE id_tag = ?", (id_tag,))
+
+            conn.commit()
+
+        return {"message": f"Card {id_tag} deleted"}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 
@@ -2936,10 +3032,37 @@ def get_holiday(date: str):
 
 
 @app.get("/api/cards")
-async def get_cards():
-    cursor.execute("SELECT card_id, balance FROM cards")
-    rows = cursor.fetchall()
-    return [{"id": row[0], "card_id": row[0], "balance": row[1]} for row in rows]
+def get_cards():
+    with get_conn() as conn:
+        cur = conn.cursor()
+
+        cur.execute("""
+            SELECT 
+                c.card_id, 
+                c.balance,
+                t.status,
+                t.valid_until,
+                o.name
+            FROM cards c
+            LEFT JOIN id_tags t ON c.card_id = t.id_tag
+            LEFT JOIN card_owners o ON c.card_id = o.card_id
+            ORDER BY c.card_id
+        """)
+
+        rows = cur.fetchall()
+
+    result = []
+    for r in rows:
+        result.append({
+            "card_id": r[0],
+            "balance": r[1],
+            "status": r[2],
+            "validUntil": r[3],
+            "name": r[4]   # ⭐ 新增住戶名稱
+        })
+
+    return result
+
 
 @app.get("/api/charge-points")
 async def list_charge_points():
@@ -3006,8 +3129,6 @@ async def delete_charge_point(cp_id: str = Path(...)):
     cursor.execute("DELETE FROM charge_points WHERE charge_point_id = ?", (cp_id,))
     conn.commit()
     return {"message": "已刪除"}
-
-
 
 
 
@@ -3803,6 +3924,19 @@ def get_current_price_breakdown(charge_point_id: str):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# === 取得特定卡片的白名單 ===
+@app.get("/api/cards/{id_tag}/whitelist")
+async def get_card_whitelist(id_tag: str):
+    """
+    目前暫時回傳空白白名單，確保前端不報錯。
+    後續若要做真正白名單功能，可加入資料表 card_whitelist。
+    """
+    return {
+        "idTag": id_tag,
+        "allowed": []  # 暫時回傳空白，不影響現有邏輯
+    }
 
 
 
