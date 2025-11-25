@@ -191,11 +191,10 @@ async def _accept_or_reject_ws(websocket: WebSocket, raw_cp_id: str):
           #  await websocket.close(code=1008)
            # return None
     print(f"📝 白名單允許={allowed_ids}, 本次連線={cp_id}")
-    # 🔵 暫時關閉白名單檢查（模擬器與真實樁都可連線）
-    #if cp_id not in allowed_ids:
-        #print(f"❌ 拒絕：{cp_id} 不在白名單 {allowed_ids}")
-        #await websocket.close(code=1008)
-        #return None
+    if cp_id not in allowed_ids:
+        print(f"❌ 拒絕：{cp_id} 不在白名單 {allowed_ids}")
+        await websocket.close(code=1008)
+        return None
 
     # 接受連線（OCPP 1.6 子協定）
     await websocket.accept(subprotocol="ocpp1.6")
@@ -486,14 +485,6 @@ cursor.execute("""
 """)
 conn.commit()
 
-
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS card_owners (
-    card_id TEXT PRIMARY KEY,
-    name TEXT
-)
-""")
-conn.commit()
 
 
 # ✅ 確保資料表存在（若不存在則建立）
@@ -873,15 +864,20 @@ class ChargePoint(OcppChargePoint):
     async def on_authorize(self, id_tag, **kwargs):
         with get_conn() as _c:
             cur = _c.cursor()
-            cur.execute("SELECT status FROM id_tags WHERE id_tag = ?", (id_tag,))
+            cur.execute("SELECT status, valid_until FROM id_tags WHERE id_tag = ?", (id_tag,))
             row = cur.fetchone()
 
-            if not row:
-                status = "Invalid"
-            else:
-                status_db = row[0]
-                status = "Accepted" if status_db == "Accepted" else "Blocked"
-
+        if not row:
+            status = "Invalid"
+        else:
+            status_db, valid_until = row
+            try:
+                valid_until_dt = datetime.fromisoformat(valid_until).replace(tzinfo=timezone.utc)
+            except ValueError:
+                logging.warning(f"⚠️ 無法解析 valid_until 格式：{valid_until}")
+                valid_until_dt = datetime.min.replace(tzinfo=timezone.utc)
+            now = datetime.utcnow().replace(tzinfo=timezone.utc)
+            status = "Accepted" if status_db == "Accepted" and valid_until_dt > now else "Expired"
 
         logging.info(f"🆔 Authorize | idTag={id_tag} → {status}")
         return call_result.AuthorizePayload(id_tag_info={"status": status})
@@ -898,18 +894,21 @@ class ChargePoint(OcppChargePoint):
             # 驗證 idTag
             with get_conn() as _c:
                 cur = _c.cursor()
-                cur.execute("SELECT status FROM id_tags WHERE id_tag = ?", (id_tag,))
+                cur.execute("SELECT status, valid_until FROM id_tags WHERE id_tag = ?", (id_tag,))
                 row = cur.fetchone()
+            if not row:
+                return call_result.StartTransactionPayload(transaction_id=0, id_tag_info={"status": "Invalid"})
 
-                if not row:
-                    return call_result.StartTransactionPayload(transaction_id=0, id_tag_info={"status": "Invalid"})
-
-                status_db = row[0]
-                status = "Accepted" if status_db == "Accepted" else "Blocked"
-
-                if status != "Accepted":
-                    return call_result.StartTransactionPayload(transaction_id=0, id_tag_info={"status": status})
-
+            status_db, valid_until = row
+            try:
+                valid_until_dt = datetime.fromisoformat(valid_until).replace(tzinfo=timezone.utc)
+            except ValueError:
+                logging.warning(f"⚠️ 無法解析 valid_until：{valid_until}")
+                valid_until_dt = datetime.min.replace(tzinfo=timezone.utc)
+            now = datetime.utcnow().replace(tzinfo=timezone.utc)
+            status = "Accepted" if status_db == "Accepted" and valid_until_dt > now else "Expired"
+            if status != "Accepted":
+                return call_result.StartTransactionPayload(transaction_id=0, id_tag_info={"status": status})
 
             # 預約檢查
             now_str = datetime.utcnow().isoformat()
@@ -1234,56 +1233,51 @@ class ChargePoint(OcppChargePoint):
                             except Exception:
                                 pass
 
-                        elif meas.startswith("Energy.Active.Import"):
+                        elif "Energy.Active.Import" in meas:
                             try:
-                                # === 1) 自動解析 Wh 或 kWh ===
-                                if unit.lower() in ("wh", "w*h", "w_h"):
-                                    kwh = float(val) / 1000.0
-                                else:
-                                    kwh = float(val)
+                                res = _calculate_multi_period_cost_detailed(transaction_id)
+                                total = res["total"]
+                                last_seg = res["segments"][-1] if res["segments"] else None
+                                price = last_seg["price"] if last_seg else _price_for_timestamp(ts)
+                                used_kwh = sum([s["kwh"] for s in res["segments"]]) if res["segments"] else 0
 
-                                # === 2) 讀取交易的 meter_start（Wh） ===
-                                with sqlite3.connect(DB_FILE) as _c2:
-                                    _cur2 = _c2.cursor()
-                                    _cur2.execute(
-                                        "SELECT meter_start FROM transactions WHERE transaction_id = ?",
-                                        (transaction_id,)
-                                    )
-                                    row_tx = _cur2.fetchone()
-                                    meter_start_wh = float(row_tx[0] or 0) if row_tx else 0
-
-                                # 本次使用量
-                                used_kwh = max(0.0, kwh - (meter_start_wh / 1000.0))
-
-                                # === 3) 多時段電價（優先）===
-                                try:
-                                    res = _calculate_multi_period_cost_detailed(transaction_id)
-                                    total = res["total"]
-                                    last_seg = res["segments"][-1] if res["segments"] else None
-                                    price = last_seg["price"] if last_seg else _price_for_timestamp(ts)
-                                    est_kwh = sum([s["kwh"] for s in res["segments"]]) if res["segments"] else used_kwh
-                                except Exception:
-                                    # fallback（單一時段）
-                                    price = float(_price_for_timestamp(ts))
-                                    total = round(used_kwh * price, 2)
-                                    est_kwh = used_kwh
-
-                                # === 4) 更新 live_status_cache ===
                                 _upsert_live(
                                     cp_id,
-                                    energy=round(kwh, 6),                  # 目前總讀值
-                                    estimated_energy=round(est_kwh, 6),    # 本次累積
-                                    estimated_amount=round(total, 2),      # 預估電費
+                                    estimated_energy=round(used_kwh, 6),
+                                    estimated_amount=round(total, 2),
                                     price_per_kwh=price,
                                     timestamp=ts,
                                 )
+                                logging.info(f"✅ 即時計算多時段金額成功：{total} 元")
+                            except Exception as e:
+                                logging.warning(f"⚠️ 即時計算多時段金額失敗：{e}")
 
                                 logging.info(
-                                    f"[LIVE] 更新能量 {cp_id}: total={kwh:.4f} kWh | used={est_kwh:.4f} kWh | price={price} | amount={total}"
+                                    f"[LIVE] 更新能量 {cp_id}: {kwh:.4f} kWh, 電價 {unit_price}, 預估金額 {est_amount}"
                                 )
 
-                            except Exception as e:
-                                logging.warning(f"⚠️ Energy 無法解析（已 fallback）：{e}")
+                                # 計算用電量與金額
+                                try:
+                                    with sqlite3.connect(DB_FILE) as _c2:
+                                        _cur2 = _c2.cursor()
+                                        _cur2.execute("SELECT meter_start FROM transactions WHERE transaction_id = ?", (transaction_id,))
+                                        row_tx = _cur2.fetchone()
+                                        if row_tx:
+                                            meter_start_wh = float(row_tx[0] or 0)
+                                            used_kwh = max(0.0, (kwh - (meter_start_wh / 1000.0)))
+                                            unit_price = float(_price_for_timestamp(ts)) if ts else 6.0
+                                            est_amount = round(used_kwh * unit_price, 2)
+                                            _upsert_live(cp_id,
+                                                         estimated_energy=round(used_kwh, 6),
+                                                         estimated_amount=est_amount,
+                                                         price_per_kwh=unit_price,
+                                                         timestamp=ts)
+
+
+
+
+                                except Exception as e:
+                                    logging.warning(f"⚠️ 預估金額計算失敗: {e}")
 
                         # Debug log
                         logging.info(f"[DEBUG][MeterValues] tx={transaction_id} | measurand={meas} | value={val}{unit} | ts={ts}")
@@ -1316,29 +1310,6 @@ class ChargePoint(OcppChargePoint):
     async def on_remote_stop_transaction(self, transaction_id, **kwargs):
         logging.info(f"✅ 收到遠端停止充電要求，transaction_id={transaction_id}")
         return call_result.RemoteStopTransactionPayload(status="Accepted")
-
-
-
-from fastapi import Body
-
-@app.post("/api/card-owners/{card_id}")
-def update_card_owner(card_id: str, data: dict = Body(...)):
-    name = data.get("name", "").strip()
-    if not name:
-        raise HTTPException(status_code=400, detail="名稱不可空白")
-
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO card_owners (card_id, name)
-            VALUES (?, ?)
-            ON CONFLICT(card_id) DO UPDATE SET name=excluded.name
-        """, (card_id, name))
-        conn.commit()
-
-    return {"message": "住戶名稱已更新", "card_id": card_id, "name": name}
-
-
 
 
 
@@ -3037,37 +3008,10 @@ def get_holiday(date: str):
 
 
 @app.get("/api/cards")
-def get_cards():
-    with get_conn() as conn:
-        cur = conn.cursor()
-
-        cur.execute("""
-            SELECT 
-                c.card_id, 
-                c.balance,
-                t.status,
-                t.valid_until,
-                o.name
-            FROM cards c
-            LEFT JOIN id_tags t ON c.card_id = t.id_tag
-            LEFT JOIN card_owners o ON c.card_id = o.card_id
-            ORDER BY c.card_id
-        """)
-
-        rows = cur.fetchall()
-
-    result = []
-    for r in rows:
-        result.append({
-            "card_id": r[0],
-            "balance": r[1],
-            "status": r[2],
-            "validUntil": r[3],
-            "name": r[4]   # ⭐ 新增住戶名稱
-        })
-
-    return result
-
+async def get_cards():
+    cursor.execute("SELECT card_id, balance FROM cards")
+    rows = cursor.fetchall()
+    return [{"id": row[0], "card_id": row[0], "balance": row[1]} for row in rows]
 
 @app.get("/api/charge-points")
 async def list_charge_points():
