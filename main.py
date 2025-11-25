@@ -2026,49 +2026,6 @@ def get_live_status(charge_point_id: str):
     }
 
 
-
-
-
-
-@app.get("/api/charge-points/{charge_point_id}/latest-energy")
-def get_latest_energy(charge_point_id: str):
-    cp_id = _normalize_cp_id(charge_point_id)
-    c = conn.cursor()
-
-    c.execute("""
-        SELECT timestamp, value, unit
-        FROM meter_values
-        WHERE charge_point_id=? AND measurand IN ('Energy.Active.Import.Register','Energy.Active.Import')
-        ORDER BY timestamp DESC LIMIT 1
-    """, (cp_id,))
-    row = c.fetchone()
-
-    result = {}
-    if row:
-        ts, val, unit = row
-        try:
-            kwh = _energy_to_kwh(val, unit)
-            if kwh is not None:
-                result = {
-                    "timestamp": ts,
-                    "totalEnergyKWh": round(kwh, 6),
-                    "sessionEnergyKWh": round(kwh, 6)
-                }
-
-                # ⭐ 保護條件：若狀態是 Available，強制回傳 0
-                cp_status = charging_point_status.get(cp_id, {}).get("status")
-                if cp_status == "Available" and result.get("totalEnergyKWh", 0) > 0:
-                    logging.debug(f"⚠️ [DEBUG] 保護觸發: CP={cp_id} 狀態=Available 但 DB 最新值={result['totalEnergyKWh']} → 強制改為 0")
-                    result["totalEnergyKWh"] = 0
-                    result["sessionEnergyKWh"] = 0
-
-        except Exception as e:
-            logging.warning(f"⚠️ latest-energy 計算失敗: {e}")
-
-    logging.debug(f"🔍 [DEBUG] latest-energy 回傳: {result}")
-    return result
-
-
 @app.get("/api/cards/{card_id}/history")
 def get_card_history(card_id: str, limit: int = 20):
     """
