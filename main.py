@@ -461,20 +461,6 @@ async def get_card_whitelist(card_id: str):
 
 
 
-
-# 🔧 新增：即時查詢目前後端實際使用電價的 API
-@app.get("/api/debug/price")
-def debug_price():
-    """
-    回傳目前後端根據 daily_pricing_rules 所採用的電價。
-    可用 curl 查詢：
-    curl https://ocppfortechlux-backend.onrender.com/api/debug/price
-    """
-    now = datetime.utcnow().isoformat()
-    price = _price_for_timestamp(now)
-    return {"current_price": price}
-
-
 # === 卡片白名單 (card_whitelist) ===
 cursor.execute("""
     CREATE TABLE IF NOT EXISTS card_whitelist (
@@ -1851,30 +1837,6 @@ def get_current_tx_summary_by_cp(charge_point_id: str):
             "total_amount": total_amount,
             "final_energy_kwh": final_energy,
             "final_cost": total_amount
-        }
-
-
-@app.get("/api/charge-points/{charge_point_id}/current-transaction/summary")
-def get_current_tx_summary(charge_point_id: str):
-    cp_id = _normalize_cp_id(charge_point_id)
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT transaction_id, id_tag, start_timestamp
-            FROM transactions
-            WHERE charge_point_id=? AND stop_timestamp IS NULL
-            ORDER BY start_timestamp DESC LIMIT 1
-        """, (cp_id,))
-        row = cur.fetchone()
-        if not row:
-            return {"found": False}
-        
-        tx_id, id_tag, start_ts = row
-        return {
-            "found": True,
-            "transaction_id": tx_id,
-            "id_tag": id_tag,
-            "start_timestamp": start_ts
         }
 
 
@@ -3842,19 +3804,6 @@ def get_current_price_breakdown(charge_point_id: str):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-
-# === 取得特定卡片的白名單 ===
-@app.get("/api/cards/{id_tag}/whitelist")
-async def get_card_whitelist(id_tag: str):
-    """
-    目前暫時回傳空白白名單，確保前端不報錯。
-    後續若要做真正白名單功能，可加入資料表 card_whitelist。
-    """
-    return {
-        "idTag": id_tag,
-        "allowed": []  # 暫時回傳空白，不影響現有邏輯
-    }
 
 
 
