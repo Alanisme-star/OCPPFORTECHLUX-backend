@@ -305,6 +305,18 @@ def _price_for_timestamp(ts: str) -> float:
 
 
 
+# 📌 預設電價規則資料表（只會存一筆）
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS default_pricing_rules (
+    id INTEGER PRIMARY KEY,
+    weekday_rules TEXT,
+    saturday_rules TEXT,
+    sunday_rules TEXT
+)
+""")
+conn.commit()
+
+
 
 # ============================================================
 # 多時段電價分段計算（依據每筆 meter_values 分段累加）
@@ -2073,6 +2085,58 @@ def delete_daily_pricing(date: str = Query(..., description="要刪除的日期 
         cur.execute("DELETE FROM daily_pricing_rules WHERE date=?", (date,))
         conn.commit()
     return {"message": f"✅ 已刪除 {date} 的所有規則"}
+
+
+@app.get("/api/default-pricing-rules")
+def get_default_pricing_rules():
+    c = conn.cursor()
+    c.execute("SELECT weekday_rules, saturday_rules, sunday_rules FROM default_pricing_rules WHERE id = 1")
+    row = c.fetchone()
+
+    if not row:
+        return {
+            "weekday": [],
+            "saturday": [],
+            "sunday": []
+        }
+
+    return {
+        "weekday": json.loads(row[0]) if row[0] else [],
+        "saturday": json.loads(row[1]) if row[1] else [],
+        "sunday": json.loads(row[2]) if row[2] else []
+    }
+
+
+
+@app.post("/api/default-pricing-rules")
+def save_default_pricing_rules(data: dict):
+    weekday = data.get("weekday", [])
+    saturday = data.get("saturday", [])
+    sunday = data.get("sunday", [])
+
+    c = conn.cursor()
+
+    # 檢查是否存在 id=1
+    c.execute("SELECT id FROM default_pricing_rules WHERE id = 1")
+    exists = c.fetchone()
+
+    if exists:
+        c.execute("""
+            UPDATE default_pricing_rules
+            SET weekday_rules = ?, saturday_rules = ?, sunday_rules = ?
+            WHERE id = 1
+        """, (json.dumps(weekday), json.dumps(saturday), json.dumps(sunday)))
+    else:
+        c.execute("""
+            INSERT INTO default_pricing_rules (id, weekday_rules, saturday_rules, sunday_rules)
+            VALUES (1, ?, ?, ?)
+        """, (json.dumps(weekday), json.dumps(saturday), json.dumps(sunday)))
+
+    conn.commit()
+    return {"status": "ok"}
+
+
+
 
 
 # === 刪除卡片（完整刪除 id_tags + cards + card_whitelist） ===
