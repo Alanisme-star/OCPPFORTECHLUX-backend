@@ -262,46 +262,63 @@ def get_conn():
     # 為每次查詢建立新的連線與游標，避免共用全域 cursor 造成並發問題
     return sqlite3.connect(DB_FILE, check_same_thread=False, timeout=15)
 
-
-
 def _price_for_timestamp(ts: str) -> float:
     """
-    根據時間戳（ISO格式）從 daily_pricing_rules 查出對應電價。
-    支援跨午夜（例如 23:30~00:30），並在查無資料時回傳預設值 6.0。
+    查當下 timestamp 所對應的電價，修正 24:00 整天規則與跨午夜邏輯。
     """
     try:
-        # ⭐ 解析 ISO 格式並將 UTC 轉為台灣時間
-        dt = datetime.fromisoformat(ts.replace("Z", "+00:00")) if "Z" in ts else datetime.fromisoformat(ts)
-        dt = dt.astimezone(ZoneInfo("Asia/Taipei"))  # ← 這一行是造成你現在電價整天變 6 的關鍵
+        # 1. 解析時間
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00")) \
+            if "Z" in ts else datetime.fromisoformat(ts)
+        dt = dt.astimezone(TZ_TAIPEI)
 
         date_str = dt.strftime("%Y-%m-%d")
         time_str = dt.strftime("%H:%M")
 
+        # 2. 查這一天的規則
         with sqlite3.connect(DB_FILE) as conn:
             cur = conn.cursor()
-
             cur.execute("""
-                SELECT price FROM daily_pricing_rules
+                SELECT start_time, end_time, price
+                FROM daily_pricing_rules
                 WHERE date = ?
-                  AND (
-                        -- ✅ 一般時段（同一天內）
-                        (start_time <= end_time AND start_time <= ? AND end_time >= ?)
+                ORDER BY start_time ASC
+            """, (date_str,))
+            rules = cur.fetchall()
 
-                        -- ✅ 跨午夜時段（例如 23:30~00:30）
-                     OR (start_time > end_time AND ( ? >= start_time OR ? <= end_time ))
-                  )
-                ORDER BY start_time DESC LIMIT 1
-            """, (date_str, time_str, time_str, time_str, time_str))
+        # ------ 沒規則 → 預設 ------
+        if not rules:
+            return 6.0
 
+        # ------ 將 24:00 → 23:59 ------
+        normalized = []
+        for s, e, p in rules:
+            s2 = "23:59" if s == "24:00" else s
+            e2 = "23:59" if e == "24:00" else e
+            normalized.append((s2, e2, p))
 
-            row = cur.fetchone()
-            if row:
-                return float(row[0])
+        # ------ 時段比對 ------
+        for s, e, price in normalized:
+            if s <= e:
+                # 一般時段
+                if s <= time_str <= e:
+                    return float(price)
+            else:
+                # 跨午夜
+                if time_str >= s or time_str <= e:
+                    return float(price)
+
+        # ------ 仍找不到 → 若為整天設定，套整天價 ------
+        overs = [p for s, e, p in normalized if s == "00:00" and e == "23:59"]
+        if overs:
+            return float(overs[0])
 
     except Exception as e:
         logging.warning(f"⚠️ 電價查詢失敗: {e}")
 
     return 6.0
+
+
 
 
 
