@@ -624,6 +624,14 @@ CREATE TABLE IF NOT EXISTS transactions (
 )
 ''')
 
+# ★ 舊庫相容：若既有 transactions 表沒有 latest_meter 欄位，自動補上
+cursor.execute("PRAGMA table_info(transactions)")
+_tx_cols = [r[1] for r in cursor.fetchall()]
+if "latest_meter" not in _tx_cols:
+    cursor.execute("ALTER TABLE transactions ADD COLUMN latest_meter REAL")
+conn.commit()
+
+
 
 cursor.execute('''
 CREATE TABLE IF NOT EXISTS id_tags (
@@ -1075,20 +1083,17 @@ class ChargePoint(OcppChargePoint):
 
 
 
-                    # 更新卡片餘額
-                    _cur.execute("SELECT balance FROM cards WHERE card_id=?", (id_tag,))
-                    card_row = _cur.fetchone()
-                    if card_row:
-                        old_balance = float(card_row[0] or 0)
-                        new_balance = max(0.0, old_balance - total_amount)
-                        _cur.execute("UPDATE cards SET balance=? WHERE card_id=?", (new_balance, id_tag))
-                        logging.info(f"💳 卡片扣款完成 | idTag={id_tag} | 扣款={total_amount} | 原餘額={old_balance} → 新餘額={new_balance}")
-
-                    # 記錄付款紀錄
+                    # ✅ 模式1：改成「只記錄，不再扣款」，避免與即時扣款重複
                     _cur.execute('''
                         INSERT INTO payments (transaction_id, base_fee, energy_fee, overuse_fee, total_amount, paid_at)
                         VALUES (?, ?, ?, ?, ?, ?)
                     ''', (transaction_id, 0.0, total_amount, 0.0, total_amount, stop_ts))
+
+                    logging.info(
+                        f"💳 StopTransaction 結算記錄完成 | tx={transaction_id} | "
+                        f"最終金額={total_amount}（已在充電過程中即時扣款，不再二次扣款）"
+                    )
+
 
                 _conn.commit()
                 # ====== ⭐ 新增結束 ======
@@ -1250,6 +1255,7 @@ class ChargePoint(OcppChargePoint):
 
                         elif "Energy.Active.Import" in meas:
                             try:
+                                # 1) 先用多時段電價計算，更新 Live 快取（前端估算用）
                                 res = _calculate_multi_period_cost_detailed(transaction_id)
                                 total = res["total"]
                                 last_seg = res["segments"][-1] if res["segments"] else None
@@ -1264,7 +1270,97 @@ class ChargePoint(OcppChargePoint):
                                     timestamp=ts,
                                 )
                                 logging.info(f"✅ 即時計算多時段金額成功：{total} 元")
+
+                                # 2) 模式1：每秒即時扣款（依照 Energy.Active.Import 累積值差值來算）
+                                try:
+                                    with sqlite3.connect(DB_FILE) as _c3:
+                                        _cur3 = _c3.cursor()
+
+                                        # 2-1 先查出這筆交易的 id_tag（用來扣卡片餘額）
+                                        _cur3.execute("""
+                                            SELECT id_tag, latest_meter
+                                            FROM transactions
+                                            WHERE transaction_id = ?
+                                        """, (transaction_id,))
+                                        row_prev = _cur3.fetchone()
+                                        if not row_prev:
+                                            # 找不到交易就不扣款
+                                            logging.warning(f"⚠️ 即時扣款找不到 transaction_id={transaction_id}")
+                                            raise RuntimeError("transaction not found")
+
+                                        id_tag, prev_meter = row_prev
+                                        prev_meter = float(prev_meter) if prev_meter is not None else None
+
+                                        # 2-2 第一次收到，先初始化 latest_meter，不扣款
+                                        if prev_meter is None:
+                                            _cur3.execute("""
+                                                UPDATE transactions
+                                                SET latest_meter = ?
+                                                WHERE transaction_id = ?
+                                            """, (val, transaction_id))   # val = 最新累積表值（Wh 或 kWh）
+                                            _c3.commit()
+                                        else:
+                                            # 2-3 計算本次累積表值的差值
+                                            delta_raw = max(0.0, val - prev_meter)
+
+                                            # 判斷單位：若是 Wh 則 /1000，若是 kWh 則直接用
+                                            unit_lower = (unit or "").lower()
+                                            if unit_lower in ("wh", "w*h", "w_h"):
+                                                delta_kwh = delta_raw / 1000.0
+                                            else:
+                                                delta_kwh = delta_raw  # 充電樁直接上報 kWh 的情況
+
+                                            if delta_kwh <= 0:
+                                                # 沒有前進就不扣款，只更新 latest_meter 避免噪音
+                                                _cur3.execute("""
+                                                    UPDATE transactions
+                                                    SET latest_meter = ?
+                                                    WHERE transaction_id = ?
+                                                """, (val, transaction_id))
+                                                _c3.commit()
+                                            else:
+                                                # 2-4 查電價：沿用上面多時段計算得到的 price
+                                                unit_price = float(price)
+
+                                                # 2-5 計算本次應扣金額
+                                                delta_amount = delta_kwh * unit_price
+
+                                                # 2-6 扣款（更新 cards.balance）
+                                                _cur3.execute("SELECT balance FROM cards WHERE card_id=?", (id_tag,))
+                                                row_card = _cur3.fetchone()
+                                                if row_card:
+                                                    old_balance = float(row_card[0] or 0.0)
+                                                    new_balance = max(0.0, old_balance - delta_amount)
+                                                    _cur3.execute(
+                                                        "UPDATE cards SET balance=? WHERE card_id=?",
+                                                        (new_balance, id_tag)
+                                                    )
+                                                else:
+                                                    # 找不到卡片，就只更新 latest_meter，不做扣款
+                                                    new_balance = None
+                                                    logging.warning(f"⚠️ 即時扣款找不到卡片 idTag={id_tag}")
+
+                                                # 2-7 更新 latest_meter，避免下次重複扣
+                                                _cur3.execute("""
+                                                    UPDATE transactions
+                                                    SET latest_meter = ?
+                                                    WHERE transaction_id = ?
+                                                """, (val, transaction_id))
+
+                                                _c3.commit()
+                                                if new_balance is not None:
+                                                    logging.info(
+                                                        f"💰 即時扣款 tx={transaction_id} | "
+                                                        f"ΔkWh={delta_kwh:.6f} | 單價={unit_price:.4f} | "
+                                                        f"本次扣款={delta_amount:.4f} | 剩餘餘額={new_balance:.4f}"
+                                                    )
+
+                                except Exception as e:
+                                    # 內層：即時扣款失敗，不影響整體 MeterValues 處理
+                                    logging.warning(f"⚠️ 即時扣款失敗：{e}")
+
                             except Exception as e:
+                                # 外層：多時段金額計算失敗，只記 log，不中斷整個 handler
                                 logging.warning(f"⚠️ 即時計算多時段金額失敗：{e}")
 
                                 logging.info(
@@ -1443,63 +1539,86 @@ async def update_card_whitelist(card_id: str, data: dict = Body(...)):
 
 
 
-
-
+# 放在 main.py 裡原本 stop API 的位置
 from fastapi import HTTPException
 
-@app.post("/api/charge-points/{charge_point_id:path}/stop")
+@app.post("/api/charge-points/{charge_point_id}/stop")
 async def stop_transaction_by_charge_point(charge_point_id: str):
-    # ← 先正規化，處理星號與 URL 編碼
-    cp_id = _normalize_cp_id(charge_point_id)
-    print(f"🟢【API呼叫】收到停止充電API請求, charge_point_id = {charge_point_id}")
+    """
+    依照「charge_point_id 文字完全相同」來查 connected_charge_points，
+    寫法盡量貼近你過去已確認可用的版本。
+    """
+    cp_id = charge_point_id
+    print(f"🟢【API呼叫】收到停止充電API請求, charge_point_id = {cp_id}")
+
+    # 直接用原字串查 map（不再額外 _normalize）
     cp = connected_charge_points.get(cp_id)
 
     if not cp:
-        print(f"🔴【API異常】找不到連線中的充電樁：{charge_point_id}")
+        # 額外印出目前有哪幾個連線中的 CP，方便你之後 debug
+        print(f"🔴【API異常】找不到連線中的充電樁：{cp_id}")
+        print(f"🔍【DEBUG】目前 connected_charge_points keys = {list(connected_charge_points.keys())}")
         raise HTTPException(
             status_code=404,
-            detail=f"⚠️ 找不到連線中的充電樁：{charge_point_id}",
-            headers={"X-Connected-CPs": str(list(connected_charge_points.keys()))}
+            detail=f"⚠️ 找不到連線中的充電樁：{cp_id}",
+            headers={"X-Connected-CPs": str(list(connected_charge_points.keys()))},
         )
-    # 查詢進行中的 transaction_id
+
+    # 查詢進行中的 transaction_id（和新版一樣用 DB 來找）
     with sqlite3.connect(DB_FILE) as conn:
         cursor = conn.cursor()
-        cursor.execute("""
-            SELECT transaction_id FROM transactions
+        cursor.execute(
+            """
+            SELECT transaction_id
+            FROM transactions
             WHERE charge_point_id = ? AND stop_timestamp IS NULL
-            ORDER BY start_timestamp DESC LIMIT 1
-        """, (cp_id,))
+            ORDER BY start_timestamp DESC
+            LIMIT 1
+            """,
+            (cp_id,),
+        )
         row = cursor.fetchone()
         if not row:
-            print(f"🔴【API異常】無進行中交易 charge_point_id={charge_point_id}")
+            print(f"🔴【API異常】無進行中交易 charge_point_id={cp_id}")
             raise HTTPException(status_code=400, detail="⚠️ 無進行中交易")
+
         transaction_id = row[0]
         print(f"🟢【API呼叫】找到進行中交易 transaction_id={transaction_id}")
 
-
-    # 新增同步等待機制
+    # === 等待 StopTransaction 的同步機制（沿用你新版的作法） ===
     loop = asyncio.get_event_loop()
     fut = loop.create_future()
     pending_stop_transactions[str(transaction_id)] = fut
 
     # 發送 RemoteStopTransaction
-    print(f"🟢【API呼叫】發送 RemoteStopTransaction 給充電樁")
-    print(f"🟢【API呼叫】即將送出 RemoteStopTransaction | charge_point_id={charge_point_id} | transaction_id={transaction_id}")
-    # 送 RemoteStopTransaction（使用 Payload）
+    print("🟢【API呼叫】發送 RemoteStopTransaction 給充電樁")
+    print(
+        f"🟢【API呼叫】即將送出 RemoteStopTransaction | "
+        f"charge_point_id={cp_id} | transaction_id={transaction_id}"
+    )
+
     req = call.RemoteStopTransactionPayload(transaction_id=int(transaction_id))
     resp = await cp.call(req)
     print(f"🟢【API回應】呼叫 RemoteStopTransaction 完成，resp={resp}")
 
-    # 等待 StopTransaction 被觸發（最多 10 秒）
+    # 等待 StopTransaction 回報（最多 10 秒）
     try:
         stop_result = await asyncio.wait_for(fut, timeout=10)
         print(f"🟢【API回應】StopTransaction 完成: {stop_result}")
-        return {"message": "充電已停止", "transaction_id": transaction_id, "stop_result": stop_result}
+        return {
+            "message": "充電已停止",
+            "transaction_id": transaction_id,
+            "stop_result": stop_result,
+        }
     except asyncio.TimeoutError:
-        print(f"🔴【API異常】等待 StopTransaction 超時")
-        return JSONResponse(status_code=504, content={"message": "等待充電樁停止回覆逾時 (StopTransaction timeout)"})
+        print("🔴【API異常】等待 StopTransaction 超時")
+        return JSONResponse(
+            status_code=504,
+            content={"message": "等待充電樁停止回覆逾時 (StopTransaction timeout)"},
+        )
     finally:
         pending_stop_transactions.pop(str(transaction_id), None)
+
 
 
 @app.post("/api/charge-points/{charge_point_id}/start")
