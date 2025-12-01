@@ -1336,11 +1336,10 @@ class ChargePoint(OcppChargePoint):
                                                         (new_balance, id_tag)
                                                     )
                                                 else:
-                                                    # 找不到卡片，就只更新 latest_meter，不做扣款
                                                     new_balance = None
                                                     logging.warning(f"⚠️ 即時扣款找不到卡片 idTag={id_tag}")
 
-                                                # 2-7 更新 latest_meter，避免下次重複扣
+                                                # 2-7 更新 latest_meter
                                                 _cur3.execute("""
                                                     UPDATE transactions
                                                     SET latest_meter = ?
@@ -1348,12 +1347,26 @@ class ChargePoint(OcppChargePoint):
                                                 """, (val, transaction_id))
 
                                                 _c3.commit()
+
                                                 if new_balance is not None:
                                                     logging.info(
-                                                        f"💰 即時扣款 tx={transaction_id} | "
-                                                        f"ΔkWh={delta_kwh:.6f} | 單價={unit_price:.4f} | "
+                                                        f"💰 即時扣款 tx={transaction_id} | ΔkWh={delta_kwh:.6f} | 單價={unit_price:.4f} | "
                                                         f"本次扣款={delta_amount:.4f} | 剩餘餘額={new_balance:.4f}"
                                                     )
+
+                                                    # ======================================================
+                                                    #       ★★★ 自動停充（後端負責 RemoteStopTransaction）★★★
+                                                    # ======================================================
+                                                    try:
+                                                        if new_balance <= 0.01:
+                                                            logging.warning(
+                                                                f"🛑 觸發後端自動停充 | tx={transaction_id} | new_balance={new_balance}"
+                                                            )
+                                                            # 非同步啟動，不阻塞 OCPP 流程
+                                                            asyncio.create_task(self.send_stop_transaction(int(transaction_id)))
+                                                    except Exception as stop_err:
+                                                        logging.error(f"❌ 自動停充失敗：{stop_err}")
+
 
                                 except Exception as e:
                                     # 內層：即時扣款失敗，不影響整體 MeterValues 處理
