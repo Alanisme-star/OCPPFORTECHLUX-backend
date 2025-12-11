@@ -817,8 +817,9 @@ class ChargePoint(OcppChargePoint):
                     logging.warning(f"⚠️ 忽略不合理的 Available 狀態（仍有交易進行中）| CP={cp_id}")
                     return call_result.StatusNotificationPayload()
 
-                # ✅ 沒有交易才真的清除
                 logging.debug(f"🔍 [DEBUG] Status=Available 前快取: {live_status_cache.get(cp_id)}")
+
+                # 🔧【新增】強制清除所有即時用欄位（避免殘留前一次）
                 live_status_cache[cp_id] = {
                     "power": 0,
                     "voltage": 0,
@@ -827,18 +828,28 @@ class ChargePoint(OcppChargePoint):
                     "estimated_energy": 0,
                     "estimated_amount": 0,
                     "price_per_kwh": 0,
-                    "timestamp": datetime.utcnow().isoformat()
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "cached_estimated_energy": 0,    # 🔧 新增
+                    "cached_estimated_amount": 0     # 🔧 新增
                 }
+
+                # 🔧【新增】補寫一筆 0 kWh 到 DB，避免前端重讀舊能源值
                 with sqlite3.connect(DB_FILE) as _c:
                     _cur = _c.cursor()
                     _cur.execute('''
                         INSERT INTO meter_values (charge_point_id, connector_id, transaction_id,
                                                   value, measurand, unit, timestamp)
                         VALUES (?, ?, ?, ?, ?, ?, ?)
-                    ''', (cp_id, connector_id, None, 0.0,
-                          "Energy.Active.Import.Register", "kWh", datetime.utcnow().isoformat()))
+                    ''', (
+                        cp_id,
+                        connector_id,
+                        None,
+                        0.0,    # 🔧 強制 0
+                        "Energy.Active.Import.Register",
+                        "kWh",
+                        datetime.utcnow().isoformat()
+                    ))
                     _c.commit()
-
 
                 logging.debug(f"🔍 [DEBUG] Status=Available 後快取: {live_status_cache.get(cp_id)}")
 
@@ -847,6 +858,7 @@ class ChargePoint(OcppChargePoint):
         except Exception as e:
             logging.exception(f"❌ StatusNotification 發生未預期錯誤：{e}")
             return call_result.StatusNotificationPayload()
+
 
 
 
