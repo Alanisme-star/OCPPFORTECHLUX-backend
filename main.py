@@ -817,9 +817,8 @@ class ChargePoint(OcppChargePoint):
                     logging.warning(f"⚠️ 忽略不合理的 Available 狀態（仍有交易進行中）| CP={cp_id}")
                     return call_result.StatusNotificationPayload()
 
+                # ✅ 沒有交易才真的清除
                 logging.debug(f"🔍 [DEBUG] Status=Available 前快取: {live_status_cache.get(cp_id)}")
-
-                # 🔧【新增】強制清除所有即時用欄位（避免殘留前一次）
                 live_status_cache[cp_id] = {
                     "power": 0,
                     "voltage": 0,
@@ -828,28 +827,18 @@ class ChargePoint(OcppChargePoint):
                     "estimated_energy": 0,
                     "estimated_amount": 0,
                     "price_per_kwh": 0,
-                    "timestamp": datetime.utcnow().isoformat(),
-                    "cached_estimated_energy": 0,    # 🔧 新增
-                    "cached_estimated_amount": 0     # 🔧 新增
+                    "timestamp": datetime.utcnow().isoformat()
                 }
-
-                # 🔧【新增】補寫一筆 0 kWh 到 DB，避免前端重讀舊能源值
                 with sqlite3.connect(DB_FILE) as _c:
                     _cur = _c.cursor()
                     _cur.execute('''
                         INSERT INTO meter_values (charge_point_id, connector_id, transaction_id,
                                                   value, measurand, unit, timestamp)
                         VALUES (?, ?, ?, ?, ?, ?, ?)
-                    ''', (
-                        cp_id,
-                        connector_id,
-                        None,
-                        0.0,    # 🔧 強制 0
-                        "Energy.Active.Import.Register",
-                        "kWh",
-                        datetime.utcnow().isoformat()
-                    ))
+                    ''', (cp_id, connector_id, None, 0.0,
+                          "Energy.Active.Import.Register", "kWh", datetime.utcnow().isoformat()))
                     _c.commit()
+
 
                 logging.debug(f"🔍 [DEBUG] Status=Available 後快取: {live_status_cache.get(cp_id)}")
 
@@ -858,7 +847,6 @@ class ChargePoint(OcppChargePoint):
         except Exception as e:
             logging.exception(f"❌ StatusNotification 發生未預期錯誤：{e}")
             return call_result.StatusNotificationPayload()
-
 
 
 
@@ -2227,24 +2215,36 @@ def get_charge_point_status(charge_point_id: str):
 @app.get("/api/charge-points/{charge_point_id}/latest-status")
 def get_latest_status(charge_point_id: str):
     cp_id = _normalize_cp_id(charge_point_id)
-    with sqlite3.connect(DB_FILE) as conn:
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT status, last_update FROM charge_points
-            WHERE charge_point_id = ?
-        """, (cp_id,))
-        row = cur.fetchone()
 
-    if row:
-        return {
-            "status": row[0],
-            "timestamp": row[1]
-        }
-    else:
-        return {
-            "status": "Unknown",
-            "timestamp": None
-        }
+    # ✅ 優先從 status_logs 抓最新狀態（你本來就有在 StatusNotification INSERT status_logs）
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT status, timestamp
+                FROM status_logs
+                WHERE charge_point_id = ?
+                ORDER BY timestamp DESC
+                LIMIT 1
+            """, (cp_id,))
+            row = cur.fetchone()
+
+        if row:
+            return {
+                "status": row[0] or "Unknown",
+                "timestamp": row[1]
+            }
+
+    except Exception as e:
+        logging.exception(f"❌ get_latest_status failed | cp_id={cp_id} | err={e}")
+
+    # ✅ DB 沒資料 or 例外 → fallback 用記憶體快取（你程式裡已有 charging_point_status）
+    st = charging_point_status.get(cp_id) or {}
+    return {
+        "status": st.get("status", "Unknown"),
+        "timestamp": st.get("timestamp")
+    }
+
 
 
 
