@@ -52,6 +52,17 @@ REQUIRED_TOKEN = os.getenv("OCPP_WS_TOKEN", None)
 
 logging.basicConfig(level=logging.WARNING)
 
+
+
+# ===============================
+# Stop API 去重保護（防換頁/重刷）
+# ===============================
+STOP_DEDUP_WINDOW = 60  # 秒
+_recent_stop_requests = {}  # {cp_id: last_stop_time}
+
+
+
+
 # 允許跨域（若前端使用）
 app.add_middleware(
     CORSMiddleware,
@@ -1447,13 +1458,27 @@ async def update_card_whitelist(card_id: str, data: dict = Body(...)):
 
 from fastapi import HTTPException
 
+from fastapi import HTTPException
+import time
+
 @app.post("/api/charge-points/{charge_point_id:path}/stop")
 async def stop_transaction_by_charge_point(charge_point_id: str):
-    # ← 先正規化，處理星號與 URL 編碼
     cp_id = _normalize_cp_id(charge_point_id)
-    print(f"🟢【API呼叫】收到停止充電API請求, charge_point_id = {charge_point_id}")
-    cp = connected_charge_points.get(cp_id)
+    now = time.time()
 
+    print(f"🟢【API呼叫】收到停止充電API請求, charge_point_id={charge_point_id}")
+
+    # ---------- ⭐ ① 60 秒內重複 stop → 直接忽略 ----------
+    last_ts = _recent_stop_requests.get(cp_id)
+    if last_ts and now - last_ts < STOP_DEDUP_WINDOW:
+        print(f"⛔【STOP去重】重複 stop 已忽略 cp_id={cp_id}")
+        return {
+            "ok": True,
+            "ignored": True,
+            "reason": "duplicate_stop"
+        }
+
+    cp = connected_charge_points.get(cp_id)
     if not cp:
         print(f"🔴【API異常】找不到連線中的充電樁：{charge_point_id}")
         raise HTTPException(
@@ -1461,7 +1486,8 @@ async def stop_transaction_by_charge_point(charge_point_id: str):
             detail=f"⚠️ 找不到連線中的充電樁：{charge_point_id}",
             headers={"X-Connected-CPs": str(list(connected_charge_points.keys()))}
         )
-    # 查詢進行中的 transaction_id
+
+    # ---------- ⭐ ② 查詢是否真的還有進行中交易 ----------
     with sqlite3.connect(DB_FILE) as conn:
         cursor = conn.cursor()
         cursor.execute("""
@@ -1470,36 +1496,49 @@ async def stop_transaction_by_charge_point(charge_point_id: str):
             ORDER BY start_timestamp DESC LIMIT 1
         """, (cp_id,))
         row = cursor.fetchone()
+
         if not row:
-            print(f"🔴【API異常】無進行中交易 charge_point_id={charge_point_id}")
-            raise HTTPException(status_code=400, detail="⚠️ 無進行中交易")
-        transaction_id = row[0]
-        print(f"🟢【API呼叫】找到進行中交易 transaction_id={transaction_id}")
+            print(f"⛔【STOP忽略】無進行中交易 cp_id={cp_id}")
+            _recent_stop_requests[cp_id] = now
+            return {
+                "ok": True,
+                "ignored": True,
+                "reason": "no_active_transaction"
+            }
 
+        transaction_id = int(row[0])
+        print(f"🟢【API】找到進行中交易 transaction_id={transaction_id}")
 
-    # 新增同步等待機制
+    # ---------- ⭐ ③ 記錄 stop 已送（關鍵） ----------
+    _recent_stop_requests[cp_id] = now
+
+    # ---------- ⭐ ④ 原本流程保留（RemoteStop + Future） ----------
     loop = asyncio.get_event_loop()
     fut = loop.create_future()
     pending_stop_transactions[str(transaction_id)] = fut
 
-    # 發送 RemoteStopTransaction
-    print(f"🟢【API呼叫】發送 RemoteStopTransaction 給充電樁")
-    print(f"🟢【API呼叫】即將送出 RemoteStopTransaction | charge_point_id={charge_point_id} | transaction_id={transaction_id}")
-    # 送 RemoteStopTransaction（使用 Payload）
-    req = call.RemoteStopTransactionPayload(transaction_id=int(transaction_id))
-    resp = await cp.call(req)
-    print(f"🟢【API回應】呼叫 RemoteStopTransaction 完成，resp={resp}")
+    print(f"🟢【API】發送 RemoteStopTransaction cp_id={cp_id} tx={transaction_id}")
+    req = call.RemoteStopTransactionPayload(transaction_id=transaction_id)
+    await cp.call(req)
 
-    # 等待 StopTransaction 被觸發（最多 10 秒）
     try:
         stop_result = await asyncio.wait_for(fut, timeout=10)
-        print(f"🟢【API回應】StopTransaction 完成: {stop_result}")
-        return {"message": "充電已停止", "transaction_id": transaction_id, "stop_result": stop_result}
+        return {
+            "ok": True,
+            "sent": True,
+            "transaction_id": transaction_id,
+            "stop_result": stop_result
+        }
+
     except asyncio.TimeoutError:
-        print(f"🔴【API異常】等待 StopTransaction 超時")
-        return JSONResponse(status_code=504, content={"message": "等待充電樁停止回覆逾時 (StopTransaction timeout)"})
+        return JSONResponse(
+            status_code=504,
+            content={"message": "等待充電樁停止回覆逾時 (StopTransaction timeout)"}
+        )
+
     finally:
         pending_stop_transactions.pop(str(transaction_id), None)
+
 
 
 @app.post("/api/charge-points/{charge_point_id}/start")
