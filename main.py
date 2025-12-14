@@ -1989,14 +1989,28 @@ def get_current_transaction(charge_point_id: str):
 
 @app.get("/api/charge-points/{charge_point_id}/live-status")
 def get_live_status(charge_point_id: str):
-    """
-    強化版：即使 live_status_cache 暫時沒有 estimated_amount，也會自動從 DB 補算跨時段電價。
-    """
     cp_id = _normalize_cp_id(charge_point_id)
     live = live_status_cache.get(cp_id, {})
 
+    # ⭐ 讀取目前樁態
+    status = charging_point_status.get(cp_id, {}).get("status")
+
+    # ⭐ 非充電狀態 → 即時量測一律視為 0（語意修正）
+    if status not in ("Charging", "Finishing"):
+        return {
+            "timestamp": live.get("timestamp"),
+            "power": 0,
+            "voltage": 0,
+            "current": 0,
+            "energy": 0,
+            "estimated_energy": 0,
+            "estimated_amount": 0,
+            "price_per_kwh": live.get("price_per_kwh", 0),
+            "derived": False
+        }
+
+    # ===== 以下維持你原本邏輯（只在充電中才成立） =====
     try:
-        # 若預估電費遺失或為 0，則從 DB 補算一次
         if not live.get("estimated_amount"):
             with get_conn() as conn:
                 cur = conn.cursor()
@@ -2012,11 +2026,8 @@ def get_live_status(charge_point_id: str):
                     if new_amount > 0:
                         live["estimated_amount"] = round(new_amount, 2)
                         _upsert_live(cp_id, estimated_amount=new_amount)
-                        logging.info(f"🧮 即時補算電費 | CP={cp_id} | tx={tx_id} | 金額={new_amount}")
     except Exception as e:
         logging.warning(f"⚠️ 即時補算失敗: {e}")
-
-    logging.debug(f"🔍 [DEBUG] live-status 回傳 | CP={cp_id} | data={live}")
 
     return {
         "timestamp": live.get("timestamp"),
