@@ -1992,10 +1992,18 @@ def get_live_status(charge_point_id: str):
     cp_id = _normalize_cp_id(charge_point_id)
     live = live_status_cache.get(cp_id, {})
 
-    # ⭐ 讀取目前樁態
     status = charging_point_status.get(cp_id, {}).get("status")
 
-    # ⭐ 非充電狀態 → 即時量測一律視為 0（語意修正）
+    now = time.time()
+    updated_at = live.get("updated_at")
+
+    # ⭐ 判斷即時資料是否過期（避免瞬斷 / 尚未回報 MeterValues）
+    is_stale = (
+        not updated_at or
+        (now - updated_at) > 3   # 3 秒可依實際情況微調
+    )
+
+    # ⭐ 非充電狀態 → 一律回 0
     if status not in ("Charging", "Finishing"):
         return {
             "timestamp": live.get("timestamp"),
@@ -2009,26 +2017,21 @@ def get_live_status(charge_point_id: str):
             "derived": False
         }
 
-    # ===== 以下維持你原本邏輯（只在充電中才成立） =====
-    try:
-        if not live.get("estimated_amount"):
-            with get_conn() as conn:
-                cur = conn.cursor()
-                cur.execute("""
-                    SELECT transaction_id FROM transactions
-                    WHERE charge_point_id=? AND stop_timestamp IS NULL
-                    ORDER BY start_timestamp DESC LIMIT 1
-                """, (cp_id,))
-                row = cur.fetchone()
-                if row:
-                    tx_id = row[0]
-                    new_amount = _calculate_multi_period_cost(tx_id)
-                    if new_amount > 0:
-                        live["estimated_amount"] = round(new_amount, 2)
-                        _upsert_live(cp_id, estimated_amount=new_amount)
-    except Exception as e:
-        logging.warning(f"⚠️ 即時補算失敗: {e}")
+    # ⭐ 充電中但資料已過期 → 暫時視為 0（關鍵修正）
+    if is_stale:
+        return {
+            "timestamp": live.get("timestamp"),
+            "power": 0,
+            "voltage": 0,
+            "current": 0,
+            "energy": live.get("energy", 0),
+            "estimated_energy": live.get("estimated_energy", 0),
+            "estimated_amount": live.get("estimated_amount", 0),
+            "price_per_kwh": live.get("price_per_kwh", 0),
+            "derived": False
+        }
 
+    # ⭐ 充電中 + 資料新鮮 → 正常回傳
     return {
         "timestamp": live.get("timestamp"),
         "power": live.get("power", 0),
@@ -2040,6 +2043,7 @@ def get_live_status(charge_point_id: str):
         "price_per_kwh": live.get("price_per_kwh", 0),
         "derived": live.get("derived", False)
     }
+
 
 
 @app.get("/api/cards/{card_id}/history")
