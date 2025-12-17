@@ -1517,9 +1517,20 @@ async def stop_transaction_by_charge_point(charge_point_id: str):
     fut = loop.create_future()
     pending_stop_transactions[str(transaction_id)] = fut
 
-    print(f"🟢【API】發送 RemoteStopTransaction cp_id={cp_id} tx={transaction_id}")
-    req = call.RemoteStopTransactionPayload(transaction_id=transaction_id)
-    await cp.call(req)
+
+    # ⭐ 先鎖交易，避免 race condition / 重複停充
+    cursor.execute("""
+        UPDATE transactions
+        SET auto_stopped = 1
+        WHERE transaction_id = ?
+    """, (transaction_id,))
+    conn.commit()
+
+    print(f"🟢 [API] 發送 RemoteStopTransaction cp_id={cp_id} tx={transaction_id}")
+
+    # ⬇️ 下面才是真正送 RemoteStopTransaction
+    await charge_point.remote_stop_transaction(transaction_id)
+
 
     try:
         stop_result = await asyncio.wait_for(fut, timeout=10)
@@ -3768,11 +3779,29 @@ async def stop_transaction_by_charge_point(charge_point_id: str):
     with sqlite3.connect(DB_FILE) as conn:
         cursor = conn.cursor()
         cursor.execute("""
-            SELECT transaction_id FROM transactions
+            SELECT transaction_id, auto_stopped
+            FROM transactions
             WHERE charge_point_id = ? AND stop_timestamp IS NULL
             ORDER BY start_timestamp DESC LIMIT 1
-        """, (charge_point_id,))
+        """, (cp_id,))
         row = cursor.fetchone()
+
+        if not row:
+            print(f"⛔【STOP忽略】無進行中交易 cp_id={cp_id}")
+            return {"ok": True, "ignored": True, "reason": "no_active_transaction"}
+
+        transaction_id, auto_stopped = row
+
+        # ⭐⭐ 關鍵防線 ⭐⭐
+        if auto_stopped == 1:
+            print(f"⛔【STOP忽略】交易已自動停充過 tx={transaction_id}")
+            return {
+                "ok": True,
+                "ignored": True,
+                "reason": "already_auto_stopped",
+                "transaction_id": transaction_id
+            }
+
         if not row:
             print(f"🔴【API異常】無進行中交易 charge_point_id={charge_point_id}")
             raise HTTPException(status_code=400, detail="⚠️ 無進行中交易")
