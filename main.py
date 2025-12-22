@@ -2030,21 +2030,10 @@ def get_live_status(charge_point_id: str):
     if ts_dt:
         age_sec = (datetime.now(timezone.utc) - ts_dt).total_seconds()
         if age_sec > LIVE_TTL:
-            # 🔧 關鍵修復：cache 與回傳值都歸零
-            zero = {
-                "timestamp": ts,
-                "power": 0,
-                "voltage": 0,
-                "current": 0,
-                "energy": live.get("energy", 0),  # 累積電量保留
-                "estimated_energy": 0,
-                "estimated_amount": 0,
-                "price_per_kwh": live.get("price_per_kwh", 0),
-                "derived": True,
-            }
-            live_status_cache[cp_id] = zero
-            return zero
-
+        stale = dict(live)
+        stale["stale"] = True          # 告知前端：資料過期
+        stale["derived"] = True        # 非即時推導值
+        return stale
 
     return {
         "timestamp": live.get("timestamp"),
