@@ -1034,32 +1034,76 @@ class ChargePoint(OcppChargePoint):
                 ''', (cp_id, 0, transaction_id, 0.0,
                       "Energy.Active.Import.Register", "kWh", stop_ts))
 
-                # ====== ⭐ 新增：計算電量與扣款 ======
-                _cur.execute("SELECT id_tag, meter_start FROM transactions WHERE transaction_id=?", (transaction_id,))
+                # ====== ⭐ 修正：計算電量與扣款（StopTransaction 可能沒有 meter_stop） ======
+                _cur.execute(
+                    "SELECT id_tag, meter_start FROM transactions WHERE transaction_id=?",
+                    (transaction_id,)
+                )
                 row = _cur.fetchone()
                 if row:
                     id_tag, meter_start = row
+
+                    # 1) 先嘗試用 meter_stop/meter_start 直接算（若 meter_stop 缺失，這條通常會失敗或算出 0）
+                    used_kwh = 0.0
                     try:
-                        meter_start_val = float(meter_start or 0)
-                        meter_stop_val = float(meter_stop or 0)
-                        used_kwh = max(0.0, (meter_stop_val - meter_start_val) / 1000.0)
+                        meter_start_wh = float(meter_start or 0)
+                        if meter_stop is not None:
+                            meter_stop_wh = float(meter_stop or 0)
+                            used_kwh = max(0.0, (meter_stop_wh - meter_start_wh) / 1000.0)
                     except Exception:
                         used_kwh = 0.0
 
-                    # 查單價
+                    # 2) 若 meter_stop 缺失或算出 0，改用 DB 內最後一筆 Energy.Active.Import* 推算
+                    #    （避免模擬器關閉/斷線導致 meter_stop 沒送，扣款永遠 = 0）
+                    if used_kwh <= 0.0:
+                        try:
+                            _cur.execute("""
+                                SELECT value, unit, timestamp
+                                FROM meter_values
+                                WHERE transaction_id = ?
+                                  AND measurand LIKE 'Energy.Active.Import%'
+                                ORDER BY timestamp DESC
+                                LIMIT 1
+                            """, (transaction_id,))
+                            mv = _cur.fetchone()
+
+                            if mv:
+                                last_val, last_unit, last_ts = mv
+                                last_val = float(last_val or 0)
+
+                                # meter_values 的 value 可能是 kWh 或 Wh，統一轉成 kWh
+                                if last_unit and str(last_unit).lower() in ("wh", "w*h", "w_h"):
+                                    last_kwh = last_val / 1000.0
+                                else:
+                                    last_kwh = last_val
+
+                                meter_start_kwh = float(meter_start or 0) / 1000.0
+                                used_kwh = max(0.0, last_kwh - meter_start_kwh)
+
+                                logging.info(
+                                    f"🧾 StopTransaction 用 meter_values 推算用電量 | "
+                                    f"tx={transaction_id} | last={last_kwh} kWh | start={meter_start_kwh} kWh | used={used_kwh} kWh | ts={last_ts}"
+                                )
+                            else:
+                                logging.warning(
+                                    f"⚠️ StopTransaction 找不到 Energy.Active.Import* 量測資料 | tx={transaction_id}，used_kwh 仍為 0"
+                                )
+                        except Exception as e:
+                            logging.warning(f"⚠️ StopTransaction 由 meter_values 推算用電量失敗 | tx={transaction_id} | err={e}")
+
+                    # 3) 查單價（以 stop_ts 當下電價為準；若要更精準，多時段計算會覆蓋 total_amount）
                     unit_price = float(_price_for_timestamp(stop_ts)) if stop_ts else 6.0
                     total_amount = round(used_kwh * unit_price, 2)
 
-
-
-                    # 🧩 新增：若有多筆量測紀錄，改用分段計算
+                    # 4) 若有多筆量測紀錄，改用分段計算（有值才覆蓋）
                     try:
                         multi_period_amount = _calculate_multi_period_cost(transaction_id)
                         if multi_period_amount > 0:
-                            total_amount = multi_period_amount
-                            logging.info(f"🧮 多時段電價計算結果：{multi_period_amount} 元")
+                            total_amount = float(multi_period_amount)
+                            logging.info(f"🧮 多時段電價計算結果：{multi_period_amount} 元 | tx={transaction_id}")
                     except Exception as e:
-                        logging.warning(f"⚠️ 多時段電價計算失敗，改用單一電價：{e}")
+                        logging.warning(f"⚠️ 多時段電價計算失敗，改用單一電價 | tx={transaction_id} | err={e}")
+
 
 
 
