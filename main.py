@@ -780,8 +780,10 @@ class ChargePoint(OcppChargePoint):
         try:
             cp_id = getattr(self, "id", None)
 
-            logging.info(f"🟢【DEBUG】收到 StatusNotification | cp_id={cp_id} | kwargs={kwargs} | "
-                         f"connector_id={connector_id} | status={status} | error_code={error_code} | ts={timestamp}")
+            logging.info(
+                f"🟢【DEBUG】收到 StatusNotification | cp_id={cp_id} | kwargs={kwargs} | "
+                f"connector_id={connector_id} | status={status} | error_code={error_code} | ts={timestamp}"
+            )
 
             try:
                 connector_id = int(connector_id) if connector_id is not None else 0
@@ -793,17 +795,24 @@ class ChargePoint(OcppChargePoint):
             timestamp = timestamp or datetime.utcnow().isoformat()
 
             if cp_id is None or status is None:
-                logging.error(f"❌ 欄位遺失 | cp_id={cp_id} | connector_id={connector_id} | status={status}")
+                logging.error(
+                    f"❌ 欄位遺失 | cp_id={cp_id} | connector_id={connector_id} | status={status}"
+                )
                 return call_result.StatusNotificationPayload()
 
+            # === 紀錄狀態歷史 ===
             with sqlite3.connect(DB_FILE) as conn:
                 cursor = conn.cursor()
-                cursor.execute('''
+                cursor.execute(
+                    '''
                     INSERT INTO status_logs (charge_point_id, connector_id, status, timestamp)
                     VALUES (?, ?, ?, ?)
-                ''', (cp_id, connector_id, status, timestamp))
+                    ''',
+                    (cp_id, connector_id, status, timestamp)
+                )
                 conn.commit()
 
+            # === 更新即時狀態 ===
             charging_point_status[cp_id] = {
                 "connector_id": connector_id,
                 "status": status,
@@ -811,47 +820,18 @@ class ChargePoint(OcppChargePoint):
                 "error_code": error_code
             }
 
-            logging.info(f"📡 StatusNotification | CP={cp_id} | connector={connector_id} | errorCode={error_code} | status={status}")
+            logging.info(
+                f"📡 StatusNotification | CP={cp_id} | connector={connector_id} | "
+                f"errorCode={error_code} | status={status}"
+            )
 
-            # ⭐ 當狀態切換成 Available，清空快取並補 0 到 DB
+            # ⭐ 修正重點：
+            # StatusNotification 僅更新「狀態」，不再清除 live_status_cache
             if status == "Available":
-                # ✅ 先確認是否仍有進行中交易
-                with sqlite3.connect(DB_FILE) as _conn_check:
-                    _cur_check = _conn_check.cursor()
-                    _cur_check.execute("""
-                        SELECT COUNT(*) FROM transactions
-                        WHERE charge_point_id = ? AND stop_timestamp IS NULL
-                    """, (cp_id,))
-                    active_tx = _cur_check.fetchone()[0]
-
-                if active_tx > 0:
-                    logging.warning(f"⚠️ 忽略不合理的 Available 狀態（仍有交易進行中）| CP={cp_id}")
-                    return call_result.StatusNotificationPayload()
-
-                # ✅ 沒有交易才真的清除
-                logging.debug(f"🔍 [DEBUG] Status=Available 前快取: {live_status_cache.get(cp_id)}")
-                live_status_cache[cp_id] = {
-                    "power": 0,
-                    "voltage": 0,
-                    "current": 0,
-                    "energy": 0,
-                    "estimated_energy": 0,
-                    "estimated_amount": 0,
-                    "price_per_kwh": 0,
-                    "timestamp": datetime.utcnow().isoformat()
-                }
-                with sqlite3.connect(DB_FILE) as _c:
-                    _cur = _c.cursor()
-                    _cur.execute('''
-                        INSERT INTO meter_values (charge_point_id, connector_id, transaction_id,
-                                                  value, measurand, unit, timestamp)
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
-                    ''', (cp_id, connector_id, None, 0.0,
-                          "Energy.Active.Import.Register", "kWh", datetime.utcnow().isoformat()))
-                    _c.commit()
-
-
-                logging.debug(f"🔍 [DEBUG] Status=Available 後快取: {live_status_cache.get(cp_id)}")
+                logging.info(
+                    f"ℹ️ StatusNotification=Available | CP={cp_id} | "
+                    f"僅更新狀態，不清除 live_status_cache"
+                )
 
             return call_result.StatusNotificationPayload()
 
@@ -1269,6 +1249,7 @@ class ChargePoint(OcppChargePoint):
 
                                 _upsert_live(
                                     cp_id,
+                                    energy=round(used_kwh, 6),
                                     estimated_energy=round(used_kwh, 6),
                                     estimated_amount=round(total, 2),
                                     price_per_kwh=price,
@@ -1990,8 +1971,8 @@ def get_live_status(charge_point_id: str):
     cp_id = _normalize_cp_id(charge_point_id)
     live = live_status_cache.get(cp_id)
 
-    # 完全沒有 live cache → 回傳全 0（不要補算）
-    if not live:
+    # 只有在「完全沒有 key」時，才回傳全 0
+    if live is None:
         return {
             "timestamp": None,
             "power": 0,
