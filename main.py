@@ -1966,12 +1966,18 @@ def get_current_transaction(charge_point_id: str):
         }
 
 
+from datetime import datetime, timezone
+
+# 若原本沒有，請在檔案上方加上
+# LIVE_TTL = 15  # seconds
+
+
 @app.get("/api/charge-points/{charge_point_id}/live-status")
 def get_live_status(charge_point_id: str):
     cp_id = _normalize_cp_id(charge_point_id)
     live = live_status_cache.get(cp_id)
 
-    # 只有在「完全沒有 key」時，才回傳全 0
+
     if live is None:
         return {
             "timestamp": None,
@@ -1985,6 +1991,32 @@ def get_live_status(charge_point_id: str):
             "derived": False,
         }
 
+
+    ts = live.get("timestamp")
+    try:
+        ts_dt = datetime.fromisoformat(ts.replace("Z", "+00:00")) if ts else None
+    except Exception:
+        ts_dt = None
+
+    if ts_dt:
+        age_sec = (datetime.now(timezone.utc) - ts_dt).total_seconds()
+        if age_sec > LIVE_TTL:
+            # 🔧 關鍵修復：cache 與回傳值都歸零
+            zero = {
+                "timestamp": ts,
+                "power": 0,
+                "voltage": 0,
+                "current": 0,
+                "energy": live.get("energy", 0),  # 累積電量保留
+                "estimated_energy": 0,
+                "estimated_amount": 0,
+                "price_per_kwh": live.get("price_per_kwh", 0),
+                "derived": True,
+            }
+            live_status_cache[cp_id] = zero
+            return zero
+
+
     return {
         "timestamp": live.get("timestamp"),
         "power": live.get("power", 0),
@@ -1996,6 +2028,7 @@ def get_live_status(charge_point_id: str):
         "price_per_kwh": live.get("price_per_kwh", 0),
         "derived": live.get("derived", False),
     }
+
 
 
 
