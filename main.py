@@ -3974,10 +3974,9 @@ def debug_price():
 
 
 
-# ✅ 除錯用：查詢目前資料庫中尚未結束的交易紀錄
+# ✅ 除錯用：查詢目前資料庫中尚未結束的交易紀錄（保留，無問題）
 @app.get("/api/debug/active-transactions")
 def get_active_transactions():
-    import sqlite3
     try:
         with sqlite3.connect(DB_FILE) as conn:
             cur = conn.cursor()
@@ -3988,6 +3987,7 @@ def get_active_transactions():
                 LIMIT 10
             """)
             rows = cur.fetchall()
+
         result = [
             {
                 "transaction_id": r[0],
@@ -4007,22 +4007,63 @@ def get_active_transactions():
         return {"error": str(e)}
 
 
-import asyncio
+# ======================================================
+# 🔒 內部用：安全停止交易（❗ 不可當 API 使用）
+# ======================================================
+async def _force_stop_transaction_internal(cp_id: str):
+    """
+    只供後端 background task 使用
+    CP 不在線 → 直接跳過（避免狀態錯亂）
+    """
+    cp = connected_charge_points.get(cp_id)
+    if not cp:
+        # CP 已離線（例如模擬器關閉），不要亂停
+        return False
 
+    # 找出進行中的交易
+    with sqlite3.connect(DB_FILE) as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT transaction_id
+            FROM transactions
+            WHERE charge_point_id = ?
+              AND stop_timestamp IS NULL
+            ORDER BY start_timestamp DESC
+            LIMIT 1
+        """, (cp_id,))
+        row = cur.fetchone()
+
+    if not row:
+        return False
+
+    transaction_id = row[0]
+
+    try:
+        req = call.RemoteStopTransactionPayload(transaction_id=transaction_id)
+        await cp.call(req)
+        print(f"🟢 [AutoStop] 已發送 RemoteStopTransaction | cp_id={cp_id}, tx={transaction_id}")
+        return True
+    except Exception as e:
+        print(f"❌ [AutoStop] 停止失敗 cp_id={cp_id} | {e}")
+        return False
+
+
+# ======================================================
+# 🧠 Background Task：餘額監控 → 自動停充（安全版）
+# ======================================================
 async def monitor_balance_and_auto_stop():
     """
-    後端監控任務：每 5 秒檢查所有進行中交易，
-    若發現卡片餘額 <= 0，自動呼叫停止充電 API。
+    每 5 秒檢查進行中交易
+    餘額 <= 0 → 嘗試安全停止（僅限 CP 在線）
     """
     while True:
         try:
             with get_conn() as conn:
                 cur = conn.cursor()
-                # 找出所有進行中交易
                 cur.execute("""
-                    SELECT t.charge_point_id, t.id_tag
-                    FROM transactions t
-                    WHERE t.stop_timestamp IS NULL
+                    SELECT charge_point_id, id_tag
+                    FROM transactions
+                    WHERE stop_timestamp IS NULL
                 """)
                 active_tx = cur.fetchall()
 
@@ -4030,7 +4071,10 @@ async def monitor_balance_and_auto_stop():
                 # 查詢卡片餘額
                 with get_conn() as conn:
                     c2 = conn.cursor()
-                    c2.execute("SELECT balance FROM cards WHERE card_id=?", (id_tag,))
+                    c2.execute(
+                        "SELECT balance FROM cards WHERE card_id=?",
+                        (id_tag,)
+                    )
                     row = c2.fetchone()
 
                 if not row:
@@ -4038,16 +4082,15 @@ async def monitor_balance_and_auto_stop():
 
                 balance = float(row[0] or 0)
                 if balance <= 0:
-                    print(f"⚠️ [自動停充監控] {cp_id} 餘額={balance}，執行停止命令")
-                    try:
-                        await stop_transaction_by_charge_point(cp_id)
-                    except Exception as e:
-                        print(f"❌ [自動停充監控] 無法停止 {cp_id}: {e}")
+                    print(f"⚠️ [AutoStop監控] cp_id={cp_id} | 餘額={balance}")
+                    await _force_stop_transaction_internal(cp_id)
+
             await asyncio.sleep(5)
 
         except Exception as e:
-            print(f"❌ [監控例外] {e}")
+            print(f"❌ [AutoStop監控例外] {e}")
             await asyncio.sleep(10)
+
 
 
 # 啟動背景任務
