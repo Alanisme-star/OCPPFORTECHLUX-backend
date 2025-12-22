@@ -1026,13 +1026,7 @@ class ChargePoint(OcppChargePoint):
                     WHERE transaction_id = ?
                 ''', (meter_stop, stop_ts, reason, transaction_id))
 
-                # → 補一筆 0 kWh 到 DB
-                _cur.execute('''
-                    INSERT INTO meter_values (charge_point_id, connector_id, transaction_id,
-                                              value, measurand, unit, timestamp)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                ''', (cp_id, 0, transaction_id, 0.0,
-                      "Energy.Active.Import.Register", "kWh", stop_ts))
+
 
                 # ====== ⭐ 修正：計算電量與扣款（StopTransaction 可能沒有 meter_stop） ======
                 _cur.execute(
