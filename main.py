@@ -1490,6 +1490,17 @@ async def stop_transaction_by_charge_point(charge_point_id: str):
         transaction_id = int(row[0])
         print(f"🟢【API】找到進行中交易 transaction_id={transaction_id}")
 
+        # ---------- ⭐ ②-1 交易級防護：已在 stop 流程中 ----------
+        if str(transaction_id) in pending_stop_transactions:
+            print(f"⛔【STOP忽略】交易已在停止流程中 tx={transaction_id}")
+            _recent_stop_requests[cp_id] = now
+            return {
+                "ok": True,
+                "ignored": True,
+                "reason": "transaction_already_stopping",
+                "transaction_id": transaction_id
+            }
+
     # ---------- ⭐ ③ 記錄 stop 已送（關鍵） ----------
     _recent_stop_requests[cp_id] = now
 
@@ -1519,6 +1530,7 @@ async def stop_transaction_by_charge_point(charge_point_id: str):
 
     finally:
         pending_stop_transactions.pop(str(transaction_id), None)
+
 
 
 
