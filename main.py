@@ -2030,10 +2030,10 @@ def get_live_status(charge_point_id: str):
     if ts_dt:
         age_sec = (datetime.now(timezone.utc) - ts_dt).total_seconds()
         if age_sec > LIVE_TTL:
-        stale = dict(live)
-        stale["stale"] = True          # 告知前端：資料過期
-        stale["derived"] = True        # 非即時推導值
-        return stale
+            stale = dict(live)
+            stale["stale"] = True          # 告知前端：資料過期
+            stale["derived"] = True        # 非即時推導值
+            return stale
 
     return {
         "timestamp": live.get("timestamp"),
