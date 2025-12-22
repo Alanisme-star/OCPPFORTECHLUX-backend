@@ -1084,8 +1084,19 @@ class ChargePoint(OcppChargePoint):
                 _conn.commit()
                 # ====== ⭐ 新增結束 ======
 
-            # ⭐ 清除快取
+            # ⭐ 清除即時量測，但保留「扣款後餘額基準」
             logging.debug(f"🔍 [DEBUG] StopTransaction 前快取: {live_status_cache.get(cp_id)}")
+
+            # 讀取最新扣款後餘額（確保與 DB 同步）
+            final_balance = None
+            try:
+                _cur.execute("SELECT balance FROM cards WHERE card_id=?", (id_tag,))
+                row_bal = _cur.fetchone()
+                if row_bal:
+                    final_balance = float(row_bal[0])
+            except Exception as e:
+                logging.warning(f"⚠️ 無法同步卡片餘額到 live cache: {e}")
+
             live_status_cache[cp_id] = {
                 "power": 0,
                 "voltage": 0,
@@ -1094,9 +1105,15 @@ class ChargePoint(OcppChargePoint):
                 "estimated_energy": 0,
                 "estimated_amount": 0,
                 "price_per_kwh": 0,
-                "timestamp": datetime.utcnow().isoformat()
+                "timestamp": datetime.utcnow().isoformat(),
+
+                # ✅ 關鍵新增（不影響既有 API）
+                "last_balance": final_balance,
+                "last_deducted_amount": total_amount
             }
+
             logging.debug(f"🔍 [DEBUG] StopTransaction 後快取: {live_status_cache.get(cp_id)}")
+
 
 
 
