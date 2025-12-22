@@ -1985,38 +1985,24 @@ def get_current_transaction(charge_point_id: str):
         }
 
 
-
-
 @app.get("/api/charge-points/{charge_point_id}/live-status")
 def get_live_status(charge_point_id: str):
-    """
-    強化版：即使 live_status_cache 暫時沒有 estimated_amount，也會自動從 DB 補算跨時段電價。
-    """
     cp_id = _normalize_cp_id(charge_point_id)
-    live = live_status_cache.get(cp_id, {})
+    live = live_status_cache.get(cp_id)
 
-    try:
-        # 若預估電費遺失或為 0，則從 DB 補算一次
-        if not live.get("estimated_amount"):
-            with get_conn() as conn:
-                cur = conn.cursor()
-                cur.execute("""
-                    SELECT transaction_id FROM transactions
-                    WHERE charge_point_id=? AND stop_timestamp IS NULL
-                    ORDER BY start_timestamp DESC LIMIT 1
-                """, (cp_id,))
-                row = cur.fetchone()
-                if row:
-                    tx_id = row[0]
-                    new_amount = _calculate_multi_period_cost(tx_id)
-                    if new_amount > 0:
-                        live["estimated_amount"] = round(new_amount, 2)
-                        _upsert_live(cp_id, estimated_amount=new_amount)
-                        logging.info(f"🧮 即時補算電費 | CP={cp_id} | tx={tx_id} | 金額={new_amount}")
-    except Exception as e:
-        logging.warning(f"⚠️ 即時補算失敗: {e}")
-
-    logging.debug(f"🔍 [DEBUG] live-status 回傳 | CP={cp_id} | data={live}")
+    # 完全沒有 live cache → 回傳全 0（不要補算）
+    if not live:
+        return {
+            "timestamp": None,
+            "power": 0,
+            "voltage": 0,
+            "current": 0,
+            "energy": 0,
+            "estimated_energy": 0,
+            "estimated_amount": 0,
+            "price_per_kwh": 0,
+            "derived": False,
+        }
 
     return {
         "timestamp": live.get("timestamp"),
@@ -2027,8 +2013,11 @@ def get_live_status(charge_point_id: str):
         "estimated_energy": live.get("estimated_energy", 0),
         "estimated_amount": live.get("estimated_amount", 0),
         "price_per_kwh": live.get("price_per_kwh", 0),
-        "derived": live.get("derived", False)
+        "derived": live.get("derived", False),
     }
+
+
+
 
 
 @app.get("/api/cards/{card_id}/history")
@@ -3733,13 +3722,6 @@ async def stop_transaction(charge_point_id: str):
 
     await cp.call(Action.RemoteStopTransaction, RemoteStopTransactionPayload(transactionId=tx_id))
     return {"message": f"✅ 已送出停止指令給 {charge_point_id}"}
-
-
-
-
-
-
-
 
 
 
