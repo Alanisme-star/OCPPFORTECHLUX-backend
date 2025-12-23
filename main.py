@@ -983,8 +983,11 @@ class ChargePoint(OcppChargePoint):
                 "estimated_energy": 0,
                 "estimated_amount": 0,
                 "price_per_kwh": 0,
-                "timestamp": datetime.utcnow().isoformat()
+                "timestamp": datetime.utcnow().replace(tzinfo=timezone.utc).isoformat(),
+                "derived": False,
+                "stale": False,
             }
+
             logging.debug(f"🔄 [DEBUG] live_status_cache reset at StartTransaction | CP={self.id} | cache={live_status_cache[self.id]}")
 
             return call_result.StartTransactionPayload(
@@ -1990,20 +1993,24 @@ def get_live_status(charge_point_id: str):
     if ts_dt:
         age_sec = (datetime.now(timezone.utc) - ts_dt).total_seconds()
         if age_sec > LIVE_TTL:
-            # 🔧 關鍵修復：cache 與回傳值都歸零
-            zero = {
+            stale = {
                 "timestamp": ts,
                 "power": 0,
                 "voltage": 0,
                 "current": 0,
-                "energy": live.get("energy", 0),  # 累積電量保留
-                "estimated_energy": 0,
-                "estimated_amount": 0,
+
+                # ✅ 關鍵：保留停電當下的金額與電量
+                "energy": live.get("energy", 0),
+                "estimated_energy": live.get("estimated_energy", 0),
+                "estimated_amount": live.get("estimated_amount", 0),
                 "price_per_kwh": live.get("price_per_kwh", 0),
+
                 "derived": True,
+                "stale": True,
             }
-            live_status_cache[cp_id] = zero
-            return zero
+            live_status_cache[cp_id] = stale
+            return stale
+
 
 
     return {
