@@ -1001,7 +1001,9 @@ class ChargePoint(OcppChargePoint):
             transaction_id = str(kwargs.get("transaction_id") or kwargs.get("transactionId"))
             meter_stop = kwargs.get("meter_stop")
             raw_ts = kwargs.get("timestamp")
+            reason = kwargs.get("reason")
 
+            # === 確保 stop timestamp ===
             try:
                 if raw_ts:
                     stop_ts = datetime.fromisoformat(raw_ts).astimezone(timezone.utc).isoformat()
@@ -1010,97 +1012,115 @@ class ChargePoint(OcppChargePoint):
             except Exception:
                 stop_ts = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
 
-            reason = kwargs.get("reason")
-
             with sqlite3.connect(DB_FILE) as _conn:
                 _cur = _conn.cursor()
 
-                # 更新 stop_transactions & transactions
-                _cur.execute('''
+                # === 記錄 StopTransaction ===
+                _cur.execute("""
                     INSERT INTO stop_transactions (transaction_id, meter_stop, timestamp, reason)
                     VALUES (?, ?, ?, ?)
-                ''', (transaction_id, meter_stop, stop_ts, reason))
-                _cur.execute('''
+                """, (transaction_id, meter_stop, stop_ts, reason))
+
+                _cur.execute("""
                     UPDATE transactions
                     SET meter_stop = ?, stop_timestamp = ?, reason = ?
                     WHERE transaction_id = ?
-                ''', (meter_stop, stop_ts, reason, transaction_id))
+                """, (meter_stop, stop_ts, reason, transaction_id))
 
-                # → 補一筆 0 kWh 到 DB
-                _cur.execute('''
-                    INSERT INTO meter_values (charge_point_id, connector_id, transaction_id,
-                                              value, measurand, unit, timestamp)
+                # === 補一筆結尾能量紀錄（避免能量斷層）===
+                _cur.execute("""
+                    INSERT INTO meter_values (
+                        charge_point_id, connector_id, transaction_id,
+                        value, measurand, unit, timestamp
+                    )
                     VALUES (?, ?, ?, ?, ?, ?, ?)
-                ''', (cp_id, 0, transaction_id, 0.0,
-                      "Energy.Active.Import.Register", "kWh", stop_ts))
+                """, (
+                    cp_id, 0, transaction_id,
+                    0.0, "Energy.Active.Import.Register", "kWh", stop_ts
+                ))
 
-                # ====== ⭐ 新增：計算電量與扣款 ======
-                _cur.execute("SELECT id_tag, meter_start FROM transactions WHERE transaction_id=?", (transaction_id,))
+                # === 扣款計算 ===
+                _cur.execute("""
+                    SELECT id_tag, meter_start
+                    FROM transactions
+                    WHERE transaction_id = ?
+                """, (transaction_id,))
                 row = _cur.fetchone()
+
                 if row:
                     id_tag, meter_start = row
+
                     try:
-                        meter_start_val = float(meter_start or 0)
-                        meter_stop_val = float(meter_stop or 0)
-                        used_kwh = max(0.0, (meter_stop_val - meter_start_val) / 1000.0)
+                        used_kwh = max(
+                            0.0,
+                            (float(meter_stop or 0) - float(meter_start or 0)) / 1000.0
+                        )
                     except Exception:
                         used_kwh = 0.0
 
-                    # 查單價
-                    unit_price = float(_price_for_timestamp(stop_ts)) if stop_ts else 6.0
+                    # 單價（預設）
+                    unit_price = float(_price_for_timestamp(stop_ts))
                     total_amount = round(used_kwh * unit_price, 2)
 
-
-
-                    # 🧩 新增：若有多筆量測紀錄，改用分段計算
+                    # 多時段電價（若有）
                     try:
-                        multi_period_amount = _calculate_multi_period_cost(transaction_id)
-                        if multi_period_amount > 0:
-                            total_amount = multi_period_amount
-                            logging.info(f"🧮 多時段電價計算結果：{multi_period_amount} 元")
+                        mp_amount = _calculate_multi_period_cost(transaction_id)
+                        if mp_amount > 0:
+                            total_amount = mp_amount
+                            logging.info(f"🧮 多時段電價計算結果：{mp_amount}")
                     except Exception as e:
-                        logging.warning(f"⚠️ 多時段電價計算失敗，改用單一電價：{e}")
-
-
-
-
-
+                        logging.warning(f"⚠️ 多時段電價計算失敗：{e}")
 
                     # 更新卡片餘額
-                    _cur.execute("SELECT balance FROM cards WHERE card_id=?", (id_tag,))
-                    card_row = _cur.fetchone()
-                    if card_row:
-                        old_balance = float(card_row[0] or 0)
+                    _cur.execute("SELECT balance FROM cards WHERE card_id = ?", (id_tag,))
+                    card = _cur.fetchone()
+                    if card:
+                        old_balance = float(card[0] or 0)
                         new_balance = max(0.0, old_balance - total_amount)
-                        _cur.execute("UPDATE cards SET balance=? WHERE card_id=?", (new_balance, id_tag))
-                        logging.info(f"💳 卡片扣款完成 | idTag={id_tag} | 扣款={total_amount} | 原餘額={old_balance} → 新餘額={new_balance}")
+                        _cur.execute(
+                            "UPDATE cards SET balance = ? WHERE card_id = ?",
+                            (new_balance, id_tag)
+                        )
+                        logging.info(
+                            f"💳 卡片扣款完成 | idTag={id_tag} | "
+                            f"{old_balance} → {new_balance} (-{total_amount})"
+                        )
 
-                    # 記錄付款紀錄
-                    _cur.execute('''
-                        INSERT INTO payments (transaction_id, base_fee, energy_fee, overuse_fee, total_amount, paid_at)
+                    # 紀錄付款
+                    _cur.execute("""
+                        INSERT INTO payments (
+                            transaction_id, base_fee, energy_fee,
+                            overuse_fee, total_amount, paid_at
+                        )
                         VALUES (?, ?, ?, ?, ?, ?)
-                    ''', (transaction_id, 0.0, total_amount, 0.0, total_amount, stop_ts))
+                    """, (
+                        transaction_id, 0.0, total_amount,
+                        0.0, total_amount, stop_ts
+                    ))
 
                 _conn.commit()
-                # ====== ⭐ 新增結束 ======
 
-            # ⭐ 清除快取
-            logging.debug(f"🔍 [DEBUG] StopTransaction 前快取: {live_status_cache.get(cp_id)}")
+            # ==================================================
+            # ⭐ 關鍵修正：只清「即時量測」，保留「結算結果」
+            # ==================================================
+            prev = live_status_cache.get(cp_id, {})
+
             live_status_cache[cp_id] = {
                 "power": 0,
                 "voltage": 0,
                 "current": 0,
-                "energy": 0,
-                "estimated_energy": 0,
-                "estimated_amount": 0,
-                "price_per_kwh": 0,
-                "timestamp": datetime.utcnow().isoformat()
+
+                # ✅ 保留最後結算數值（避免餘額假象）
+                "energy": prev.get("energy", 0),
+                "estimated_energy": prev.get("estimated_energy", 0),
+                "estimated_amount": prev.get("estimated_amount", 0),
+                "price_per_kwh": prev.get("price_per_kwh", 0),
+
+                "timestamp": datetime.utcnow().replace(tzinfo=timezone.utc).isoformat(),
+                "derived": True
             }
-            logging.debug(f"🔍 [DEBUG] StopTransaction 後快取: {live_status_cache.get(cp_id)}")
 
-
-
-            # ✅ 新增：若有等待中的 fut，通知 /api/stop
+            # === 通知等待中的 API（/api/stop）===
             fut = pending_stop_transactions.get(str(transaction_id))
             if fut and not fut.done():
                 fut.set_result({
@@ -1109,9 +1129,6 @@ class ChargePoint(OcppChargePoint):
                     "timestamp": stop_ts,
                     "reason": reason
                 })
-                logging.info(f"🔔 已通知等待中的 StopTransaction Future | tx={transaction_id}")
-
-
 
             return call_result.StopTransactionPayload()
 
