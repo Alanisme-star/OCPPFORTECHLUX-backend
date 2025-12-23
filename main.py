@@ -1113,8 +1113,6 @@ class ChargePoint(OcppChargePoint):
 
 
 
-
-
             return call_result.StopTransactionPayload()
 
         except Exception as e:
