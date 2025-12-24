@@ -1390,41 +1390,30 @@ def force_add_charge_point(
 
 
 # ------------------------------------------------------------
-# ⭐ 當充電樁（或模擬器）斷線時，更新狀態為 Available
+# ✅ 修正版：充電樁斷線時，不主動改寫交易狀態
 # ------------------------------------------------------------
 async def on_disconnect(self, websocket, close_code):
     try:
-        # 嘗試從 websocket 物件中取得充電樁 ID
         cp_id = getattr(websocket, "cp_id", None)
-        if cp_id:
-            # 從已連線清單中移除
-            connected_charge_points.pop(cp_id, None)
-            logging.warning(f"⚠️ 充電樁已斷線: {cp_id}")
 
-            # ✅ 僅在沒有進行中交易時才更新為 Available
-            with sqlite3.connect(DB_FILE, timeout=15) as conn:
-                cur = conn.cursor()
-                cur.execute("""
-                    SELECT COUNT(*) FROM transactions
-                    WHERE charge_point_id = ? AND stop_timestamp IS NULL
-                """, (cp_id,))
-                active_tx = cur.fetchone()[0]
+        if not cp_id:
+            logging.warning("⚠️ on_disconnect：無法取得 cp_id")
+            return
 
-                if active_tx == 0:
-                    cur.execute("""
-                        UPDATE charge_points
-                        SET status = 'Available'
-                        WHERE charge_point_id = ?
-                    """, (cp_id,))
-                    conn.commit()
-                    logging.info(f"✅ 已將 {cp_id} 狀態更新為 Available（無進行中交易）")
-                else:
-                    logging.warning(f"⚠️ 忽略斷線狀態更新：{cp_id} 仍有 {active_tx} 筆交易進行中")
+        # 僅移除連線控制權，不代表交易結束
+        connected_charge_points.pop(cp_id, None)
 
-        else:
-            logging.warning("⚠️ 無法辨識斷線的充電樁 ID")
+        logging.warning(
+            f"⚠️ 充電樁斷線 | cp_id={cp_id} | "
+            f"保持原有交易狀態，等待重連或 StopTransaction"
+        )
+
+        # ❗❗ 重要原則：
+        # WebSocket 斷線 ≠ 交易結束
+        # 狀態只允許由 StopTransaction / StatusNotification 結束
+
     except Exception as e:
-        logging.error(f"❌ on_disconnect 更新狀態時發生錯誤: {e}")
+        logging.error(f"❌ on_disconnect 發生例外: {e}")
 
 
 from fastapi import Body
