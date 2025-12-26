@@ -1008,105 +1008,133 @@ class ChargePoint(OcppChargePoint):
 
         transaction_id = kwargs.get("transaction_id")
         meter_stop = kwargs.get("meter_stop")
-        timestamp = kwargs.get("timestamp")
+        raw_ts = kwargs.get("timestamp")
         reason = kwargs.get("reason")
 
-            # === 確保 stop timestamp ===
-            try:
-                if raw_ts:
-                    stop_ts = datetime.fromisoformat(raw_ts).astimezone(timezone.utc).isoformat()
-                else:
-                    raise ValueError("Empty timestamp")
-            except Exception:
-                stop_ts = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
+        # === 確保 stop timestamp ===
+        try:
+            if raw_ts:
+                stop_ts = datetime.fromisoformat(raw_ts).astimezone(timezone.utc).isoformat()
+            else:
+                raise ValueError("Empty timestamp")
+        except Exception:
+            stop_ts = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
 
-            with sqlite3.connect(DB_FILE) as _conn:
-                _cur = _conn.cursor()
+        with sqlite3.connect(DB_FILE) as _conn:
+            _cur = _conn.cursor()
 
-                # === 記錄 StopTransaction ===
-                _cur.execute("""
-                    INSERT INTO stop_transactions (transaction_id, meter_stop, timestamp, reason)
-                    VALUES (?, ?, ?, ?)
-                """, (transaction_id, meter_stop, stop_ts, reason))
+            # === 記錄 StopTransaction ===
+            _cur.execute(
+                """
+                INSERT INTO stop_transactions (transaction_id, meter_stop, timestamp, reason)
+                VALUES (?, ?, ?, ?)
+                """,
+                (transaction_id, meter_stop, stop_ts, reason),
+            )
 
-                _cur.execute("""
-                    UPDATE transactions
-                    SET meter_stop = ?, stop_timestamp = ?, reason = ?
-                    WHERE transaction_id = ?
-                """, (meter_stop, stop_ts, reason, transaction_id))
+            _cur.execute(
+                """
+                UPDATE transactions
+                SET meter_stop = ?, stop_timestamp = ?, reason = ?
+                WHERE transaction_id = ?
+                """,
+                (meter_stop, stop_ts, reason, transaction_id),
+            )
 
-                # === 補一筆結尾能量紀錄（避免能量斷層）===
-                _cur.execute("""
-                    INSERT INTO meter_values (
-                        charge_point_id, connector_id, transaction_id,
-                        value, measurand, unit, timestamp
+            # === 補一筆結尾能量紀錄（避免能量斷層）===
+            _cur.execute(
+                """
+                INSERT INTO meter_values (
+                    charge_point_id, connector_id, transaction_id,
+                    value, measurand, unit, timestamp
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    cp_id,
+                    0,
+                    transaction_id,
+                    0.0,
+                    "Energy.Active.Import.Register",
+                    "kWh",
+                    stop_ts,
+                ),
+            )
+
+            # === 扣款計算 ===
+            _cur.execute(
+                """
+                SELECT id_tag, meter_start
+                FROM transactions
+                WHERE transaction_id = ?
+                """,
+                (transaction_id,),
+            )
+            row = _cur.fetchone()
+
+            if row:
+                id_tag, meter_start = row
+
+                try:
+                    used_kwh = max(
+                        0.0,
+                        (float(meter_stop or 0) - float(meter_start or 0)) / 1000.0
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    cp_id, 0, transaction_id,
-                    0.0, "Energy.Active.Import.Register", "kWh", stop_ts
-                ))
+                except Exception:
+                    used_kwh = 0.0
 
-                # === 扣款計算 ===
-                _cur.execute("""
-                    SELECT id_tag, meter_start
-                    FROM transactions
-                    WHERE transaction_id = ?
-                """, (transaction_id,))
-                row = _cur.fetchone()
+                # 單價（預設）
+                unit_price = float(_price_for_timestamp(stop_ts))
+                total_amount = round(used_kwh * unit_price, 2)
 
-                if row:
-                    id_tag, meter_start = row
+                # 多時段電價（若有）
+                try:
+                    mp_amount = _calculate_multi_period_cost(transaction_id)
+                    if mp_amount > 0:
+                        total_amount = mp_amount
+                        logging.info(f"🧮 多時段電價計算結果：{mp_amount}")
+                except Exception as e:
+                    logging.warning(f"⚠️ 多時段電價計算失敗：{e}")
 
-                    try:
-                        used_kwh = max(
-                            0.0,
-                            (float(meter_stop or 0) - float(meter_start or 0)) / 1000.0
-                        )
-                    except Exception:
-                        used_kwh = 0.0
+                # 更新卡片餘額
+                _cur.execute(
+                    "SELECT balance FROM cards WHERE card_id = ?",
+                    (id_tag,),
+                )
+                card = _cur.fetchone()
+                if card:
+                    old_balance = float(card[0] or 0)
+                    new_balance = max(0.0, old_balance - total_amount)
+                    _cur.execute(
+                        "UPDATE cards SET balance = ? WHERE card_id = ?",
+                        (new_balance, id_tag),
+                    )
+                    logging.info(
+                        f"💳 卡片扣款完成 | idTag={id_tag} | "
+                        f"{old_balance} → {new_balance} (-{total_amount})"
+                    )
 
-                    # 單價（預設）
-                    unit_price = float(_price_for_timestamp(stop_ts))
-                    total_amount = round(used_kwh * unit_price, 2)
+                # 紀錄付款
+                _cur.execute(
+                    """
+                    INSERT INTO payments (
+                        transaction_id, base_fee, energy_fee,
+                        overuse_fee, total_amount, paid_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        transaction_id,
+                        0.0,
+                        total_amount,
+                        0.0,
+                        total_amount,
+                        stop_ts,
+                    ),
+                )
 
-                    # 多時段電價（若有）
-                    try:
-                        mp_amount = _calculate_multi_period_cost(transaction_id)
-                        if mp_amount > 0:
-                            total_amount = mp_amount
-                            logging.info(f"🧮 多時段電價計算結果：{mp_amount}")
-                    except Exception as e:
-                        logging.warning(f"⚠️ 多時段電價計算失敗：{e}")
+            _conn.commit()
 
-                    # 更新卡片餘額
-                    _cur.execute("SELECT balance FROM cards WHERE card_id = ?", (id_tag,))
-                    card = _cur.fetchone()
-                    if card:
-                        old_balance = float(card[0] or 0)
-                        new_balance = max(0.0, old_balance - total_amount)
-                        _cur.execute(
-                            "UPDATE cards SET balance = ? WHERE card_id = ?",
-                            (new_balance, id_tag)
-                        )
-                        logging.info(
-                            f"💳 卡片扣款完成 | idTag={id_tag} | "
-                            f"{old_balance} → {new_balance} (-{total_amount})"
-                        )
-
-                    # 紀錄付款
-                    _cur.execute("""
-                        INSERT INTO payments (
-                            transaction_id, base_fee, energy_fee,
-                            overuse_fee, total_amount, paid_at
-                        )
-                        VALUES (?, ?, ?, ?, ?, ?)
-                    """, (
-                        transaction_id, 0.0, total_amount,
-                        0.0, total_amount, stop_ts
-                    ))
-
-                _conn.commit()
 
             # ==================================================
             # ⭐ 關鍵修正：只清「即時量測」，保留「結算結果」
