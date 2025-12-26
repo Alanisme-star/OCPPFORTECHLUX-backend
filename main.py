@@ -996,7 +996,6 @@ class ChargePoint(OcppChargePoint):
             )
 
 
-
     @on(Action.StopTransaction)
     async def on_stop_transaction(self, **kwargs):
         cp_id = getattr(self, "id", None)
@@ -1134,6 +1133,9 @@ class ChargePoint(OcppChargePoint):
                 )
 
             _conn.commit()
+
+        return call_result.StopTransactionPayload()
+
 
 
             # ==================================================
