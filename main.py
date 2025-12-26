@@ -999,16 +999,17 @@ class ChargePoint(OcppChargePoint):
 
     @on(Action.StopTransaction)
     async def on_stop_transaction(self, **kwargs):
-        try:
-            cp_id = getattr(self, "id", None)
-            print(f"🧾【DEBUG】StopTransaction received | CP={cp_id} | kwargs_keys={list(kwargs.keys())} | kwargs={kwargs}")
+        cp_id = getattr(self, "id", None)
 
-            transaction_id = str(kwargs.get("transaction_id") or kwargs.get("transactionId"))
-            print(f"🧾【DEBUG】StopTransaction parsed transaction_id={transaction_id} (type={type(transaction_id)})")
+        logger.error(
+            f"🧾 [StopTransaction RECEIVED] cp_id={cp_id} | "
+            f"kwargs={kwargs}"
+        )
 
-            meter_stop = kwargs.get("meter_stop")
-            raw_ts = kwargs.get("timestamp")
-            reason = kwargs.get("reason")
+        transaction_id = kwargs.get("transaction_id")
+        meter_stop = kwargs.get("meter_stop")
+        timestamp = kwargs.get("timestamp")
+        reason = kwargs.get("reason")
 
             # === 確保 stop timestamp ===
             try:
@@ -3716,19 +3717,56 @@ async def duplicate_by_rule(data: dict = Body(...)):
 from fastapi import HTTPException
 
 @app.post("/api/charge-points/{charge_point_id}/stop")
-async def stop_transaction(charge_point_id: str):
-    cp = connected_charge_points.get(charge_point_id)
+async def stop_charge_point(charge_point_id: str):
+    cp_id = _normalize_cp_id(charge_point_id)
+
+    logger.error(
+        f"🛑 [STOP API CALLED] cp_id={cp_id} | "
+        f"connected_keys={list(connected_charge_points.keys())}"
+    )
+
+    cp = connected_charge_points.get(cp_id)
     if not cp:
-        raise HTTPException(status_code=404, detail=f"⚠️ 找不到連線中的充電樁：{charge_point_id}")
+        logger.error(
+            f"❌ [STOP API FAIL] cp_id={cp_id} NOT in connected_charge_points"
+        )
+        raise HTTPException(status_code=404, detail="Charge point not connected")
 
-    tx_id = active_transactions.get(charge_point_id)
-    if not tx_id:
-        # ⭐ 改為直接略過報錯
-        logging.warning(f"⚠️ 無 transaction_id，仍送出停止指令給 {charge_point_id}")
-        return {"message": f"⚠️ 無 transaction_id，已略過停止指令"}
+    fut = asyncio.get_event_loop().create_future()
+    pending_stop_transactions[str(cp_id)] = fut
 
-    await cp.call(Action.RemoteStopTransaction, RemoteStopTransactionPayload(transactionId=tx_id))
-    return {"message": f"✅ 已送出停止指令給 {charge_point_id}"}
+    try:
+        logger.error(
+            f"📤 [REMOTE STOP SEND] cp_id={cp_id}"
+        )
+        await cp.send_remote_stop_transaction()
+
+        logger.error(
+            f"⏳ [WAIT StopTransaction] cp_id={cp_id} timeout=20s"
+        )
+
+        result = await asyncio.wait_for(fut, timeout=20)
+
+        logger.error(
+            f"✅ [STOP SUCCESS] cp_id={cp_id} | result={result}"
+        )
+        return result
+
+    except asyncio.TimeoutError:
+        logger.error(
+            f"⏰ [STOP TIMEOUT] cp_id={cp_id} | no StopTransaction received"
+        )
+        raise HTTPException(status_code=504, detail="StopTransaction timeout")
+
+    except Exception as e:
+        logger.exception(
+            f"🔥 [STOP EXCEPTION] cp_id={cp_id} | error={e}"
+        )
+        raise
+
+    finally:
+        pending_stop_transactions.pop(str(cp_id), None)
+
 
 
 
