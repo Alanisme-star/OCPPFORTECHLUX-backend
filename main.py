@@ -1447,8 +1447,8 @@ async def update_card_whitelist(card_id: str, data: dict = Body(...)):
 
 
 
-from ocpp.exceptions import OCPPError, CallError  # 若版本不同，CallError 可能在 ocpp.exceptions
-import traceback
+from ocpp.exceptions import OCPPError
+
 
 @app.post("/api/charge-points/{charge_point_id:path}/stop")
 async def stop_transaction_by_charge_point(charge_point_id: str):
