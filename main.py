@@ -1005,21 +1005,27 @@ class ChargePoint(OcppChargePoint):
             f"kwargs={kwargs}"
         )
 
+        # === 先取關鍵欄位（一定要成功）===
+        transaction_id = kwargs.get("transaction_id")
+        meter_stop = kwargs.get("meter_stop")
+        raw_ts = kwargs.get("timestamp")
+        reason = kwargs.get("reason")
+
+        # ⚠️ 沒有 transaction_id 直接回（但仍回 CALLRESULT）
+        if not transaction_id:
+            logger.error("🔴 StopTransaction missing transaction_id")
+            return call_result.StopTransactionPayload()
+
+        # === 確保 stop timestamp ===
         try:
-            transaction_id = kwargs.get("transaction_id")
-            meter_stop = kwargs.get("meter_stop")
-            raw_ts = kwargs.get("timestamp")
-            reason = kwargs.get("reason")
+            if raw_ts:
+                stop_ts = datetime.fromisoformat(raw_ts).astimezone(timezone.utc).isoformat()
+            else:
+                raise ValueError("Empty timestamp")
+        except Exception:
+            stop_ts = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
 
-            # === 確保 stop timestamp ===
-            try:
-                if raw_ts:
-                    stop_ts = datetime.fromisoformat(raw_ts).astimezone(timezone.utc).isoformat()
-                else:
-                    raise ValueError("Empty timestamp")
-            except Exception:
-                stop_ts = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
-
+        try:
             with sqlite3.connect(DB_FILE) as _conn:
                 _cur = _conn.cursor()
 
@@ -1083,20 +1089,17 @@ class ChargePoint(OcppChargePoint):
                     except Exception:
                         used_kwh = 0.0
 
-                    # 單價（預設）
                     unit_price = float(_price_for_timestamp(stop_ts))
                     total_amount = round(used_kwh * unit_price, 2)
 
-                    # 多時段電價（若有）
                     try:
                         mp_amount = _calculate_multi_period_cost(transaction_id)
                         if mp_amount > 0:
                             total_amount = mp_amount
-                            logging.info(f"🧮 多時段電價計算結果：{mp_amount}")
+                            logger.info(f"🧮 多時段電價計算結果：{mp_amount}")
                     except Exception as e:
-                        logging.warning(f"⚠️ 多時段電價計算失敗：{e}")
+                        logger.warning(f"⚠️ 多時段電價計算失敗：{e}")
 
-                    # 更新卡片餘額
                     _cur.execute(
                         "SELECT balance FROM cards WHERE card_id = ?",
                         (id_tag,),
@@ -1109,12 +1112,11 @@ class ChargePoint(OcppChargePoint):
                             "UPDATE cards SET balance = ? WHERE card_id = ?",
                             (new_balance, id_tag),
                         )
-                        logging.info(
+                        logger.info(
                             f"💳 卡片扣款完成 | idTag={id_tag} | "
                             f"{old_balance} → {new_balance} (-{total_amount})"
                         )
 
-                    # 紀錄付款
                     _cur.execute(
                         """
                         INSERT INTO payments (
@@ -1135,8 +1137,13 @@ class ChargePoint(OcppChargePoint):
 
                 _conn.commit()
 
+        except Exception as e:
+            # ⚠️ DB 或計算失敗也不能阻止 StopTransaction 流程
+            logger.exception(f"🔴 StopTransaction DB/計算發生錯誤：{e}")
+
+        finally:
             # ==================================================
-            # ⭐ 關鍵：只清「即時量測」，保留「結算結果」
+            # ⭐ 關鍵：更新 live_status（只清即時，不清結算）
             # ==================================================
             prev = live_status_cache.get(cp_id, {})
 
@@ -1145,7 +1152,6 @@ class ChargePoint(OcppChargePoint):
                 "voltage": 0,
                 "current": 0,
 
-                # ✅ 保留最後結算數值（避免餘額/電費顯示跳回）
                 "energy": prev.get("energy", 0),
                 "estimated_energy": prev.get("estimated_energy", 0),
                 "estimated_amount": prev.get("estimated_amount", 0),
@@ -1155,26 +1161,28 @@ class ChargePoint(OcppChargePoint):
                 "derived": True,
             }
 
-            # === 通知等待中的 API（/api/stop）===
+            # ==================================================
+            # ⭐⭐ 關鍵：解鎖 stop API 的等待 future（一定要做）
+            # ==================================================
             fut = pending_stop_transactions.get(str(transaction_id))
-            print(
-                f"🧾【DEBUG】pending_stop_transactions hit={bool(fut)} "
-                f"fut_done={(fut.done() if fut else None)} "
-                f"pending_keys={list(pending_stop_transactions.keys())}"
+            logger.debug(
+                f"🧾【StopTransaction FUTURE】hit={bool(fut)} "
+                f"done={(fut.done() if fut else None)} "
+                f"keys={list(pending_stop_transactions.keys())}"
             )
+
             if fut and not fut.done():
-                fut.set_result({
-                    "transaction_id": transaction_id,
-                    "meter_stop": meter_stop,
-                    "timestamp": stop_ts,
-                    "reason": reason
-                })
+                fut.set_result(
+                    {
+                        "transaction_id": transaction_id,
+                        "meter_stop": meter_stop,
+                        "timestamp": stop_ts,
+                        "reason": reason,
+                    }
+                )
 
-            return call_result.StopTransactionPayload()
-
-        except Exception as e:
-            logging.exception(f"🔴 StopTransaction 發生錯誤：{e}")
-            return call_result.StopTransactionPayload()
+        # ⚠️ 永遠回 CALLRESULT（不能拋例外）
+        return call_result.StopTransactionPayload()
 
 
 
@@ -1485,58 +1493,86 @@ from ocpp.exceptions import OCPPError
 @app.post("/api/charge-points/{charge_point_id:path}/stop")
 async def stop_transaction_by_charge_point(charge_point_id: str):
     cp_id = _normalize_cp_id(charge_point_id)
-    print(f"🟢【API呼叫】收到停止充電API請求, raw={charge_point_id} normalized={cp_id}")
-    print(f"🧭【DEBUG】connected_charge_points keys={list(connected_charge_points.keys())}")
+    logger.info(f"🟢【API呼叫】收到停止充電API請求 raw={charge_point_id} normalized={cp_id}")
+    logger.debug(f"🧭【DEBUG】connected_charge_points keys={list(connected_charge_points.keys())}")
 
     cp = connected_charge_points.get(cp_id)
     if not cp:
-        print(f"🔴【API異常】找不到連線中的充電樁：{cp_id}")
+        logger.error(f"🔴【API異常】找不到連線中的充電樁：{cp_id}")
         raise HTTPException(status_code=404, detail=f"⚠️ 找不到連線中的充電樁：{cp_id}")
 
+    # === 找進行中交易 ===
     with sqlite3.connect(DB_FILE) as conn:
         cursor = conn.cursor()
-        cursor.execute("""
-            SELECT transaction_id FROM transactions
+        cursor.execute(
+            """
+            SELECT transaction_id
+            FROM transactions
             WHERE charge_point_id = ? AND stop_timestamp IS NULL
-            ORDER BY start_timestamp DESC LIMIT 1
-        """, (cp_id,))
+            ORDER BY start_timestamp DESC
+            LIMIT 1
+            """,
+            (cp_id,),
+        )
         row = cursor.fetchone()
         if not row:
-            print(f"🔴【API異常】無進行中交易 cp_id={cp_id}")
+            logger.error(f"🔴【API異常】無進行中交易 cp_id={cp_id}")
             raise HTTPException(status_code=400, detail="⚠️ 無進行中交易")
+
         transaction_id = row[0]
 
-    print(f"🟢【API呼叫】找到進行中交易 transaction_id={transaction_id} (type={type(transaction_id)})")
+    logger.info(
+        f"🟢【API呼叫】找到進行中交易 transaction_id={transaction_id} "
+        f"(type={type(transaction_id)})"
+    )
 
-    loop = asyncio.get_event_loop()
+    # === 建立 StopTransaction 等待 future ===
+    loop = asyncio.get_running_loop()
     fut = loop.create_future()
     pending_stop_transactions[str(transaction_id)] = fut
-    print(f"🧩【DEBUG】pending_stop_transactions add key={str(transaction_id)} size={len(pending_stop_transactions)}")
+    logger.debug(
+        f"🧩【DEBUG】pending_stop_transactions add key={transaction_id} "
+        f"size={len(pending_stop_transactions)}"
+    )
 
-    # RemoteStopTransaction
+    # === 發送 RemoteStopTransaction（⚠️ 不管回傳結果）===
     req = call.RemoteStopTransactionPayload(transaction_id=int(transaction_id))
-    print(f"📤【DEBUG】RemoteStopTransaction payload tx_id(int)={int(transaction_id)}")
+    logger.debug(f"📤【DEBUG】RemoteStopTransaction payload tx_id={int(transaction_id)}")
 
     try:
-        resp = await cp.call(req)
-        print(f"🟢【API回應】RemoteStopTransaction CALLRESULT resp={resp} type={type(resp)}")
+        await cp.call(req)
+        logger.info(f"🟢【API】RemoteStopTransaction 已送出 tx={transaction_id}")
     except Exception as e:
-        print(f"🔴【API異常】RemoteStopTransaction 例外: {repr(e)}")
-        print("🔴【DEBUG】traceback:\n" + traceback.format_exc())
-        pending_stop_transactions.pop(str(transaction_id), None)
-        return JSONResponse(status_code=502, content={"message": "RemoteStopTransaction failed", "error": str(e)})
+        # ⚠️ 關鍵：只記錄，不中斷 StopTransaction 等待
+        logger.warning(f"⚠️【API】RemoteStopTransaction 發送例外（忽略）: {repr(e)}")
 
-    # wait StopTransaction
+    # === 唯一成功依據：等待 StopTransaction ===
     try:
-        stop_result = await asyncio.wait_for(fut, timeout=10)
-        print(f"🟢【API回應】StopTransaction 完成: {stop_result}")
-        return {"message": "充電已停止", "transaction_id": transaction_id, "stop_result": stop_result}
+        stop_result = await asyncio.wait_for(fut, timeout=15)
+        logger.info(f"🟢【API回應】StopTransaction 完成 tx={transaction_id}")
+        return {
+            "message": "充電已停止",
+            "transaction_id": transaction_id,
+            "stop_result": stop_result,
+        }
+
     except asyncio.TimeoutError:
-        print(f"🔴【API異常】等待 StopTransaction 超時 | key={str(transaction_id)} still_pending={str(transaction_id) in pending_stop_transactions}")
-        return JSONResponse(status_code=504, content={"message": "等待充電樁停止回覆逾時 (StopTransaction timeout)"})
+        logger.error(
+            f"🔴【API異常】等待 StopTransaction 超時 "
+            f"| key={transaction_id} "
+            f"still_pending={str(transaction_id) in pending_stop_transactions}"
+        )
+        return JSONResponse(
+            status_code=504,
+            content={"message": "等待充電樁停止回覆逾時 (StopTransaction timeout)"},
+        )
+
     finally:
         pending_stop_transactions.pop(str(transaction_id), None)
-        print(f"🧹【DEBUG】pending_stop_transactions pop key={str(transaction_id)} size={len(pending_stop_transactions)}")
+        logger.debug(
+            f"🧹【DEBUG】pending_stop_transactions pop key={transaction_id} "
+            f"size={len(pending_stop_transactions)}"
+        )
 
 
 
