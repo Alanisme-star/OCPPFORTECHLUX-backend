@@ -1000,6 +1000,23 @@ class ChargePoint(OcppChargePoint):
     async def on_stop_transaction(self, **kwargs):
         cp_id = getattr(self, "id", None)
 
+
+
+        # === DEBUG：原始 StopTransaction payload（低噪音）===
+        logger.info(
+            "[STOP][RAW] cp_id=%s | keys=%s | kwargs=%s",
+            cp_id,
+            list(kwargs.keys()),
+            kwargs,
+        )
+
+
+        # === 先取關鍵欄位（一定要成功）===
+        transaction_id = kwargs.get("transaction_id")
+        meter_stop = kwargs.get("meter_stop")
+        raw_ts = kwargs.get("timestamp")
+        reason = kwargs.get("reason")
+
         logger.warning(
             f"[STOP][DONE] StopTransaction received "
             f"| cp_id={cp_id} "
