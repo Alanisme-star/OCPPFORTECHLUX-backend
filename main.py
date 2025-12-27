@@ -1000,10 +1000,14 @@ class ChargePoint(OcppChargePoint):
     async def on_stop_transaction(self, **kwargs):
         cp_id = getattr(self, "id", None)
 
-        logger.error(
-            f"🧾 [StopTransaction RECEIVED] cp_id={cp_id} | "
-            f"kwargs={kwargs}"
+        logger.warning(
+            f"[STOP][DONE] StopTransaction received "
+            f"| cp_id={cp_id} "
+            f"| tx_id={transaction_id} "
+            f"| meter_stop={meter_stop} "
+            f"| reason={reason}"
         )
+
 
         # === 先取關鍵欄位（一定要成功）===
         transaction_id = kwargs.get("transaction_id")
@@ -1199,6 +1203,18 @@ class ChargePoint(OcppChargePoint):
                 logging.error("❌ 無法識別充電樁 ID（self.id 為空）")
                 return call_result.MeterValuesPayload()
 
+            # === ✅ 新增：STOP 後仍收到 MeterValues 的觀察 log（只觀察，不中斷）===
+            # 位置：function 一進來、cp_id 確認後就插入（你截圖說的第一/第二行附近）
+            _observe_tx_id = pick(kwargs, "transactionId", "transaction_id", "TransactionId", default="")
+            if _observe_tx_id and str(_observe_tx_id) in pending_stop_transactions:
+                logging.warning(
+                    f"[STOP][OBSERVE] MeterValues still coming AFTER RemoteStop "
+                    f"| cp_id={cp_id} "
+                    f"| tx_id={_observe_tx_id} "
+                    f"| pending_keys={list(pending_stop_transactions.keys())} "
+                    f"| raw={kwargs}"
+                )
+
             connector_id = pick(kwargs, "connectorId", "connector_id", default=0)
             try:
                 connector_id = int(connector_id or 0)
@@ -1376,6 +1392,7 @@ class ChargePoint(OcppChargePoint):
 
 
 
+
     @on(Action.RemoteStopTransaction)
     async def on_remote_stop_transaction(self, transaction_id, **kwargs):
         logging.info(f"✅ 收到遠端停止充電要求，transaction_id={transaction_id}")
@@ -1539,12 +1556,25 @@ async def stop_transaction_by_charge_point(charge_point_id: str):
     req = call.RemoteStopTransactionPayload(transaction_id=int(transaction_id))
     logger.debug(f"📤【DEBUG】RemoteStopTransaction payload tx_id={int(transaction_id)}")
 
+    logger.warning(
+        f"[STOP][SEND] RemoteStopTransaction "
+        f"| cp_id={cp_id} "
+        f"| tx_id={transaction_id} "
+        f"| ws_connected={cp_id in connected_charge_points}"
+    )
+
     try:
         await cp.call(req)
-        logger.info(f"🟢【API】RemoteStopTransaction 已送出 tx={transaction_id}")
+        logger.warning(
+            f"[STOP][ACK] RemoteStopTransaction accepted "
+            f"| cp_id={cp_id} | tx_id={transaction_id}"
+        )
     except Exception as e:
-        # ⚠️ 關鍵：只記錄，不中斷 StopTransaction 等待
-        logger.warning(f"⚠️【API】RemoteStopTransaction 發送例外（忽略）: {repr(e)}")
+        logger.error(
+            f"[STOP][ERR] RemoteStopTransaction failed "
+            f"| cp_id={cp_id} | tx_id={transaction_id} | err={repr(e)}"
+        )
+
 
     # === 唯一成功依據：等待 StopTransaction ===
     try:
@@ -1558,14 +1588,16 @@ async def stop_transaction_by_charge_point(charge_point_id: str):
 
     except asyncio.TimeoutError:
         logger.error(
-            f"🔴【API異常】等待 StopTransaction 超時 "
-            f"| key={transaction_id} "
-            f"still_pending={str(transaction_id) in pending_stop_transactions}"
+            f"[STOP][TIMEOUT] StopTransaction not received "
+            f"| cp_id={cp_id} "
+            f"| tx_id={transaction_id} "
+            f"| pending_keys={list(pending_stop_transactions.keys())}"
         )
         return JSONResponse(
             status_code=504,
             content={"message": "等待充電樁停止回覆逾時 (StopTransaction timeout)"},
         )
+
 
     finally:
         pending_stop_transactions.pop(str(transaction_id), None)
@@ -4107,11 +4139,23 @@ async def monitor_balance_and_auto_stop():
 
                 balance = float(row[0] or 0)
                 if balance <= 0:
-                    print(f"⚠️ [自動停充監控] {cp_id} 餘額={balance}，執行停止命令")
+                    logger.warning(
+                        f"[STOP][TRIGGER] balance_zero "
+                        f"| cp_id={cp_id} "
+                        f"| idTag={id_tag} "
+                        f"| balance={balance}"
+                    )
+
                     try:
                         await stop_transaction_by_charge_point(cp_id)
                     except Exception as e:
-                        print(f"❌ [自動停充監控] 無法停止 {cp_id}: {e}")
+                        logger.error(
+                            f"[STOP][TRIGGER_ERR] auto_stop failed "
+                            f"| cp_id={cp_id} "
+                            f"| idTag={id_tag} "
+                            f"| err={repr(e)}"
+                        )
+
             await asyncio.sleep(5)
 
         except Exception as e:
