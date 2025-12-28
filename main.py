@@ -227,6 +227,7 @@ async def _accept_or_reject_ws(websocket: WebSocket, raw_cp_id: str):
 
 @app.websocket("/{charge_point_id:path}")
 async def websocket_endpoint(websocket: WebSocket, charge_point_id: str):
+    print(f"🌐 WS attempt | raw_path={charge_point_id} | headers={dict(websocket.headers)}")
     try:
         # 1) 驗證 + accept(subprotocol="ocpp1.6")，並回傳標準化 cp_id
         cp_id = await _accept_or_reject_ws(websocket, charge_point_id)
