@@ -479,7 +479,7 @@ def _calculate_multi_period_cost_detailed(transaction_id: int):
         seg["subtotal"] = round(seg["kwh"] * seg["price"], 2)  # 精確以最新 kWh×單價計算
 
     return {
-        "total": round(sum(seg["subtotal"] for seg in segments), 2),  # 最後一次統一 round
+        "total": float(round(sum(seg["subtotal"] for seg in segments), 2)),
         "segments": segments
     }
 
@@ -727,6 +727,83 @@ CREATE TABLE IF NOT EXISTS status_logs (
 conn.commit()
 
 from ocpp.v16 import call
+
+
+async def _auto_stop_if_balance_insufficient(
+    cp_id: str,
+    transaction_id: int,
+    estimated_amount: float,
+):
+    # 已送過停充的交易直接跳過（避免重複）
+    if str(transaction_id) in pending_stop_transactions:
+        return
+
+    # 取得 id_tag 與餘額
+    with sqlite3.connect(DB_FILE) as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT id_tag
+            FROM transactions
+            WHERE transaction_id = ?
+        """, (transaction_id,))
+        row = cur.fetchone()
+        if not row:
+            return
+
+        id_tag = row[0]
+
+        cur.execute(
+            "SELECT balance FROM cards WHERE card_id = ?",
+            (id_tag,)
+        )
+        card = cur.fetchone()
+
+    if not card:
+        return
+
+    balance = float(card[0] or 0)
+
+    # ⭐ 關鍵判斷：餘額不足
+    if balance > estimated_amount:
+        return
+
+    logger.warning(
+        f"[AUTO-STOP] balance insufficient "
+        f"| cp_id={cp_id} "
+        f"| tx_id={transaction_id} "
+        f"| balance={balance} "
+        f"| estimated={estimated_amount}"
+    )
+
+    cp = connected_charge_points.get(cp_id)
+    if not cp:
+        logger.error(f"[AUTO-STOP] CP not connected | cp_id={cp_id}")
+        return
+
+    # 建立等待 StopTransaction 的 future（沿用你原本機制）
+    loop = asyncio.get_running_loop()
+    fut = loop.create_future()
+    pending_stop_transactions[str(transaction_id)] = fut
+
+    # 發送 RemoteStopTransaction
+    req = call.RemoteStopTransactionPayload(
+        transaction_id=int(transaction_id)
+    )
+
+    try:
+        await cp.call(req)
+        logger.warning(
+            f"[AUTO-STOP][SEND] RemoteStopTransaction "
+            f"| cp_id={cp_id} | tx_id={transaction_id}"
+        )
+    except Exception as e:
+        logger.error(
+            f"[AUTO-STOP][ERR] RemoteStop failed "
+            f"| cp_id={cp_id} | tx_id={transaction_id} | err={e}"
+        )
+
+
+
 
 class ChargePoint(OcppChargePoint):
     # ...（你的其他方法，例如 on_status_notification, on_meter_values, ...）
@@ -1391,6 +1468,21 @@ class ChargePoint(OcppChargePoint):
                                     price_per_kwh=price,
                                     timestamp=ts,
                                 )
+
+
+                                # ===== 方案 B：餘額不足自動停充 =====
+                                try:
+                                    await _auto_stop_if_balance_insufficient(
+                                        cp_id=cp_id,
+                                        transaction_id=int(transaction_id),
+                                        estimated_amount=float(total),
+                                    )
+                                except Exception as e:
+                                    logger.error(f"[AUTO-STOP] exception: {e}")
+
+
+
+
                                 logging.info(f"✅ 即時計算多時段金額成功：{total} 元")
                             except Exception as e:
                                 logging.warning(f"⚠️ 即時計算多時段金額失敗：{e}")
