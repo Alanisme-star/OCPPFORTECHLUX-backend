@@ -534,6 +534,14 @@ CREATE TABLE IF NOT EXISTS charge_points (
 """)
 conn.commit()
 
+# ★ 新增：charge_points 補欄位 max_current_a（預設電流上限，單位 A）
+cursor.execute("PRAGMA table_info(charge_points)")
+_cp_cols = [r[1] for r in cursor.fetchall()]
+if "max_current_a" not in _cp_cols:
+    cursor.execute("ALTER TABLE charge_points ADD COLUMN max_current_a REAL DEFAULT 16")
+    conn.commit()
+
+
 # 初始化 connection_logs 表格（如不存在就建立）
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS connection_logs (
@@ -2272,6 +2280,109 @@ def get_live_status(charge_point_id: str):
     }
 
 
+from ocpp.v16 import call as ocpp_call
+
+@app.get("/api/charge-points/{charge_point_id}/current-limit")
+def get_current_limit(charge_point_id: str):
+    cp_id = _normalize_cp_id(charge_point_id)
+    with get_conn() as c:
+        cur = c.cursor()
+        cur.execute("SELECT max_current_a FROM charge_points WHERE charge_point_id = ?", (cp_id,))
+        row = cur.fetchone()
+    val = row[0] if row and row[0] is not None else 16
+    return {"chargePointId": cp_id, "maxCurrentA": float(val)}
+
+def _build_cs_charging_profiles(limit_a: float, purpose: str = "ChargePointMaxProfile"):
+    # OCPP 1.6 SetChargingProfile → csChargingProfiles
+    # chargingRateUnit 用 "A" 表示電流限制
+    return {
+        "chargingProfileId": 1,
+        "stackLevel": 0,
+        "chargingProfilePurpose": purpose,          # "ChargePointMaxProfile" / "TxProfile"
+        "chargingProfileKind": "Absolute",
+        "chargingSchedule": {
+            "chargingRateUnit": "A",
+            "chargingSchedulePeriod": [
+                {"startPeriod": 0, "limit": float(limit_a)}
+            ],
+        },
+    }
+
+@app.post("/api/charge-points/{charge_point_id}/apply-current-limit")
+async def apply_current_limit(charge_point_id: str, data: dict = Body(...)):
+    """
+    前端 LiveStatus slider 用：
+    - data.maxCurrentA: float/int
+    - data.connectorId: optional (default 1)
+    - data.applyNow: optional (default True)
+    """
+    cp_id = _normalize_cp_id(charge_point_id)
+
+    max_current_a = data.get("maxCurrentA") or data.get("max_current_a")
+    if max_current_a is None:
+        raise HTTPException(status_code=400, detail="maxCurrentA is required")
+
+    try:
+        max_current_a = float(max_current_a)
+    except Exception:
+        raise HTTPException(status_code=400, detail="maxCurrentA must be a number")
+
+    connector_id = data.get("connectorId", 1)
+    try:
+        connector_id = int(connector_id)
+    except Exception:
+        connector_id = 1
+
+    apply_now = data.get("applyNow", True)
+
+    # 1) 先存 DB（作為預設值）
+    with get_conn() as c:
+        cur = c.cursor()
+        cur.execute(
+            "UPDATE charge_points SET max_current_a = ? WHERE charge_point_id = ?",
+            (max_current_a, cp_id),
+        )
+        c.commit()
+
+    # 2) 若不需要立刻下發，就到此結束
+    if not apply_now:
+        return {"ok": True, "chargePointId": cp_id, "maxCurrentA": max_current_a, "applied": False}
+
+    # 3) 取已連線的 CP
+    cp = connected_charge_points.get(cp_id)
+    if not cp:
+        return {
+            "ok": True,
+            "chargePointId": cp_id,
+            "maxCurrentA": max_current_a,
+            "applied": False,
+            "message": "CP not connected (已存DB，但未下發到樁)"
+        }
+
+    # 4) 送 OCPP SetChargingProfile
+    try:
+        cs_profile = _build_cs_charging_profiles(max_current_a, purpose="ChargePointMaxProfile")
+        req = ocpp_call.SetChargingProfilePayload(
+            connector_id=connector_id,
+            cs_charging_profiles=cs_profile
+        )
+        resp = await cp.call(req)
+
+        return {
+            "ok": True,
+            "chargePointId": cp_id,
+            "maxCurrentA": max_current_a,
+            "applied": True,
+            "ocpp": getattr(resp, "__dict__", str(resp)),
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "chargePointId": cp_id,
+            "maxCurrentA": max_current_a,
+            "applied": False,
+            "error": str(e),
+        }
 
 
 
@@ -3323,7 +3434,7 @@ def get_cards():
 
 @app.get("/api/charge-points")
 async def list_charge_points():
-    cursor.execute("SELECT id, charge_point_id, name, status, created_at FROM charge_points")
+    cursor.execute("SELECT id, charge_point_id, name, status, created_at, max_current_a FROM charge_points")
     rows = cursor.fetchall()
     return [
         {
@@ -3341,12 +3452,21 @@ async def add_charge_point(data: dict = Body(...)):
     cp_id = data.get("chargePointId") or data.get("charge_point_id")
     name = data.get("name", "")
     status = (data.get("status") or "enabled").lower()
+
+    # ★ 新增：預設電流上限
+    max_current_a = data.get("maxCurrentA") or data.get("max_current_a") or 16
+    try:
+        max_current_a = float(max_current_a)
+    except Exception:
+        max_current_a = 16
+
+
     if not cp_id:
         raise HTTPException(status_code=400, detail="chargePointId is required")
     try:
         cursor.execute(
-            "INSERT INTO charge_points (charge_point_id, name, status) VALUES (?, ?, ?)",
-            (cp_id, name, status)
+            "INSERT INTO charge_points (charge_point_id, name, status, max_current_a) VALUES (?, ?, ?, ?)",
+            (cp_id, name, status, max_current_a)
         )
         conn.commit()
         print(f"✅ 新增白名單到資料庫: {cp_id}, {name}, {status}")  # 新增，除錯用
@@ -3374,6 +3494,16 @@ async def update_charge_point(cp_id: str = Path(...), data: dict = Body(...)):
     if status is not None:
         update_fields.append("status = ?")
         params.append(status)
+
+    max_current_a = data.get("maxCurrentA") if isinstance(data, dict) else None
+    if max_current_a is not None:
+        try:
+            max_current_a = float(max_current_a)
+            update_fields.append("max_current_a = ?")
+            params.append(max_current_a)
+        except Exception:
+            pass
+
     if not update_fields:
         raise HTTPException(status_code=400, detail="無可更新欄位")
     params.append(cp_id)
