@@ -36,6 +36,44 @@ from ocpp.routing import on
 from urllib.parse import urlparse, parse_qsl
 from reportlab.pdfgen import canvas
 
+# ===============================
+# 🔌 OCPP 電流限制（TxProfile）
+# ===============================
+async def send_current_limit_profile(
+    cp,
+    connector_id: int,
+    limit_a: float,
+    tx_id: int | None = None,
+):
+    """
+    對充電樁送出 OCPP 1.6 SetChargingProfile
+    - connector_id: 通常是 1
+    - limit_a: 電流上限（A）
+    - tx_id: 可選，若提供則只限制該交易
+    """
+    payload = call.SetChargingProfile(
+        connector_id=int(connector_id),
+        cs_charging_profiles={
+            "chargingProfileId": int(tx_id or 1),
+            "stackLevel": 1,
+            "chargingProfilePurpose": "TxProfile",
+            "chargingProfileKind": "Absolute",
+            "chargingSchedule": {
+                "chargingRateUnit": "A",
+                "chargingSchedulePeriod": [
+                    {
+                        "startPeriod": 0,
+                        "limit": float(limit_a),
+                    }
+                ],
+            },
+            **({"transactionId": int(tx_id)} if tx_id else {}),
+        },
+    )
+
+    await cp.call(payload)
+
+
 
 
 # === 時區設定: 台北 ===
@@ -993,6 +1031,11 @@ class ChargePoint(OcppChargePoint):
                 row = cur.fetchone()
 
                 if not row:
+
+
+
+
+
                     return call_result.StartTransactionPayload(transaction_id=0, id_tag_info={"status": "Invalid"})
 
                 status_db = row[0]
@@ -1059,6 +1102,44 @@ class ChargePoint(OcppChargePoint):
 
             conn.commit()
             logging.info(f"🚗 StartTransaction 成功 | CP={self.id} | idTag={id_tag} | transactionId={transaction_id} | start_ts={start_ts} | meter_start={meter_start_val} kWh")
+
+
+            # ===============================
+            # 🔌 StartTransaction 後立即限流
+            # ===============================
+            try:
+                # 1) 從資料庫讀取該樁的電流上限
+                with sqlite3.connect(DB_FILE) as _c:
+                    _cur = _c.cursor()
+                    _cur.execute(
+                        "SELECT max_current_a FROM charge_points WHERE charge_point_id = ?",
+                        (self.id,),
+                    )
+                    row = _cur.fetchone()
+
+                limit_a = float(row[0]) if row and row[0] else 16.0
+
+                # 2) 發送 SetChargingProfile
+                await send_current_limit_profile(
+                    cp=self,
+                    connector_id=connector_id,
+                    limit_a=limit_a,
+                    tx_id=transaction_id,
+                )
+
+                logging.warning(
+                    f"[LIMIT][SEND] SetChargingProfile "
+                    f"| cp_id={self.id} | tx_id={transaction_id} | limit={limit_a}A"
+                )
+
+            except Exception as e:
+                logging.error(
+                    f"[LIMIT][ERR] failed to send SetChargingProfile "
+                    f"| cp_id={self.id} | err={e}"
+                )
+
+
+
 
             # ⭐ 重置快取，避免沿用上一筆交易的電費/電量
             live_status_cache[self.id] = {
