@@ -39,6 +39,44 @@ from reportlab.pdfgen import canvas
 # ===============================
 # 🔌 OCPP 電流限制（TxProfile）
 # ===============================
+async def query_smart_charging_capability(cp):
+    """
+    查詢充電樁 Smart Charging 相關能力（OCPP 1.6）
+    """
+    keys = [
+        "ChargingScheduleAllowedChargingRateUnit",
+        "SmartChargingEnabled",
+        "MaxChargingProfilesInstalled",
+    ]
+
+    req = call.GetConfiguration(key=keys)
+
+    resp = await cp.call(req)
+
+    result = {
+        "supported": {},
+        "unsupported": [],
+    }
+
+    for item in resp.configuration_key or []:
+        key = item["key"]
+        val = item.get("value")
+        readonly = item.get("readonly")
+
+        result["supported"][key] = {
+            "value": val,
+            "readonly": readonly,
+        }
+
+    # 樁不支援的 key 會回在 unknown_key
+    for k in resp.unknown_key or []:
+        result["unsupported"].append(k)
+
+    return result
+
+
+
+
 async def send_current_limit_profile(
     cp,
     connector_id: int,
@@ -51,10 +89,20 @@ async def send_current_limit_profile(
     - limit_a: 電流上限（A）
     - tx_id: 可選，若提供則只限制該交易
     """
+
+    # ⭐【關鍵 DEBUG LOG】確認即將送出的限流內容
+    logging.warning(
+        f"[LIMIT][CALL] SetChargingProfile "
+        f"| cp_id={getattr(cp, 'id', 'unknown')} "
+        f"| connector_id={connector_id} "
+        f"| tx_id={tx_id} "
+        f"| limit={limit_a}A"
+    )
+
     payload = call.SetChargingProfile(
         connector_id=int(connector_id),
         cs_charging_profiles={
-            "chargingProfileId": int(tx_id or 1),
+            "chargingProfileId": int(tx_id % 100000 if tx_id else 1),
             "stackLevel": 1,
             "chargingProfilePurpose": "TxProfile",
             "chargingProfileKind": "Absolute",
@@ -64,6 +112,7 @@ async def send_current_limit_profile(
                     {
                         "startPeriod": 0,
                         "limit": float(limit_a),
+                        "numberPhases": 1,   # ★ 單相（若三相可改 3）
                     }
                 ],
             },
@@ -72,6 +121,7 @@ async def send_current_limit_profile(
     )
 
     await cp.call(payload)
+
 
 
 
@@ -971,22 +1021,86 @@ class ChargePoint(OcppChargePoint):
 
     @on(Action.BootNotification)
     async def on_boot_notification(self, charge_point_model, charge_point_vendor, **kwargs):
+        """
+        OCPP 1.6 BootNotification
+        - 回應 Accepted
+        - 同步查詢充電樁 Smart Charging 能力（GetConfiguration）
+        """
+        now = datetime.utcnow().replace(tzinfo=timezone.utc)
+
         try:
-            now = datetime.utcnow().replace(tzinfo=timezone.utc)
-            logging.info(f"🔌 BootNotification | 模型={charge_point_model} | 廠商={charge_point_vendor}")
+            logging.info(
+                f"🔌 BootNotification | CP={self.id} | 模型={charge_point_model} | 廠商={charge_point_vendor}"
+            )
+
+            # =====================================================
+            # 🔍 查詢 Smart Charging 能力（OCPP 1.6）
+            # =====================================================
+            try:
+                req = call.GetConfiguration(
+                    key=[
+                        "ChargingScheduleAllowedChargingRateUnit",
+                        "SmartChargingEnabled",
+                        "MaxChargingProfilesInstalled",
+                    ]
+                )
+                resp = await self.call(req)
+
+                supported = {}
+                unsupported = []
+
+                # 樁有回應的 key
+                for item in resp.configuration_key or []:
+                    supported[item["key"]] = {
+                        "value": item.get("value"),
+                        "readonly": item.get("readonly"),
+                    }
+
+                # === 判斷是否支援 Smart Charging（存到 CP 物件上）===
+                self.supports_smart_charging = (
+                    supported.get("SmartChargingEnabled", {}).get("value", "").lower() == "true"
+                )
+
+                logging.warning(
+                    f"[CAPABILITY][RESULT] CP={self.id} | supports_smart_charging={self.supports_smart_charging}"
+                )
+
+
+
+                # 樁不支援的 key
+                for k in resp.unknown_key or []:
+                    unsupported.append(k)
+
+                logging.warning(
+                    f"[CAPABILITY] CP={self.id} | "
+                    f"supported={json.dumps(supported, ensure_ascii=False)} | "
+                    f"unsupported={unsupported}"
+                )
+
+            except Exception as e:
+                # ⚠️ 查能力失敗不影響 BootNotification
+                logging.error(
+                    f"[CAPABILITY][ERR] CP={self.id} | GetConfiguration failed | err={e}"
+                )
+
+            # =====================================================
+            # ✅ 正常回應 BootNotification
+            # =====================================================
             return call_result.BootNotificationPayload(
                 current_time=now.isoformat(),
                 interval=10,
                 status=RegistrationStatus.accepted
             )
+
         except Exception as e:
-            logging.exception(f"BootNotification handler error: {e}")
-            now = datetime.utcnow().replace(tzinfo=timezone.utc)
+            # ❗ BootNotification 永遠不能擋樁
+            logging.exception(f"❌ BootNotification handler error: {e}")
             return call_result.BootNotificationPayload(
                 current_time=now.isoformat(),
                 interval=10,
                 status=RegistrationStatus.accepted
             )
+
 
 
     @on(Action.Heartbeat)
@@ -1119,18 +1233,24 @@ class ChargePoint(OcppChargePoint):
 
                 limit_a = float(row[0]) if row and row[0] else 16.0
 
-                # 2) 發送 SetChargingProfile
-                await send_current_limit_profile(
-                    cp=self,
-                    connector_id=connector_id,
-                    limit_a=limit_a,
-                    tx_id=transaction_id,
-                )
+                # 2) 發送 SetChargingProfile（僅在樁支援 SmartCharging 時）
+                if getattr(self, "supports_smart_charging", False):
+                    await send_current_limit_profile(
+                        cp=self,
+                        connector_id=connector_id,
+                        limit_a=limit_a,
+                        tx_id=transaction_id,
+                    )
 
-                logging.warning(
-                    f"[LIMIT][SEND] SetChargingProfile "
-                    f"| cp_id={self.id} | tx_id={transaction_id} | limit={limit_a}A"
-                )
+                    logging.warning(
+                        f"[LIMIT][SEND] SetChargingProfile "
+                        f"| cp_id={self.id} | tx_id={transaction_id} | limit={limit_a}A"
+                    )
+                else:
+                    logging.warning(
+                        f"[LIMIT][SKIP] CP={self.id} does NOT support SmartCharging | "
+                        f"skip SetChargingProfile | limit={limit_a}A"
+                    )
 
             except Exception as e:
                 logging.error(
@@ -1843,6 +1963,151 @@ async def stop_transaction_by_charge_point(charge_point_id: str):
             f"🧹【DEBUG】pending_stop_transactions pop key={transaction_id} "
             f"size={len(pending_stop_transactions)}"
         )
+
+
+@app.put("/api/charge-points/{charge_point_id:path}")
+def update_charge_point(charge_point_id: str, data: dict = Body(...)):
+    cp_id = _normalize_cp_id(charge_point_id)
+
+    name = data.get("name")
+    status = data.get("status")
+    max_current = data.get("maxCurrent")  # ⭐ 前端送來的欄位
+
+    # 基本驗證
+    if max_current is not None:
+        try:
+            max_current = float(max_current)
+            if max_current <= 0:
+                raise ValueError()
+        except Exception:
+            raise HTTPException(status_code=400, detail="maxCurrent 必須為正數")
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+
+        # 確認充電樁存在
+        cur.execute(
+            "SELECT charge_point_id FROM charge_points WHERE charge_point_id = ?",
+            (cp_id,),
+        )
+        if not cur.fetchone():
+            raise HTTPException(status_code=404, detail="Charge point not found")
+
+        # 動態組 UPDATE
+        fields = []
+        params = []
+
+        if name is not None:
+            fields.append("name = ?")
+            params.append(name)
+
+        if status is not None:
+            fields.append("status = ?")
+            params.append(status)
+
+        if max_current is not None:
+            fields.append("max_current_a = ?")
+            params.append(max_current)
+
+        if not fields:
+            return {"message": "No fields updated"}
+
+        params.append(cp_id)
+
+        sql = f"""
+            UPDATE charge_points
+            SET {", ".join(fields)}
+            WHERE charge_point_id = ?
+        """
+        cur.execute(sql, params)
+        conn.commit()
+
+    return {
+        "message": "Charge point updated",
+        "charge_point_id": cp_id,
+        "updated": {
+            "name": name,
+            "status": status,
+            "max_current_a": max_current,
+        },
+    }
+
+
+
+
+@app.post("/api/charge-points/{charge_point_id:path}/current-limit")
+async def set_current_limit(
+    charge_point_id: str,
+    data: dict = Body(...),
+):
+    cp_id = _normalize_cp_id(charge_point_id)
+    limit_a = data.get("limit_amps")
+
+    if limit_a is None:
+        raise HTTPException(status_code=400, detail="missing limit_amps")
+
+    try:
+        limit_a = float(limit_a)
+        if limit_a <= 0:
+            raise ValueError()
+    except Exception:
+        raise HTTPException(status_code=400, detail="limit_amps must be positive number")
+
+    # 1️⃣ 先存進 DB（不管是否正在充電）
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            UPDATE charge_points
+            SET max_current_a = ?
+            WHERE charge_point_id = ?
+            """,
+            (limit_a, cp_id),
+        )
+        conn.commit()
+
+    # 2️⃣ 如果樁有連線 & 正在充電 → 立刻送 SetChargingProfile
+    cp = connected_charge_points.get(cp_id)
+    applied = False
+
+    if cp and getattr(cp, "supports_smart_charging", False):
+        # 找目前進行中的交易
+        with sqlite3.connect(DB_FILE) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT transaction_id, connector_id
+                FROM transactions
+                WHERE charge_point_id = ?
+                  AND stop_timestamp IS NULL
+                ORDER BY start_timestamp DESC
+                LIMIT 1
+                """,
+                (cp_id,),
+            )
+            row = cur.fetchone()
+
+        if row:
+            tx_id, connector_id = row
+            try:
+                await send_current_limit_profile(
+                    cp=cp,
+                    connector_id=connector_id or 1,
+                    limit_a=limit_a,
+                    tx_id=tx_id,
+                )
+                applied = True
+            except Exception as e:
+                logging.error(
+                    f"[LIMIT][ERR] immediate apply failed | cp_id={cp_id} | err={e}"
+                )
+
+    return {
+        "message": "current limit updated",
+        "charge_point_id": cp_id,
+        "limit_a": limit_a,
+        "applied_immediately": applied,
+    }
 
 
 
