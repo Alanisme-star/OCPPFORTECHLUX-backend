@@ -75,15 +75,20 @@ async def send_current_limit_profile(
     - tx_id: 可選，若提供則只限制該交易
     """
 
-    # ⭐【關鍵 DEBUG LOG】確認即將送出的限流內容
-    logging.warning(
-        f"[LIMIT][CALL] SetChargingProfile "
+    # =====================================================
+    # 🔴 STEP 1：確認 function「真的有被呼叫」
+    # =====================================================
+    logging.error(
+        f"[LIMIT][ENTER] send_current_limit_profile "
         f"| cp_id={getattr(cp, 'id', 'unknown')} "
         f"| connector_id={connector_id} "
         f"| tx_id={tx_id} "
         f"| limit={limit_a}A"
     )
 
+    # =====================================================
+    # 🔴 STEP 2：組 SetChargingProfile payload
+    # =====================================================
     payload = call.SetChargingProfile(
         connector_id=int(connector_id),
         cs_charging_profiles={
@@ -97,7 +102,7 @@ async def send_current_limit_profile(
                     {
                         "startPeriod": 0,
                         "limit": float(limit_a),
-                        "numberPhases": 1,   # ★ 單相（若三相可改 3）
+                        "numberPhases": 1,
                     }
                 ],
             },
@@ -105,7 +110,35 @@ async def send_current_limit_profile(
         },
     )
 
-    await cp.call(payload)
+    # =====================================================
+    # 🔴 STEP 3：實際送出 OCPP call + 回傳結果觀察
+    # =====================================================
+    try:
+        logging.error(
+            f"[LIMIT][SEND] about to call SetChargingProfile "
+            f"| cp_id={getattr(cp, 'id', 'unknown')} "
+            f"| tx_id={tx_id}"
+        )
+
+        resp = await cp.call(payload)
+
+        logging.error(
+            f"[LIMIT][OK] SetChargingProfile accepted "
+            f"| cp_id={getattr(cp, 'id', 'unknown')} "
+            f"| resp={resp}"
+        )
+
+        return resp
+
+    except Exception as e:
+        logging.exception(
+            f"[LIMIT][ERR] SetChargingProfile FAILED "
+            f"| cp_id={getattr(cp, 'id', 'unknown')} "
+            f"| tx_id={tx_id} "
+            f"| err={e}"
+        )
+        raise
+
 
 
 
