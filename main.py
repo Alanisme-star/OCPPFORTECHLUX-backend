@@ -1291,10 +1291,15 @@ class ChargePoint(OcppChargePoint):
 
                 limit_a = float(row[0]) if row and row[0] else 16.0
 
+                logging.error(
+                    f"[DEBUG][START_TX][LIMIT] "
+                    f"cp_id={self.id} | limit_a={limit_a} | raw_row={row} | db={DB_FILE}"
+                )
 
                 logging.warning(
                     f"[LIMIT][DB] cp_id={self.id} | max_current_a={limit_a}"
                 )
+
 
 
                 # 2) 發送 SetChargingProfile（僅在樁支援 SmartCharging 時）
