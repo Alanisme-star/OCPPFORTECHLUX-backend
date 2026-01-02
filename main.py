@@ -141,7 +141,6 @@ REQUIRED_TOKEN = os.getenv("OCPP_WS_TOKEN", None)
 
 logging.basicConfig(level=logging.WARNING)
 
-ensure_charge_points_schema()
 
 # ===============================
 # Stop API 去重保護（防換頁/重刷）
@@ -358,6 +357,8 @@ DB_FILE = os.path.join(BASE_DIR, "ocpp_data.db")  # ✅ 固定資料庫絕對路
 conn = sqlite3.connect(DB_FILE, check_same_thread=False, timeout=15)
 cursor = conn.cursor()
 
+# ✅ 這裡再呼叫
+ensure_charge_points_schema()
 
 def get_conn():
     # 為每次查詢建立新的連線與游標，避免共用全域 cursor 造成並發問題
