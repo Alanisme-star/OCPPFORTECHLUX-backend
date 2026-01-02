@@ -1109,6 +1109,18 @@ class ChargePoint(OcppChargePoint):
                     f"FORCE_SMART_CHARGING=0 | supports_smart_charging=False"
                 )
 
+
+            # =====================================================
+            # 🔧 DEBUG：強制 SmartCharging = True（排除所有干擾）
+            # =====================================================
+            self.supports_smart_charging = True
+
+            logging.error(
+                f"🔧 [DEBUG][BOOT] CP={self.id} | supports_smart_charging={self.supports_smart_charging}"
+            )
+
+
+
             # =====================================================
             # ✅ 正常回應 BootNotification（永遠 Accepted）
             # =====================================================
@@ -1164,6 +1176,16 @@ class ChargePoint(OcppChargePoint):
 
     @on(Action.StartTransaction)
     async def on_start_transaction(self, connector_id, id_tag, meter_start, timestamp, **kwargs):
+
+
+        logging.error(
+            f"🧪 [DEBUG][START_TX][ENTER] "
+            f"CP={self.id} | "
+            f"supports_smart_charging={getattr(self, 'supports_smart_charging', 'MISSING')}"
+        )
+
+
+
         with sqlite3.connect(DB_FILE) as conn:
             cursor = conn.cursor()
 
