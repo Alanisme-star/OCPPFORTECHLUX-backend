@@ -1072,17 +1072,25 @@ class ChargePoint(OcppChargePoint):
             return call_result.StatusNotificationPayload()
 
 
-
-
-
     from ocpp.v16.enums import RegistrationStatus
+    import os
+
+    # =====================================================
+    # SmartCharging 能力判定模式
+    # - FORCE_SMART_CHARGING=1 → 強制視為支援（開發 / 模擬器）
+    # - FORCE_SMART_CHARGING=0 → 不強制（正式 / 真實樁）
+    # =====================================================
+    FORCE_SMART_CHARGING = os.getenv("FORCE_SMART_CHARGING", "0") == "1"
+
 
     @on(Action.BootNotification)
     async def on_boot_notification(self, charge_point_model, charge_point_vendor, **kwargs):
         """
         OCPP 1.6 BootNotification
-        - 回應 Accepted
-        - 同步查詢充電樁 Smart Charging 能力（GetConfiguration）
+        - 回應 Accepted（永遠不能擋樁）
+        - SmartCharging 能力判定：
+            * 開發期：可強制開啟（FORCE_SMART_CHARGING=1）
+            * 正式環境：不依賴 GetConfiguration（避免 library / 樁相容性問題）
         """
         now = datetime.utcnow().replace(tzinfo=timezone.utc)
 
@@ -1092,62 +1100,33 @@ class ChargePoint(OcppChargePoint):
             )
 
             # =====================================================
-            # 🔍 查詢 Smart Charging 能力（OCPP 1.6）
+            # 🔍 SmartCharging 能力判定（目前策略）
             # =====================================================
-            try:
-                req = call.GetConfiguration(
-                    key=[
-                        "ChargingScheduleAllowedChargingRateUnit",
-                        "SmartChargingEnabled",
-                        "MaxChargingProfilesInstalled",
-                    ]
-                )
-                resp = await self.call(req)
-
-                supported = {}
-                unsupported = []
-
-                # 樁有回應的 key
-                for item in resp.configuration_key or []:
-                    supported[item["key"]] = {
-                        "value": item.get("value"),
-                        "readonly": item.get("readonly"),
-                    }
-
-                # === 判斷是否支援 Smart Charging（存到 CP 物件上）===
-                self.supports_smart_charging = (
-                    supported.get("SmartChargingEnabled", {}).get("value", "").lower() == "true"
-                )
+            if FORCE_SMART_CHARGING:
+                # ✅ 開發 / 模擬器模式：強制視為支援
+                self.supports_smart_charging = True
 
                 logging.warning(
-                    f"[CAPABILITY][RESULT] CP={self.id} | supports_smart_charging={self.supports_smart_charging}"
+                    f"[CAPABILITY][FORCE] CP={self.id} | "
+                    f"FORCE_SMART_CHARGING=1 | supports_smart_charging=True"
                 )
-
-
-
-                # 樁不支援的 key
-                for k in resp.unknown_key or []:
-                    unsupported.append(k)
+            else:
+                # 🟡 正式環境：預設不強制（避免誤判）
+                # 👉 未來可改成「嘗試送 SetChargingProfile，以結果回填能力」
+                self.supports_smart_charging = False
 
                 logging.warning(
-                    f"[CAPABILITY] CP={self.id} | "
-                    f"supported={json.dumps(supported, ensure_ascii=False)} | "
-                    f"unsupported={unsupported}"
-                )
-
-            except Exception as e:
-                # ⚠️ 查能力失敗不影響 BootNotification
-                logging.error(
-                    f"[CAPABILITY][ERR] CP={self.id} | GetConfiguration failed | err={e}"
+                    f"[CAPABILITY][DEFAULT] CP={self.id} | "
+                    f"FORCE_SMART_CHARGING=0 | supports_smart_charging=False"
                 )
 
             # =====================================================
-            # ✅ 正常回應 BootNotification
+            # ✅ 正常回應 BootNotification（永遠 Accepted）
             # =====================================================
             return call_result.BootNotificationPayload(
                 current_time=now.isoformat(),
                 interval=10,
-                status=RegistrationStatus.accepted
+                status=RegistrationStatus.accepted,
             )
 
         except Exception as e:
@@ -1156,9 +1135,12 @@ class ChargePoint(OcppChargePoint):
             return call_result.BootNotificationPayload(
                 current_time=now.isoformat(),
                 interval=10,
-                status=RegistrationStatus.accepted
+                status=RegistrationStatus.accepted,
             )
 
+
+
+    
 
 
     @on(Action.Heartbeat)
