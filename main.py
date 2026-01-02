@@ -1233,6 +1233,12 @@ class ChargePoint(OcppChargePoint):
 
                 limit_a = float(row[0]) if row and row[0] else 16.0
 
+
+                logging.warning(
+                    f"[LIMIT][DB] cp_id={self.id} | max_current_a={limit_a}"
+                )
+
+
                 # 2) 發送 SetChargingProfile（僅在樁支援 SmartCharging 時）
                 if getattr(self, "supports_smart_charging", False):
                     await send_current_limit_profile(
@@ -1965,35 +1971,45 @@ async def stop_transaction_by_charge_point(charge_point_id: str):
         )
 
 
+from fastapi import Body, HTTPException
+
 @app.put("/api/charge-points/{charge_point_id:path}")
 def update_charge_point(charge_point_id: str, data: dict = Body(...)):
+    # 1️⃣ 正規化 CP ID（處理 TW*MSI*E000100 / URL encode）
     cp_id = _normalize_cp_id(charge_point_id)
 
+    # 2️⃣ 前端欄位（⚠️ 關鍵：maxCurrent）
     name = data.get("name")
     status = data.get("status")
-    max_current = data.get("maxCurrent")  # ⭐ 前端送來的欄位
+    max_current = data.get("maxCurrent")   # ← 前端送來的電流上限（A）
 
-    # 基本驗證
+    # 3️⃣ maxCurrent 基本驗證（有給才驗）
     if max_current is not None:
         try:
             max_current = float(max_current)
             if max_current <= 0:
                 raise ValueError()
         except Exception:
-            raise HTTPException(status_code=400, detail="maxCurrent 必須為正數")
+            raise HTTPException(
+                status_code=400,
+                detail="maxCurrent 必須為正數 (A)"
+            )
 
     with get_conn() as conn:
         cur = conn.cursor()
 
-        # 確認充電樁存在
+        # 4️⃣ 確認充電樁存在
         cur.execute(
             "SELECT charge_point_id FROM charge_points WHERE charge_point_id = ?",
             (cp_id,),
         )
         if not cur.fetchone():
-            raise HTTPException(status_code=404, detail="Charge point not found")
+            raise HTTPException(
+                status_code=404,
+                detail=f"Charge point not found: {cp_id}"
+            )
 
-        # 動態組 UPDATE
+        # 5️⃣ 動態組 UPDATE（只更新有給的欄位）
         fields = []
         params = []
 
@@ -2010,7 +2026,10 @@ def update_charge_point(charge_point_id: str, data: dict = Body(...)):
             params.append(max_current)
 
         if not fields:
-            return {"message": "No fields updated"}
+            return {
+                "message": "No fields updated",
+                "charge_point_id": cp_id,
+            }
 
         params.append(cp_id)
 
@@ -2019,9 +2038,11 @@ def update_charge_point(charge_point_id: str, data: dict = Body(...)):
             SET {", ".join(fields)}
             WHERE charge_point_id = ?
         """
+
         cur.execute(sql, params)
         conn.commit()
 
+    # 6️⃣ 回傳結果（方便前端確認）
     return {
         "message": "Charge point updated",
         "charge_point_id": cp_id,
