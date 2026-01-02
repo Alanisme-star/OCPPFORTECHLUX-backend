@@ -3,7 +3,7 @@ uvicorn[standard]>=0.27,<1.0
 
 # WebSocket / OCPP
 websockets>=10.4,<12
-ocpp==0.24.0
+ocpp==0.26.0
 
 # Utilities
 requests>=2.31
