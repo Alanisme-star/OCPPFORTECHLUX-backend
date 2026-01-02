@@ -3918,35 +3918,59 @@ async def add_charge_point(data: dict = Body(...)):
         raise HTTPException(status_code=500, detail="內部錯誤")
 
 
-
 @app.put("/api/charge-points/{cp_id}")
-async def update_charge_point(cp_id: str = Path(...), data: dict = Body(...)):
+async def update_charge_point(
+    cp_id: str = Path(...),
+    data: dict = Body(...)
+):
     name = data.get("name")
     status = data.get("status")
+
     update_fields = []
     params = []
+
     if name is not None:
         update_fields.append("name = ?")
         params.append(name)
+
     if status is not None:
         update_fields.append("status = ?")
         params.append(status)
 
-    max_current_a = data.get("maxCurrentA") if isinstance(data, dict) else None
-    if max_current_a is not None:
+    # ✅【關鍵修正】前端送的是 maxCurrent，不是 maxCurrentA
+    max_current = data.get("maxCurrent")
+    if max_current is not None:
         try:
-            max_current_a = float(max_current_a)
+            max_current = float(max_current)
             update_fields.append("max_current_a = ?")
-            params.append(max_current_a)
+            params.append(max_current)
         except Exception:
-            pass
+            raise HTTPException(
+                status_code=400,
+                detail="maxCurrent 必須是數字"
+            )
 
     if not update_fields:
         raise HTTPException(status_code=400, detail="無可更新欄位")
+
     params.append(cp_id)
-    cursor.execute(f"UPDATE charge_points SET {', '.join(update_fields)} WHERE charge_point_id = ?", params)
-    conn.commit()
+
+    # ✅ 改用 get_conn（避免多請求共用 cursor 問題）
+    with get_conn() as _conn:
+        _cur = _conn.cursor()
+        _cur.execute(
+            f"""
+            UPDATE charge_points
+            SET {', '.join(update_fields)}
+            WHERE charge_point_id = ?
+            """,
+            params,
+        )
+        _conn.commit()
+
     return {"message": "已更新"}
+
+
 
 @app.delete("/api/charge-points/{cp_id}")
 async def delete_charge_point(cp_id: str = Path(...)):
