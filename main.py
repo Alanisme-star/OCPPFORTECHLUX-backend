@@ -133,6 +133,7 @@ TZ_TAIPEI = ZoneInfo("Asia/Taipei")
 
 app = FastAPI()
 
+
 # === WebSocket 連線驗證設定（可選）===
 REQUIRED_TOKEN = os.getenv("OCPP_WS_TOKEN", None)  
 
@@ -140,7 +141,7 @@ REQUIRED_TOKEN = os.getenv("OCPP_WS_TOKEN", None)
 
 logging.basicConfig(level=logging.WARNING)
 
-
+ensure_charge_points_schema()
 
 # ===============================
 # Stop API 去重保護（防換頁/重刷）
@@ -361,6 +362,22 @@ cursor = conn.cursor()
 def get_conn():
     # 為每次查詢建立新的連線與游標，避免共用全域 cursor 造成並發問題
     return sqlite3.connect(DB_FILE, check_same_thread=False, timeout=15)
+
+def ensure_charge_points_schema():
+    """
+    確保 charge_points 表有 max_current_a 欄位（雲端第一次跑也會自動補）
+    """
+    with get_conn() as c:
+        cur = c.cursor()
+        cur.execute("PRAGMA table_info(charge_points);")
+        cols = [r[1] for r in cur.fetchall()]  # r[1] = column name
+
+        if "max_current_a" not in cols:
+            cur.execute("ALTER TABLE charge_points ADD COLUMN max_current_a REAL DEFAULT 16;")
+            c.commit()
+            logging.warning("🛠️ [MIGRATION] charge_points add column max_current_a REAL DEFAULT 16")
+        else:
+            logging.info("✅ [MIGRATION] charge_points.max_current_a exists")
 
 def _price_for_timestamp(ts: str) -> float:
     """
