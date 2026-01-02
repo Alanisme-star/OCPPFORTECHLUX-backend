@@ -61,7 +61,6 @@ async def query_smart_charging_capability(cp):
 
 
 
-
 async def send_current_limit_profile(
     cp,
     connector_id: int,
@@ -69,25 +68,22 @@ async def send_current_limit_profile(
     tx_id: int | None = None,
 ):
     """
-    對充電樁送出 OCPP 1.6 SetChargingProfile
-    - connector_id: 通常是 1
-    - limit_a: 電流上限（A）
-    - tx_id: 可選，若提供則只限制該交易
+    對充電樁送出 OCPP 1.6 SetChargingProfile（TxProfile）
     """
 
+    cp_id = getattr(cp, "id", "unknown")
+
     # =====================================================
-    # 🔴 STEP 1：確認 function「真的有被呼叫」
+    # [1] 進入點（確認一定有進來）
     # =====================================================
     logging.error(
         f"[LIMIT][ENTER] send_current_limit_profile "
-        f"| cp_id={getattr(cp, 'id', 'unknown')} "
-        f"| connector_id={connector_id} "
-        f"| tx_id={tx_id} "
-        f"| limit={limit_a}A"
+        f"| cp_id={cp_id} | connector_id={connector_id} "
+        f"| tx_id={tx_id} | limit={limit_a}A"
     )
 
     # =====================================================
-    # 🔴 STEP 2：組 SetChargingProfile payload
+    # [2] 組 payload（ocpp 0.26.0 合法格式）
     # =====================================================
     payload = call.SetChargingProfile(
         connector_id=int(connector_id),
@@ -111,44 +107,36 @@ async def send_current_limit_profile(
     )
 
     # =====================================================
-    # 🔴 STEP 3：實際送出 OCPP call + 回傳結果觀察
+    # [3] 嘗試送出（TRY）
     # =====================================================
+    logging.error(
+        f"[LIMIT][SEND][TRY] "
+        f"| cp_id={cp_id} | tx_id={tx_id} | limit={limit_a}A"
+    )
+
     try:
-        logging.error(
-            f"[LIMIT][SEND] about to call SetChargingProfile "
-            f"| cp_id={getattr(cp, 'id', 'unknown')} "
-            f"| tx_id={tx_id}"
-        )
-
-        logging.error(
-            f"[LIMIT][SEND][TRY] "
-            f"| cp_id={getattr(cp, 'id', 'unknown')} "
-            f"| tx_id={tx_id} "
-            f"| limit={limit_a}A"
-        )
-
-
-
-
-
         resp = await cp.call(payload)
 
+        # =================================================
+        # [4] 成功（沒有 exception 就視為 OK）
+        # =================================================
         logging.error(
-            f"[LIMIT][OK] SetChargingProfile accepted "
-            f"| cp_id={getattr(cp, 'id', 'unknown')} "
-            f"| resp={resp}"
+            f"[LIMIT][SEND][OK] "
+            f"| cp_id={cp_id} | tx_id={tx_id} | resp={resp}"
         )
 
         return resp
 
     except Exception as e:
+        # =================================================
+        # [5] 失敗（ERR）
+        # =================================================
         logging.exception(
-            f"[LIMIT][ERR] SetChargingProfile FAILED "
-            f"| cp_id={getattr(cp, 'id', 'unknown')} "
-            f"| tx_id={tx_id} "
-            f"| err={e}"
+            f"[LIMIT][SEND][ERR] "
+            f"| cp_id={cp_id} | tx_id={tx_id} | err={e}"
         )
         raise
+
 
 
 
