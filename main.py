@@ -1204,6 +1204,8 @@ class ChargePoint(OcppChargePoint):
 
 
 
+
+
     @on(Action.StartTransaction)
     async def on_start_transaction(
         self,
@@ -1213,100 +1215,46 @@ class ChargePoint(OcppChargePoint):
         timestamp,
         **kwargs
     ):
-        # =====================================================
-        # 🔴 STEP 0：進入 StartTransaction（一定要看到）
-        # =====================================================
-        logging.error(
-            f"[DEBUG][START_TX][ENTER] "
-            f"CP={self.id} | connector_id={connector_id} | id_tag={id_tag}"
-        )
 
-        # =====================================================
-        # 🔴 STEP 1：保證 SmartCharging flag 一定存在（debug 用）
-        # =====================================================
+        # ✅ 保證 SmartCharging 能力存在（避免不同 cp instance 問題）
         if not hasattr(self, "supports_smart_charging"):
             self.supports_smart_charging = True
             logging.error(
-                f"[DEBUG][START_TX][FIX] CP={self.id} | "
+                f"🧪 [DEBUG][START_TX][FIX] CP={self.id} | "
                 f"supports_smart_charging defaulted to True"
             )
 
         logging.error(
-            f"[DEBUG][START_TX][STATE] CP={self.id} | "
-            f"supports_smart_charging={self.supports_smart_charging}"
+            f"🧪 [DEBUG][START_TX][ENTER] "
+            f"CP={self.id} | "
+            f"supports_smart_charging={getattr(self, 'supports_smart_charging', 'MISSING')}"
         )
 
-        # =====================================================
-        # 🔴 STEP 2：驗證 idTag（你原本的邏輯，保留）
-        # =====================================================
+
+
+
         with sqlite3.connect(DB_FILE) as conn:
             cursor = conn.cursor()
 
+            # 驗證 idTag
             with get_conn() as _c:
                 cur = _c.cursor()
                 cur.execute("SELECT status FROM id_tags WHERE id_tag = ?", (id_tag,))
                 row = cur.fetchone()
 
                 if not row:
-                    logging.error(
-                        f"[DEBUG][START_TX][IDTAG] Invalid id_tag={id_tag}"
-                    )
-                    return call_result.StartTransactionPayload(
-                        transaction_id=0,
-                        id_tag_info={"status": "Invalid"},
-                    )
+
+
+
+
+
+                    return call_result.StartTransactionPayload(transaction_id=0, id_tag_info={"status": "Invalid"})
 
                 status_db = row[0]
                 status = "Accepted" if status_db == "Accepted" else "Blocked"
 
                 if status != "Accepted":
-                    logging.error(
-                        f"[DEBUG][START_TX][IDTAG] Blocked id_tag={id_tag}"
-                    )
-                    return call_result.StartTransactionPayload(
-                        transaction_id=0,
-                        id_tag_info={"status": status},
-                    )
-
-        # =====================================================
-        # 🔴 STEP 3：建立 transaction（必要，後面要用）
-        # =====================================================
-        transaction_id = int(time.time())  # debug 用即可
-        logging.error(
-            f"[DEBUG][START_TX][TX_CREATED] "
-            f"CP={self.id} | tx_id={transaction_id}"
-        )
-
-        # =====================================================
-        # 🔴 STEP 4：🔥 強制呼叫限流 function（關鍵驗證點）
-        # =====================================================
-        logging.error(
-            f"[DEBUG][FORCE_LIMIT_CALL] about to call send_current_limit_profile | "
-            f"CP={self.id} | tx_id={transaction_id}"
-        )
-
-        await send_current_limit_profile(
-            cp=self,
-            connector_id=connector_id,
-            limit_a=6.0,
-            tx_id=transaction_id,
-        )
-
-        logging.error(
-            f"[DEBUG][FORCE_LIMIT_CALL][DONE] "
-            f"CP={self.id} | tx_id={transaction_id}"
-        )
-
-        # =====================================================
-        # 🔴 STEP 5：正常回覆 StartTransaction
-        # =====================================================
-        return call_result.StartTransactionPayload(
-            transaction_id=transaction_id,
-            id_tag_info={"status": "Accepted"},
-        )
-
-
-
+                    return call_result.StartTransactionPayload(transaction_id=0, id_tag_info={"status": status})
 
 
             # 預約檢查
