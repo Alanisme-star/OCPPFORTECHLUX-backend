@@ -349,9 +349,25 @@ async def websocket_endpoint(websocket: WebSocket, charge_point_id: str):
 async def get_status(cp_id: str):
     return JSONResponse(charging_point_status.get(cp_id, {}))
 
+
+# ===============================
+# 初始化 SQLite 資料庫（順序修正）
+# ===============================
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_FILE = os.path.join(BASE_DIR, "ocpp_data.db")  # ✅ 固定資料庫絕對路徑
+
+
+def get_conn():
+    """
+    為每次查詢建立新的連線與游標，避免共用全域 cursor 造成並發問題
+    """
+    return sqlite3.connect(DB_FILE, check_same_thread=False, timeout=15)
+
+
 def ensure_charge_points_schema():
     """
-    確保 charge_points 表有 max_current_a 欄位（雲端第一次跑也會自動補）
+    確保 charge_points 表有 max_current_a 欄位
+    （雲端第一次跑也會自動補）
     """
     with get_conn() as c:
         cur = c.cursor()
@@ -359,38 +375,40 @@ def ensure_charge_points_schema():
         cols = [r[1] for r in cur.fetchall()]  # r[1] = column name
 
         if "max_current_a" not in cols:
-            cur.execute("ALTER TABLE charge_points ADD COLUMN max_current_a REAL DEFAULT 16;")
+            cur.execute(
+                "ALTER TABLE charge_points "
+                "ADD COLUMN max_current_a REAL DEFAULT 16;"
+            )
             c.commit()
-            logging.warning("🛠️ [MIGRATION] charge_points add column max_current_a REAL DEFAULT 16")
+            logging.warning(
+                "🛠️ [MIGRATION] charge_points add column max_current_a REAL DEFAULT 16"
+            )
         else:
             logging.info(
                 "✅ [MIGRATION] charge_points.max_current_a exists"
             )
 
 
-
-# 初始化 SQLite 資料庫
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_FILE = os.path.join(BASE_DIR, "ocpp_data.db")  # ✅ 固定資料庫絕對路徑
+# 建立一個全域連線（僅供少數 legacy 用途）
 conn = sqlite3.connect(DB_FILE, check_same_thread=False, timeout=15)
 cursor = conn.cursor()
 
-# ✅ 這裡再呼叫
+# ✅ 一定要放在 get_conn / ensure 定義「之後」
 ensure_charge_points_schema()
-
-def get_conn():
-    # 為每次查詢建立新的連線與游標，避免共用全域 cursor 造成並發問題
-    return sqlite3.connect(DB_FILE, check_same_thread=False, timeout=15)
 
 
 def _price_for_timestamp(ts: str) -> float:
     """
-    查當下 timestamp 所對應的電價，修正 24:00 整天規則與跨午夜邏輯。
+    查當下 timestamp 所對應的電價，
+    修正 24:00 整天規則與跨午夜邏輯。
     """
     try:
         # 1. 解析時間
-        dt = datetime.fromisoformat(ts.replace("Z", "+00:00")) \
-            if "Z" in ts else datetime.fromisoformat(ts)
+        dt = (
+            datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            if "Z" in ts
+            else datetime.fromisoformat(ts)
+        )
         dt = dt.astimezone(TZ_TAIPEI)
 
         date_str = dt.strftime("%Y-%m-%d")
@@ -399,12 +417,15 @@ def _price_for_timestamp(ts: str) -> float:
         # 2. 查這一天的規則
         with sqlite3.connect(DB_FILE) as conn:
             cur = conn.cursor()
-            cur.execute("""
+            cur.execute(
+                """
                 SELECT start_time, end_time, price
                 FROM daily_pricing_rules
                 WHERE date = ?
                 ORDER BY start_time ASC
-            """, (date_str,))
+                """,
+                (date_str,),
+            )
             rules = cur.fetchall()
 
         # ------ 沒規則 → 預設 ------
@@ -421,7 +442,6 @@ def _price_for_timestamp(ts: str) -> float:
         # ------ 時段比對 ------
         for s, e, price in normalized:
             if s <= e:
-                # 一般時段
                 if s <= time_str <= e:
                     return float(price)
             else:
@@ -429,7 +449,7 @@ def _price_for_timestamp(ts: str) -> float:
                 if time_str >= s or time_str <= e:
                     return float(price)
 
-        # ------ 仍找不到 → 若為整天設定，套整天價 ------
+        # ------ 整天設定 fallback ------
         overs = [p for s, e, p in normalized if s == "00:00" and e == "23:59"]
         if overs:
             return float(overs[0])
