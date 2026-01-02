@@ -1074,6 +1074,8 @@ class ChargePoint(OcppChargePoint):
 
     @on(Action.BootNotification)
     async def on_boot_notification(self, charge_point_model, charge_point_vendor, **kwargs):
+        logging.error("🔥🔥 BOOT HANDLER NEW VERSION ACTIVE 🔥🔥")
+
         """
         OCPP 1.6 BootNotification
         - 永遠回 Accepted（不能擋樁）
