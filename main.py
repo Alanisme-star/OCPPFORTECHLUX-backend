@@ -120,6 +120,17 @@ async def send_current_limit_profile(
             f"| tx_id={tx_id}"
         )
 
+        logging.error(
+            f"[LIMIT][SEND][TRY] "
+            f"| cp_id={getattr(cp, 'id', 'unknown')} "
+            f"| tx_id={tx_id} "
+            f"| limit={limit_a}A"
+        )
+
+
+
+
+
         resp = await cp.call(payload)
 
         logging.error(
