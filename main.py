@@ -363,21 +363,55 @@ def get_conn():
     """
     return sqlite3.connect(DB_FILE, check_same_thread=False, timeout=15)
 
-
-def ensure_charge_points_schema():
+def ensure_charge_points_table():
     """
-    確保 charge_points 表有 max_current_a 欄位
-    （雲端第一次跑也會自動補）
+    ✅ 保證 charge_points 表一定存在
+    - 新 DB 第一次啟動：建立表（直接包含 max_current_a）
+    - 舊 DB：若已存在，不影響
     """
     with get_conn() as c:
         cur = c.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS charge_points (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                charge_point_id TEXT UNIQUE NOT NULL,
+                name TEXT,
+                status TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                max_current_a REAL DEFAULT 16
+            )
+        """)
+        c.commit()
+
+
+def ensure_charge_points_schema():
+    """
+    ✅ 舊 DB 相容用：
+    - 表存在但沒有 max_current_a → 自動補欄位
+    - 表不存在 → 直接跳過（避免 Deploy 炸掉）
+    """
+    with get_conn() as c:
+        cur = c.cursor()
+
+
+        cur.execute("""
+            SELECT name FROM sqlite_master
+            WHERE type='table' AND name='charge_points'
+        """)
+        if not cur.fetchone():
+            logging.warning(
+                "⚠️ [MIGRATION] charge_points table not found, skip ALTER"
+            )
+            return
+
+
         cur.execute("PRAGMA table_info(charge_points);")
-        cols = [r[1] for r in cur.fetchall()]  # r[1] = column name
+        cols = [r[1] for r in cur.fetchall()]
 
         if "max_current_a" not in cols:
             cur.execute(
                 "ALTER TABLE charge_points "
-                "ADD COLUMN max_current_a REAL DEFAULT 16;"
+                "ADD COLUMN max_current_a REAL DEFAULT 16"
             )
             c.commit()
             logging.warning(
@@ -393,8 +427,10 @@ def ensure_charge_points_schema():
 conn = sqlite3.connect(DB_FILE, check_same_thread=False, timeout=15)
 cursor = conn.cursor()
 
-# ✅ 一定要放在 get_conn / ensure 定義「之後」
+# ✅ 正確順序：先確保表存在，再做 migration
+ensure_charge_points_table()
 ensure_charge_points_schema()
+
 
 
 def _price_for_timestamp(ts: str) -> float:
