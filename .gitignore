@@ -1,39 +1,75 @@
 # =========================
-# Visual Studio / IDE
+# Python
 # =========================
-.vs/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# Environment variables / secrets
+.env
+.env.*
+!.env.example
+
+# =========================
+# Database / Runtime data
+# =========================
+*.db
+*.sqlite
+*.sqlite3
+
+# =========================
+# Logs / Runtime outputs
+# =========================
+*.log
+*.bak
+*.tmp
+*.coverage
+.pytest_cache/
+htmlcov/
+
+# =========================
+# IDE / Editor
+# =========================
 .vscode/
+.vs/
+.idea/
 *.suo
 *.user
 *.userosscache
 *.slnx
 
 # =========================
-# Python
-# =========================
-__pycache__/
-*.pyc
-*.pyo
-venv/
-.env
-
-# =========================
-# Database
-# =========================
-*.db
-*.sqlite
-
-# =========================
-# OS / Temp
+# OS generated files
 # =========================
 .DS_Store
 Thumbs.db
-*.swp
+ehthumbs.db
+Icon?
 
 # =========================
-# Logs / Test
+# Swap / Temp files
 # =========================
-*.log
-*.bak
-*.coverage
-*.pytest_cache/
+*.swp
+*.swo
+*.swm
+*~
+
+# =========================
+# Node / Frontend (若未來有用到)
+# =========================
+node_modules/
+dist/
+build/
+
+# =========================
+# Misc
+# =========================
+.cache/
