@@ -36,43 +36,28 @@ from ocpp.routing import on
 from urllib.parse import urlparse, parse_qsl
 from reportlab.pdfgen import canvas
 
+
 # ===============================
 # 🔌 OCPP 電流限制（TxProfile）
 # ===============================
 async def query_smart_charging_capability(cp):
     """
-    查詢充電樁 Smart Charging 相關能力（OCPP 1.6）
+    ⚠️ 已停用（重要）
+    ------------------------------------------------
+    python-ocpp 目前不支援 call.GetConfiguration，
+    若繼續使用會導致：
+      - supports_smart_charging 永遠 False
+      - SetChargingProfile 永遠被 SKIP
+    ------------------------------------------------
+    若未來要恢復能力探測，請改用：
+      - 嘗試送 SetChargingProfile
+      - 以成功 / 失敗結果回填能力
     """
-    keys = [
-        "ChargingScheduleAllowedChargingRateUnit",
-        "SmartChargingEnabled",
-        "MaxChargingProfilesInstalled",
-    ]
+    raise RuntimeError(
+        "query_smart_charging_capability is DISABLED. "
+        "Do NOT use call.GetConfiguration with current python-ocpp."
+    )
 
-    req = call.GetConfiguration(key=keys)
-
-    resp = await cp.call(req)
-
-    result = {
-        "supported": {},
-        "unsupported": [],
-    }
-
-    for item in resp.configuration_key or []:
-        key = item["key"]
-        val = item.get("value")
-        readonly = item.get("readonly")
-
-        result["supported"][key] = {
-            "value": val,
-            "readonly": readonly,
-        }
-
-    # 樁不支援的 key 會回在 unknown_key
-    for k in resp.unknown_key or []:
-        result["unsupported"].append(k)
-
-    return result
 
 
 
@@ -1078,7 +1063,11 @@ class ChargePoint(OcppChargePoint):
     # =====================================================
     # SmartCharging 能力判定模式
     # - FORCE_SMART_CHARGING=1 → 強制視為支援（開發 / 模擬器）
-    # - FORCE_SMART_CHARGING=0 → 不強制（正式 / 真實樁）
+    # - FORCE_SMART_CHARGING=0 → 一律視為不支援（正式 / 真實樁）
+    #
+    # ⚠️ 設計原則：
+    # - BootNotification 階段【禁止】呼叫 GetConfiguration
+    # - 避免因樁或 library 相容性問題造成誤判或卡樁
     # =====================================================
     FORCE_SMART_CHARGING = os.getenv("FORCE_SMART_CHARGING", "0") == "1"
 
@@ -1087,10 +1076,9 @@ class ChargePoint(OcppChargePoint):
     async def on_boot_notification(self, charge_point_model, charge_point_vendor, **kwargs):
         """
         OCPP 1.6 BootNotification
-        - 回應 Accepted（永遠不能擋樁）
-        - SmartCharging 能力判定：
-            * 開發期：可強制開啟（FORCE_SMART_CHARGING=1）
-            * 正式環境：不依賴 GetConfiguration（避免 library / 樁相容性問題）
+        - 永遠回 Accepted（不能擋樁）
+        - SmartCharging 僅設定「能力旗標」
+        - 不做任何 SmartCharging 通訊（不呼叫 GetConfiguration）
         """
         now = datetime.utcnow().replace(tzinfo=timezone.utc)
 
@@ -1100,10 +1088,10 @@ class ChargePoint(OcppChargePoint):
             )
 
             # =====================================================
-            # 🔍 SmartCharging 能力判定（目前策略）
+            # 🔍 SmartCharging 能力判定（旗標模式）
             # =====================================================
             if FORCE_SMART_CHARGING:
-                # ✅ 開發 / 模擬器模式：強制視為支援
+                # ✅ 開發 / 模擬器：強制視為支援
                 self.supports_smart_charging = True
 
                 logging.warning(
@@ -1111,8 +1099,7 @@ class ChargePoint(OcppChargePoint):
                     f"FORCE_SMART_CHARGING=1 | supports_smart_charging=True"
                 )
             else:
-                # 🟡 正式環境：預設不強制（避免誤判）
-                # 👉 未來可改成「嘗試送 SetChargingProfile，以結果回填能力」
+                # 🟡 正式環境：預設一律不支援
                 self.supports_smart_charging = False
 
                 logging.warning(
