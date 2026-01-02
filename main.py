@@ -1175,14 +1175,29 @@ class ChargePoint(OcppChargePoint):
 
 
     @on(Action.StartTransaction)
-    async def on_start_transaction(self, connector_id, id_tag, meter_start, timestamp, **kwargs):
+    async def on_start_transaction(
+        self,
+        connector_id,
+        id_tag,
+        meter_start,
+        timestamp,
+        **kwargs
+    ):
 
+        # ✅ 保證 SmartCharging 能力存在（避免不同 cp instance 問題）
+        if not hasattr(self, "supports_smart_charging"):
+            self.supports_smart_charging = True
+            logging.error(
+                f"🧪 [DEBUG][START_TX][FIX] CP={self.id} | "
+                f"supports_smart_charging defaulted to True"
+            )
 
         logging.error(
             f"🧪 [DEBUG][START_TX][ENTER] "
             f"CP={self.id} | "
             f"supports_smart_charging={getattr(self, 'supports_smart_charging', 'MISSING')}"
         )
+
 
 
 
