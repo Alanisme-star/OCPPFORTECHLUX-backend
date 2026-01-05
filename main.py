@@ -32,6 +32,10 @@ sys.path.insert(0, "./")
 
 import json
 import os
+# =====================================================
+# 🔧 SmartCharging 強制開關（模擬器 / 開發用）
+# =====================================================
+FORCE_SMART_CHARGING = os.getenv("FORCE_SMART_CHARGING", "0") == "1"
 import io
 import csv
 import uuid
@@ -106,7 +110,7 @@ async def send_current_limit_profile(
     # =====================================================
     # [2] 組 payload（ocpp 0.26.0 合法格式）
     # =====================================================
-    payload = call.SetChargingProfile(
+    payload = call.SetChargingProfilePayload(
         connector_id=int(connector_id),
         cs_charging_profiles={
             "chargingProfileId": int(tx_id % 100000 if tx_id else 1),
