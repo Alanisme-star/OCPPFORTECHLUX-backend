@@ -144,7 +144,7 @@ async def send_current_limit_profile(
     )
 
     # =====================================================
-    # [3] 嘗試送出（TRY）
+    # [3] 嘗試送出（DISPATCH，不等待回應）
     # =====================================================
     logging.error(
         f"[LIMIT][SEND][TRY] "
@@ -152,32 +152,33 @@ async def send_current_limit_profile(
     )
 
     try:
+        # ⚠️ 非同步送出，不 await（避免卡死）
         asyncio.create_task(cp.call(payload))
 
         # =================================================
-        # [4] 成功（沒有 exception 就視為 OK）
+        # [4] 已成功「送出指令」（不是樁已套用）
         # =================================================
         logging.error(
-            f"[LIMIT][SEND][OK] "
-            f"| cp_id={cp_id} | tx_id={tx_id} | resp={resp}"
+            f"[LIMIT][SEND][DISPATCHED] "
+            f"| cp_id={cp_id} | tx_id={tx_id} | limit={limit_a}A"
         )
 
-        # ====== ✅ 新增：記錄後端「限流已成功送出」狀態 ======
+        # ====== ✅ 記錄後端「已送出限流指令」狀態 ======
         now_iso = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
         st = current_limit_state.setdefault(cp_id, {})
         st.update({
             "requested_limit_a": float(limit_a),
             "requested_at": now_iso,
-            "applied": True,
+            "applied": False,              # ⚠️ 尚未確認樁端套用
             "last_try_at": now_iso,
-            "last_ok_at": now_iso,
+            "last_ok_at": None,
             "last_tx_id": int(tx_id) if tx_id else None,
             "last_connector_id": int(connector_id) if connector_id else None,
             "last_error": None,
         })
         # ========================================================
 
-        return resp
+        return
 
     except Exception as e:
         # =================================================
@@ -188,7 +189,7 @@ async def send_current_limit_profile(
             f"| cp_id={cp_id} | tx_id={tx_id} | err={e}"
         )
 
-        # ====== ❌ 新增：記錄限流失敗原因 ======
+        # ====== ❌ 記錄限流失敗原因 ======
         now_iso = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
         st = current_limit_state.setdefault(cp_id, {})
         st.update({
