@@ -2900,7 +2900,7 @@ async def apply_current_limit(charge_point_id: str, data: dict = Body(...)):
         cs_profile = _build_cs_charging_profiles(max_current_a, purpose="ChargePointMaxProfile")
         req = ocpp_call.SetChargingProfilePayload(
             connector_id=connector_id,
-            cs_charging_profiles=cs_profile
+            cs_charging_profile=cs_profile
         )
         resp = await cp.call(req)
 
