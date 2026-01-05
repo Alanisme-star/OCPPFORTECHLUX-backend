@@ -2211,8 +2211,46 @@ def update_charge_point(charge_point_id: str, data: dict = Body(...)):
         },
     }
 
+@app.get("/api/charge-points/{charge_point_id:path}/current-limit")
+async def get_current_limit(charge_point_id: str):
+    # 1️⃣ 正規化 CP ID（處理 URL encode / 前綴 / slash）
+    cp_id = _normalize_cp_id(charge_point_id)
 
 
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT max_current_a
+            FROM charge_points
+            WHERE charge_point_id = ?
+            """,
+            (cp_id,),
+        )
+        row = cur.fetchone()
+
+    if not row:
+
+        raise HTTPException(
+            status_code=404,
+            detail=f"Charge point not found: {cp_id}"
+        )
+
+    raw_val = row[0]
+
+    # 3️⃣ ⚠️ 關鍵修正點（避免 6A 被當 False）
+    if raw_val is None:
+        limit_a = 16.0   # 預設值
+    else:
+        try:
+            limit_a = float(raw_val)
+        except Exception:
+            limit_a = 16.0
+
+
+    return {
+        "maxCurrentA": limit_a
+    }
 
 @app.post("/api/charge-points/{charge_point_id:path}/current-limit")
 async def set_current_limit(
