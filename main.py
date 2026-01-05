@@ -2268,11 +2268,17 @@ async def set_current_limit(
         if limit_a <= 0:
             raise ValueError()
     except Exception:
-        raise HTTPException(status_code=400, detail="limit_amps must be positive number")
+        raise HTTPException(
+            status_code=400,
+            detail="limit_amps must be positive number"
+        )
 
-
+    # ===============================
+    # 🔧 關鍵修正：UPDATE → INSERT if not exists
+    # ===============================
     with get_conn() as conn:
         cur = conn.cursor()
+
         cur.execute(
             """
             UPDATE charge_points
@@ -2281,6 +2287,16 @@ async def set_current_limit(
             """,
             (limit_a, cp_id),
         )
+
+        if cur.rowcount == 0:
+            cur.execute(
+                """
+                INSERT INTO charge_points (charge_point_id, max_current_a)
+                VALUES (?, ?)
+                """,
+                (cp_id, limit_a),
+            )
+
         conn.commit()
 
     cp = connected_charge_points.get(cp_id)
