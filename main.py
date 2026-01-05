@@ -112,7 +112,7 @@ async def send_current_limit_profile(
     # =====================================================
     payload = call.SetChargingProfilePayload(
         connector_id=int(connector_id),
-        cs_charging_profile={
+        cs_charging_profiles={
             "charging_profile_id": int(tx_id % 100000 if tx_id else 1),
             "stack_level": 1,
             "charging_profile_purpose": "TxProfile",
