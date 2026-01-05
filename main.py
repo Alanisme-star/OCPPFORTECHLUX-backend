@@ -6,6 +6,27 @@ def _normalize_cp_id(cp_id: str) -> str:
 
 connected_charge_points = {}
 live_status_cache = {}
+
+# ===============================
+# 🔌 SmartCharging / 限流狀態（後端真實控制狀態）
+# ===============================
+current_limit_state = {}
+# 結構說明（每個 cp_id 一筆）：
+# {
+#   cp_id: {
+#     "requested_limit_a": float,
+#     "requested_at": iso8601,
+#     "applied": bool,
+#     "last_try_at": iso8601,
+#     "last_ok_at": iso8601 | None,
+#     "last_err_at": iso8601 | None,
+#     "last_error": str | None,
+#     "last_tx_id": int | None,
+#     "last_connector_id": int | None,
+#   }
+# }
+
+
 import sys
 sys.path.insert(0, "./")
 
@@ -125,6 +146,25 @@ async def send_current_limit_profile(
             f"| cp_id={cp_id} | tx_id={tx_id} | resp={resp}"
         )
 
+
+        # ====== ✅ 新增：記錄後端「限流已成功送出」狀態 ======
+        now_iso = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
+        st = current_limit_state.setdefault(cp_id, {})
+        st.update({
+            "requested_limit_a": float(limit_a),
+            "requested_at": now_iso,
+            "applied": True,
+            "last_try_at": now_iso,
+            "last_ok_at": now_iso,
+            "last_tx_id": int(tx_id) if tx_id else None,
+            "last_connector_id": int(connector_id) if connector_id else None,
+            "last_error": None,
+        })
+        # ========================================================
+
+
+
+
         return resp
 
     except Exception as e:
@@ -135,6 +175,19 @@ async def send_current_limit_profile(
             f"[LIMIT][SEND][ERR] "
             f"| cp_id={cp_id} | tx_id={tx_id} | err={e}"
         )
+
+        # ====== ❌ 新增：記錄限流失敗原因 ======
+        now_iso = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
+        st = current_limit_state.setdefault(cp_id, {})
+        st.update({
+            "applied": False,
+            "last_try_at": now_iso,
+            "last_err_at": now_iso,
+            "last_error": str(e),
+        })
+        # ======================================
+
+
         raise
 
 
@@ -2177,7 +2230,7 @@ async def set_current_limit(
     except Exception:
         raise HTTPException(status_code=400, detail="limit_amps must be positive number")
 
-    # 1️⃣ 先存進 DB（不管是否正在充電）
+
     with get_conn() as conn:
         cur = conn.cursor()
         cur.execute(
@@ -2190,7 +2243,6 @@ async def set_current_limit(
         )
         conn.commit()
 
-    # 2️⃣ 如果樁有連線 & 正在充電 → 立刻送 SetChargingProfile
     cp = connected_charge_points.get(cp_id)
     applied = False
 
@@ -2234,6 +2286,20 @@ async def set_current_limit(
     }
 
 
+@app.get("/api/charge-points/{charge_point_id:path}/current-limit-status")
+async def get_current_limit_status(charge_point_id: str):
+    cp_id = _normalize_cp_id(charge_point_id)
+
+    cp = connected_charge_points.get(cp_id)
+
+    return {
+        "charge_point_id": cp_id,
+        "connected": bool(cp),
+        "supports_smart_charging": bool(
+            getattr(cp, "supports_smart_charging", False)
+        ) if cp else False,
+        "limit_state": current_limit_state.get(cp_id),
+    }
 
 
 
