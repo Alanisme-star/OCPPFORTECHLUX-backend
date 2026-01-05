@@ -147,7 +147,7 @@ async def send_current_limit_profile(
     )
 
     try:
-        resp = await cp.call(payload)
+        cp.call(payload)
 
         # =================================================
         # [4] 成功（沒有 exception 就視為 OK）
