@@ -113,23 +113,24 @@ async def send_current_limit_profile(
     payload = call.SetChargingProfilePayload(
         connector_id=int(connector_id),
         cs_charging_profile={
-            "chargingProfileId": int(tx_id % 100000 if tx_id else 1),
-            "stackLevel": 1,
-            "chargingProfilePurpose": "TxProfile",
-            "chargingProfileKind": "Absolute",
-            "chargingSchedule": {
-                "chargingRateUnit": "A",
-                "chargingSchedulePeriod": [
+            "charging_profile_id": int(tx_id % 100000 if tx_id else 1),
+            "stack_level": 1,
+            "charging_profile_purpose": "TxProfile",
+            "charging_profile_kind": "Absolute",
+            "charging_schedule": {
+                "charging_rate_unit": "A",
+                "charging_schedule_period": [
                     {
-                        "startPeriod": 0,
+                        "start_period": 0,
                         "limit": float(limit_a),
-                        "numberPhases": 1,
+                        "number_phases": 1,
                     }
                 ],
             },
-            **({"transactionId": int(tx_id)} if tx_id else {}),
+            **({"transaction_id": int(tx_id)} if tx_id else {}),
         },
     )
+
 
     # =====================================================
     # [2.5] 🔍 DEBUG：確認 payload / call 型態（Step A）
