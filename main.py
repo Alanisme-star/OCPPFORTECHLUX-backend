@@ -1181,7 +1181,7 @@ class ChargePoint(OcppChargePoint):
             )
 
             # =====================================================
-            # 🔍 SmartCharging 能力判定（旗標模式）
+            # 🔍 SmartCharging 能力判定（選項 A：模擬器強制）
             # =====================================================
             if FORCE_SMART_CHARGING:
                 # ✅ 開發 / 模擬器：強制視為支援
@@ -1192,25 +1192,14 @@ class ChargePoint(OcppChargePoint):
                     f"FORCE_SMART_CHARGING=1 | supports_smart_charging=True"
                 )
             else:
-                # 🟡 正式環境：預設一律不支援
+                # 🟡 正式環境：預設一律不支援（安全）
                 self.supports_smart_charging = False
 
-                logging.warning(
+                logging.info(
                     f"[CAPABILITY][DEFAULT] CP={self.id} | "
                     f"FORCE_SMART_CHARGING=0 | supports_smart_charging=False"
                 )
-
-
             # =====================================================
-            # 🔧 DEBUG：強制 SmartCharging = True（排除所有干擾）
-            # =====================================================
-            self.supports_smart_charging = True
-
-            logging.error(
-                f"🔧 [DEBUG][BOOT] CP={self.id} | supports_smart_charging={self.supports_smart_charging}"
-            )
-
-
 
             # =====================================================
             # ✅ 正常回應 BootNotification（永遠 Accepted）
@@ -1229,6 +1218,7 @@ class ChargePoint(OcppChargePoint):
                 interval=10,
                 status=RegistrationStatus.accepted,
             )
+
 
 
 
