@@ -128,6 +128,17 @@ async def send_current_limit_profile(
     )
 
     # =====================================================
+    # [2.5] 🔍 DEBUG：確認 payload / call 型態（Step A）
+    # =====================================================
+    logging.error(
+        f"[LIMIT][DEBUG] "
+        f"payload={payload} | "
+        f"type(payload)={type(payload)} | "
+        f"call_fn={cp.call} | "
+        f"type(call_fn)={type(cp.call)}"
+    )
+
+    # =====================================================
     # [3] 嘗試送出（TRY）
     # =====================================================
     logging.error(
@@ -146,7 +157,6 @@ async def send_current_limit_profile(
             f"| cp_id={cp_id} | tx_id={tx_id} | resp={resp}"
         )
 
-
         # ====== ✅ 新增：記錄後端「限流已成功送出」狀態 ======
         now_iso = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
         st = current_limit_state.setdefault(cp_id, {})
@@ -161,9 +171,6 @@ async def send_current_limit_profile(
             "last_error": None,
         })
         # ========================================================
-
-
-
 
         return resp
 
@@ -186,7 +193,6 @@ async def send_current_limit_profile(
             "last_error": str(e),
         })
         # ======================================
-
 
         raise
 
