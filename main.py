@@ -2120,9 +2120,8 @@ class ChargePoint(OcppChargePoint):
 
 
             # ===============================
-            # 🔌 StartTransaction 後立即限流
+            # 🔌 StartTransaction 後立即限流（修改後）
             # ✅ 僅在「社區 Smart Charging 未啟用」時才執行
-            # （已啟用時，限流交給 rebalance，避免 32A → 16A 連發）
             # ===============================
             try:
                 sc_enabled, sc_cfg = is_community_smart_charging_enabled()
@@ -2146,11 +2145,6 @@ class ChargePoint(OcppChargePoint):
 
                     limit_a = float(row[0]) if row and row[0] else 16.0
 
-                    logging.error(
-                        f"[DEBUG][START_TX][LIMIT] "
-                        f"cp_id={self.id} | limit_a={limit_a} | raw_row={row} | db={DB_FILE}"
-                    )
-
                     logging.warning(
                         f"[LIMIT][DB] cp_id={self.id} | max_current_a={limit_a}"
                     )
@@ -2161,17 +2155,7 @@ class ChargePoint(OcppChargePoint):
                             cp=self,
                             connector_id=connector_id,
                             limit_a=limit_a,
-                            tx_id=transaction_id,
-                        )
-
-                        logging.warning(
-                            f"[LIMIT][SEND] SetChargingProfile "
-                            f"| cp_id={self.id} | tx_id={transaction_id} | limit={limit_a}A"
-                        )
-                    else:
-                        logging.warning(
-                            f"[LIMIT][SKIP] CP={self.id} does NOT support SmartCharging | "
-                            f"skip SetChargingProfile | limit={limit_a}A"
+                            tx_id=tx_id,
                         )
 
             except Exception as e:
