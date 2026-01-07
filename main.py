@@ -681,15 +681,61 @@ async def websocket_endpoint(websocket: WebSocket, charge_point_id: str):
 
     except WebSocketDisconnect:
         logger.warning(f"⚠️ Disconnected: {charge_point_id}")
+
     except Exception as e:
         logger.error(f"❌ WebSocket error for {charge_point_id}: {e}")
         try:
             await websocket.close()
         except Exception:
             pass
+
     finally:
-        # 3) 清理連線狀態
-        connected_charge_points.pop(_normalize_cp_id(charge_point_id), None)
+        cp_norm = _normalize_cp_id(charge_point_id)
+
+        # ==================================================
+        # 3) 移除 WebSocket 連線
+        # ==================================================
+        connected_charge_points.pop(cp_norm, None)
+
+        # ==================================================
+        # 4) 🔴 關鍵修正：
+        #    WebSocket 中斷時，自動結束未完成交易
+        # ==================================================
+        try:
+            with sqlite3.connect(DB_FILE, check_same_thread=False) as conn:
+                cur = conn.cursor()
+                cur.execute("""
+                    SELECT transaction_id
+                    FROM transactions
+                    WHERE charge_point_id = ?
+                      AND stop_timestamp IS NULL
+                """, (cp_norm,))
+                rows = cur.fetchall()
+
+            if rows:
+                now = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
+
+                with sqlite3.connect(DB_FILE, check_same_thread=False) as conn:
+                    cur = conn.cursor()
+                    for (tx_id,) in rows:
+                        cur.execute("""
+                            UPDATE transactions
+                            SET stop_timestamp = ?, reason = ?
+                            WHERE transaction_id = ?
+                        """, (now, "ConnectionLost", tx_id))
+
+                        logger.warning(
+                            f"[AUTO-STOP][WS_DISCONNECT] "
+                            f"cp_id={cp_norm} tx_id={tx_id} reason=ConnectionLost"
+                        )
+
+                    conn.commit()
+
+        except Exception as e:
+            logger.exception(
+                f"[AUTO-STOP][WS_DISCONNECT][ERR] cp_id={cp_norm} | err={e}"
+            )
+
 
 
 
