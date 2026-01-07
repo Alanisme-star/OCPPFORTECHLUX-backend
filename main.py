@@ -736,14 +736,50 @@ async def websocket_endpoint(websocket: WebSocket, charge_point_id: str):
             )
 
         # ==================================================
-        # 5) 🔴【關鍵修正】清除 / 覆寫 live_status_cache
+        # 5) 🔴【關鍵修正】強制同步狀態來源
+        #    - status_logs
+        #    - charging_point_status
+        # ==================================================
+        try:
+            now = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
+
+            # --- 寫入 status_logs（等效 StatusNotification）---
+            with sqlite3.connect(DB_FILE, check_same_thread=False) as conn:
+                cur = conn.cursor()
+                cur.execute("""
+                    INSERT INTO status_logs
+                    (charge_point_id, connector_id, status, timestamp)
+                    VALUES (?, ?, ?, ?)
+                """, (cp_norm, 0, "Available", now))
+                conn.commit()
+
+            # --- 同步 HTTP 狀態快取 ---
+            charging_point_status[cp_norm] = {
+                "connector_id": 0,
+                "status": "Available",
+                "timestamp": now,
+                "error_code": "NoError",
+                "derived": True,   # ← 標記為後端強制寫入
+            }
+
+            logger.warning(
+                f"[STATUS][WS_DISCONNECT][FORCE_AVAILABLE] cp_id={cp_norm}"
+            )
+
+        except Exception as e:
+            logger.exception(
+                f"[STATUS][WS_DISCONNECT][ERR] cp_id={cp_norm} | err={e}"
+            )
+
+        # ==================================================
+        # 6) 清除 / 覆寫 live_status_cache
         #    避免前端誤判仍在 Charging
         # ==================================================
         try:
             prev = live_status_cache.get(cp_norm, {})
 
             live_status_cache[cp_norm] = {
-                "status": "Available",          # ← 明確回到可用
+                "status": "Available",
                 "power": 0,
                 "voltage": 0,
                 "current": 0,
@@ -753,7 +789,7 @@ async def websocket_endpoint(websocket: WebSocket, charge_point_id: str):
 
                 "estimated_energy": 0,
                 "estimated_amount": 0,
-                "derived": True,                # ← 標記為後端補寫
+                "derived": True,
                 "updated_at": time.time(),
             }
 
@@ -766,6 +802,7 @@ async def websocket_endpoint(websocket: WebSocket, charge_point_id: str):
             logger.exception(
                 f"[LIVE][WS_DISCONNECT][ERR] cp_id={cp_norm} | err={e}"
             )
+
 
 
 
