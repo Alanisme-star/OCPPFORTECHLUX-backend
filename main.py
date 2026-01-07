@@ -152,16 +152,73 @@ async def send_current_limit_profile(
     )
 
     try:
-        # ⚠️ 非同步送出，不 await（避免卡死）
-        asyncio.create_task(cp.call(payload))
-
         # =================================================
-        # [4] 已成功「送出指令」（不是樁已套用）
+        # [4] 送出 SetChargingProfile，並等待樁端回應
         # =================================================
         logging.error(
-            f"[LIMIT][SEND][DISPATCHED] "
+            f"[LIMIT][SEND][TRY] "
             f"| cp_id={cp_id} | tx_id={tx_id} | limit={limit_a}A"
         )
+
+        # ✅ 等待樁端回應（加 timeout，避免卡死）
+        resp = await asyncio.wait_for(
+            cp.call(payload),
+            timeout=10.0
+        )
+
+        # OCPP 1.6 標準回傳通常有 status
+        status = getattr(resp, "status", None)
+        status_str = str(status) if status is not None else "UNKNOWN"
+
+        ok = (status_str.lower() == "accepted")
+
+        now_iso = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
+        st = current_limit_state.setdefault(cp_id, {})
+        st.update({
+            "requested_limit_a": float(limit_a),
+            "requested_at": now_iso,
+            "applied": ok,
+            "last_tx_id": tx_id,
+            "last_error": None if ok else f"status={status_str}",
+        })
+
+        logging.error(
+            f"[LIMIT][SEND][RESP] "
+            f"| cp_id={cp_id} | tx_id={tx_id} | status={status_str} | applied={ok}"
+        )
+
+    except asyncio.TimeoutError:
+        now_iso = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
+        st = current_limit_state.setdefault(cp_id, {})
+        st.update({
+            "requested_limit_a": float(limit_a),
+            "requested_at": now_iso,
+            "applied": False,
+            "last_tx_id": tx_id,
+            "last_error": "timeout>10s",
+        })
+
+        logging.error(
+            f"[LIMIT][SEND][TIMEOUT] "
+            f"| cp_id={cp_id} | tx_id={tx_id} | limit={limit_a}A"
+        )
+
+    except Exception as e:
+        now_iso = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
+        st = current_limit_state.setdefault(cp_id, {})
+        st.update({
+            "requested_limit_a": float(limit_a),
+            "requested_at": now_iso,
+            "applied": False,
+            "last_tx_id": tx_id,
+            "last_error": repr(e),
+        })
+
+        logging.exception(
+            f"[LIMIT][SEND][ERR] "
+            f"| cp_id={cp_id} | tx_id={tx_id} | err={e}"
+        )
+
 
         # ====== ✅ 記錄後端「已送出限流指令」狀態 ======
         now_iso = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
@@ -456,6 +513,24 @@ def debug_start_transaction_check(
     try:
         active_now = get_active_charging_count()
         trial_count = active_now + 1
+
+        # ✅ 新增區段：確認社區 Smart Charging 是否「真正啟用」
+        smart_enabled, community_cfg = is_community_smart_charging_enabled()
+
+        if not smart_enabled:
+            out = {
+                "cp_id": cp_norm,
+                "idTag": id_tag,
+                "decision": "Accepted",
+                "reason": "smart_charging_disabled",
+                "active_now": active_now,
+                "trial_count": trial_count,
+                "community_settings": community_cfg,
+            }
+            logging.warning(f"[DEBUG][START_TX_CHECK] {out}")
+            return out
+
+        # === 原本流程：開始試算允許電流 ===
         allowed_a = calculate_allowed_current(
             active_charging_count=trial_count
         )
@@ -1769,35 +1844,49 @@ class ChargePoint(OcppChargePoint):
             # 🏘️ Smart Charging：最後一台車輛擋下判斷（Step 2-3）
             # ==================================================
             try:
-                # 目前正在充電的台數
-                active_now = get_active_charging_count()
+                # 🔰 先確認是否啟用 Smart Charging
+                sc_enabled, sc_cfg = is_community_smart_charging_enabled()
 
-                # 嘗試「加上這一台」
-                trial_count = active_now + 1
-
-                allowed_a = calculate_allowed_current(
-                    active_charging_count=trial_count
-                )
-
-                logging.warning(
-                    f"[SMART][START_TX][CHECK] "
-                    f"cp_id={self.id} | "
-                    f"active_now={active_now} | "
-                    f"trial_count={trial_count} | "
-                    f"allowed_a={allowed_a}"
-                )
-
-                # ❌ 若回傳 None，代表最後一台不可充電
-                if allowed_a is None:
-                    logging.error(
-                        f"[SMART][START_TX][BLOCKED] "
+                if not sc_enabled:
+                    logging.warning(
+                        f"[SMART][START_TX][SKIP] "
                         f"cp_id={self.id} | "
-                        f"reason=avg_current_below_min"
+                        f"reason=community_smart_charging_disabled | "
+                        f"cfg={sc_cfg}"
                     )
-                    return call_result.StartTransactionPayload(
-                        transaction_id=0,
-                        id_tag_info={"status": "Blocked"}
+                else:
+                    # 目前正在充電的台數
+                    active_now = get_active_charging_count()
+
+                    # 嘗試「加上這一台」
+                    trial_count = active_now + 1
+
+                    allowed_a = calculate_allowed_current(
+                        active_charging_count=trial_count
                     )
+
+                    logging.warning(
+                        f"[SMART][START_TX][CHECK] "
+                        f"cp_id={self.id} | "
+                        f"active_now={active_now} | "
+                        f"trial_count={trial_count} | "
+                        f"allowed_a={allowed_a} | "
+                        f"cfg={sc_cfg}"
+                    )
+
+                    # ❌ 若回傳 None，代表最後一台不可充電
+                    if allowed_a is None:
+                        logging.error(
+                            f"[SMART][START_TX][BLOCKED] "
+                            f"cp_id={self.id} | "
+                            f"reason=avg_current_below_min | "
+                            f"trial_count={trial_count} | "
+                            f"cfg={sc_cfg}"
+                        )
+                        return call_result.StartTransactionPayload(
+                            transaction_id=0,
+                            id_tag_info={"status": "Blocked"}
+                        )
 
             except Exception as e:
                 # ⚠️ 保守策略：SmartCharging 出錯時，不影響原本流程
@@ -1806,35 +1895,6 @@ class ChargePoint(OcppChargePoint):
                     f"cp_id={self.id} | err={e}"
                 )
 
-
-            # 確保 meter_start 有效
-            try:
-                meter_start_val = float(meter_start or 0) / 1000.0
-            except Exception:
-                meter_start_val = 0.0
-
-            # 建立交易 ID
-            transaction_id = int(datetime.utcnow().timestamp() * 1000)
-
-            # === 修正：確保 start_timestamp 永遠正確 ===
-            try:
-                if timestamp:
-                    start_ts = datetime.fromisoformat(timestamp).astimezone(timezone.utc).isoformat()
-                else:
-                    raise ValueError("Empty timestamp")
-            except Exception:
-                start_ts = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
-
-            # 寫入交易紀錄
-            cursor.execute("""
-                INSERT INTO transactions (
-                    transaction_id, charge_point_id, connector_id, id_tag,
-                    meter_start, start_timestamp, meter_stop, stop_timestamp, reason
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (transaction_id, self.id, connector_id, id_tag, meter_start, start_ts, None, None, None))
-
-            conn.commit()
-            logging.info(f"🚗 StartTransaction 成功 | CP={self.id} | idTag={id_tag} | transactionId={transaction_id} | start_ts={start_ts} | meter_start={meter_start_val} kWh")
 
 
 
@@ -1852,84 +1912,70 @@ class ChargePoint(OcppChargePoint):
                 )
 
 
-
-
-
-
             # ===============================
             # 🔌 StartTransaction 後立即限流
+            # ✅ 僅在「社區 Smart Charging 未啟用」時才執行
+            # （已啟用時，限流交給 rebalance，避免 32A → 16A 連發）
             # ===============================
             try:
-                # 1) 從資料庫讀取該樁的電流上限
-                with sqlite3.connect(DB_FILE) as _c:
-                    _cur = _c.cursor()
-                    _cur.execute(
-                        "SELECT max_current_a FROM charge_points WHERE charge_point_id = ?",
-                        (self.id,),
-                    )
-                    row = _cur.fetchone()
+                sc_enabled, sc_cfg = is_community_smart_charging_enabled()
 
-                limit_a = float(row[0]) if row and row[0] else 16.0
-
-                logging.error(
-                    f"[DEBUG][START_TX][LIMIT] "
-                    f"cp_id={self.id} | limit_a={limit_a} | raw_row={row} | db={DB_FILE}"
-                )
-
-                logging.warning(
-                    f"[LIMIT][DB] cp_id={self.id} | max_current_a={limit_a}"
-                )
-
-
-
-                # 2) 發送 SetChargingProfile（僅在樁支援 SmartCharging 時）
-                if getattr(self, "supports_smart_charging", False):
-                    await send_current_limit_profile(
-                        cp=self,
-                        connector_id=connector_id,
-                        limit_a=limit_a,
-                        tx_id=transaction_id,
-                    )
-
+                if sc_enabled:
                     logging.warning(
-                        f"[LIMIT][SEND] SetChargingProfile "
-                        f"| cp_id={self.id} | tx_id={transaction_id} | limit={limit_a}A"
+                        f"[LIMIT][SKIP][START_TX] "
+                        f"cp_id={self.id} | "
+                        f"reason=community_smart_charging_enabled | cfg={sc_cfg}"
                     )
+
                 else:
-                    logging.warning(
-                        f"[LIMIT][SKIP] CP={self.id} does NOT support SmartCharging | "
-                        f"skip SetChargingProfile | limit={limit_a}A"
+                    # 1) 從資料庫讀取該樁的電流上限
+                    with sqlite3.connect(DB_FILE) as _c:
+                        _cur = _c.cursor()
+                        _cur.execute(
+                            "SELECT max_current_a FROM charge_points WHERE charge_point_id = ?",
+                            (self.id,),
+                        )
+                        row = _cur.fetchone()
+
+                    limit_a = float(row[0]) if row and row[0] else 16.0
+
+                    logging.error(
+                        f"[DEBUG][START_TX][LIMIT] "
+                        f"cp_id={self.id} | limit_a={limit_a} | raw_row={row} | db={DB_FILE}"
                     )
+
+                    logging.warning(
+                        f"[LIMIT][DB] cp_id={self.id} | max_current_a={limit_a}"
+                    )
+
+                    # 2) 發送 SetChargingProfile（僅在樁支援 SmartCharging 時）
+                    if getattr(self, "supports_smart_charging", False):
+                        await send_current_limit_profile(
+                            cp=self,
+                            connector_id=connector_id,
+                            limit_a=limit_a,
+                            tx_id=transaction_id,
+                        )
+
+                        logging.warning(
+                            f"[LIMIT][SEND] SetChargingProfile "
+                            f"| cp_id={self.id} | tx_id={transaction_id} | limit={limit_a}A"
+                        )
+                    else:
+                        logging.warning(
+                            f"[LIMIT][SKIP] CP={self.id} does NOT support SmartCharging | "
+                            f"skip SetChargingProfile | limit={limit_a}A"
+                        )
 
             except Exception as e:
-                logging.error(
-                    f"[LIMIT][ERR] failed to send SetChargingProfile "
-                    f"| cp_id={self.id} | err={e}"
+                logging.exception(
+                    f"[LIMIT][START_TX][ERROR] cp_id={self.id} | err={e}"
                 )
 
 
 
 
-            # ⭐ 重置快取，避免沿用上一筆交易的電費/電量
-            live_status_cache[self.id] = {
-                "power": 0,
-                "voltage": 0,
-                "current": 0,
-                "energy": 0,
-                "estimated_energy": 0,
-                "estimated_amount": 0,
-                "price_per_kwh": 0,
-                "timestamp": datetime.utcnow().replace(tzinfo=timezone.utc).isoformat(),
-                "derived": False,
-                "stale": False,
-            }
 
-            logging.debug(f"🔄 [DEBUG] live_status_cache reset at StartTransaction | CP={self.id} | cache={live_status_cache[self.id]}")
-
-            return call_result.StartTransactionPayload(
-                transaction_id=transaction_id,
-                id_tag_info={"status": "Accepted"}
-            )
 
 
     @on(Action.StopTransaction)
