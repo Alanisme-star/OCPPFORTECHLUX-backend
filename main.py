@@ -445,6 +445,206 @@ def get_conn():
     """
     return sqlite3.connect(DB_FILE, check_same_thread=False, timeout=15)
 
+
+def get_community_settings():
+    with sqlite3.connect(DB_FILE, check_same_thread=False, timeout=15) as conn:
+        cur = conn.cursor()
+        cur.execute('''
+            SELECT enabled, contract_kw, voltage_v, phases, min_current_a, max_current_a
+            FROM community_settings
+            WHERE id = 1
+        ''')
+        row = cur.fetchone()
+
+    if not row:
+        return {
+            "enabled": False,
+            "contract_kw": 0,
+            "voltage_v": 220,
+            "phases": 1,
+            "min_current_a": 16,
+            "max_current_a": 32,
+        }
+
+    return {
+        "enabled": bool(row[0]),
+        "contract_kw": float(row[1] or 0),
+        "voltage_v": float(row[2] or 220),
+        "phases": int(row[3] or 1),
+        "min_current_a": float(row[4] or 16),
+        "max_current_a": float(row[5] or 32),
+    }
+
+
+
+def calculate_allowed_current(
+    *,
+    active_charging_count: int,
+):
+    """
+    社區 Smart Charging 核心計算函式
+
+    回傳：
+    - None  → 最後一台「不允許充電」（低於 min_current_a）
+    - float → 每台車應套用的電流 (A)
+    """
+
+    cfg = get_community_settings()
+
+    # 🔒 若未啟用社區分流，表示後端不介入電流控制
+    if not cfg["enabled"]:
+        return None
+
+    contract_kw = cfg["contract_kw"]
+    if contract_kw <= 0:
+        return None
+
+    voltage_v = cfg["voltage_v"]
+    min_a = cfg["min_current_a"]
+    max_a = cfg["max_current_a"]
+
+    # 防呆：理論上不會發生，但保險起見
+    if active_charging_count <= 0:
+        return max_a
+
+    # 🔢 契約容量 → 可用總電流
+    total_current_a = (contract_kw * 1000.0) / voltage_v
+
+    # ➗ 平均分攤
+    avg_a = total_current_a / active_charging_count
+
+    # ❌ 若低於最低充電電流，表示「最後一台不可充電」
+    if avg_a < min_a:
+        return None
+
+    # ✅ 高於單樁最大上限，直接用上限
+    if avg_a > max_a:
+        return max_a
+
+    # ✅ 介於 min ~ max 之間，依平均值
+    return round(avg_a, 2)
+
+
+
+
+def get_active_charging_count():
+    """
+    取得目前「正在充電中的車輛數」
+
+    判定依據：
+    - stop_timestamp IS NULL
+    - start_timestamp IS NOT NULL
+    """
+
+    with sqlite3.connect(DB_FILE, check_same_thread=False, timeout=15) as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT COUNT(*)
+            FROM transactions
+            WHERE stop_timestamp IS NULL
+              AND start_timestamp IS NOT NULL
+        """)
+        row = cur.fetchone()
+
+    try:
+        return int(row[0] or 0)
+    except Exception:
+        return 0
+
+
+async def rebalance_all_charging_points(reason: str):
+    """
+    Smart Charging 核心調度器（Step 2-4）
+    """
+
+    try:
+        active_count = get_active_charging_count()
+
+        allowed_a = calculate_allowed_current(
+            active_charging_count=active_count
+        )
+
+        logging.warning(
+            f"[SMART][REBALANCE] reason={reason} | "
+            f"active_count={active_count} | allowed_a={allowed_a}"
+        )
+
+        if allowed_a is None:
+            logging.error(
+                f"[SMART][REBALANCE][SKIP] "
+                f"allowed_a=None | reason={reason}"
+            )
+            return
+
+        try:
+            allowed_a = float(allowed_a)
+        except Exception:
+            logging.error(
+                f"[SMART][REBALANCE][SKIP] "
+                f"allowed_a invalid={allowed_a}"
+            )
+            return
+
+        with sqlite3.connect(DB_FILE, check_same_thread=False, timeout=15) as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT charge_point_id, connector_id, transaction_id
+                FROM transactions
+                WHERE stop_timestamp IS NULL
+                  AND start_timestamp IS NOT NULL
+            """)
+            rows = cur.fetchall()
+
+        for cp_id, connector_id, tx_id in rows:
+            cp = connected_charge_points.get(cp_id)
+            if not cp:
+                logging.warning(
+                    f"[SMART][REBALANCE][SKIP] cp_id={cp_id} not connected"
+                )
+                continue
+
+            if not getattr(cp, "supports_smart_charging", False):
+                logging.warning(
+                    f"[SMART][REBALANCE][SKIP] cp_id={cp_id} not support smart charging"
+                )
+                continue
+
+            try:
+                tx_id = int(tx_id)
+            except Exception:
+                logging.warning(
+                    f"[SMART][REBALANCE][SKIP] invalid tx_id={tx_id}"
+                )
+                continue
+
+            try:
+                await send_current_limit_profile(
+                    cp=cp,
+                    connector_id=int(connector_id or 1),
+                    limit_a=allowed_a,
+                    tx_id=tx_id,
+                )
+
+                logging.warning(
+                    f"[SMART][REBALANCE][APPLY] "
+                    f"cp_id={cp_id} | tx_id={tx_id} | limit={allowed_a}A"
+                )
+
+            except Exception as e:
+                logging.exception(
+                    f"[SMART][REBALANCE][ERR] "
+                    f"cp_id={cp_id} | tx_id={tx_id} | err={e}"
+                )
+
+    except Exception as e:
+        logging.exception(
+            f"[SMART][REBALANCE][FATAL] err={e}"
+        )
+
+
+
+
+
 def ensure_charge_points_table():
     """
     ✅ 保證 charge_points 表一定存在
@@ -962,6 +1162,35 @@ CREATE TABLE IF NOT EXISTS status_logs (
 
 conn.commit()
 
+
+# ============================================================
+# 🏘️ 社區 Smart Charging 設定（契約容量）
+# ============================================================
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS community_settings (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    enabled INTEGER DEFAULT 0,          -- 0=false, 1=true
+    contract_kw REAL DEFAULT 0,          -- 契約容量 (kW)
+    voltage_v REAL DEFAULT 220,          -- 電壓 (V)
+    phases INTEGER DEFAULT 1,            -- 相數（先保留）
+    min_current_a REAL DEFAULT 16,       -- 最低充電電流
+    max_current_a REAL DEFAULT 32        -- 每樁最大上限
+)
+''')
+
+# ✅ 確保一定有一筆 id=1
+cursor.execute('''
+INSERT OR IGNORE INTO community_settings (id)
+VALUES (1)
+''')
+
+conn.commit()
+
+
+
+
+
+
 from ocpp.v16 import call
 
 
@@ -1341,6 +1570,48 @@ class ChargePoint(OcppChargePoint):
 
             logging.info(f"🟢 StartTransaction Accepted：idTag={id_tag} | balance={balance}")
 
+            # ==================================================
+            # 🏘️ Smart Charging：最後一台車輛擋下判斷（Step 2-3）
+            # ==================================================
+            try:
+                # 目前正在充電的台數
+                active_now = get_active_charging_count()
+
+                # 嘗試「加上這一台」
+                trial_count = active_now + 1
+
+                allowed_a = calculate_allowed_current(
+                    active_charging_count=trial_count
+                )
+
+                logging.warning(
+                    f"[SMART][START_TX][CHECK] "
+                    f"cp_id={self.id} | "
+                    f"active_now={active_now} | "
+                    f"trial_count={trial_count} | "
+                    f"allowed_a={allowed_a}"
+                )
+
+                # ❌ 若回傳 None，代表最後一台不可充電
+                if allowed_a is None:
+                    logging.error(
+                        f"[SMART][START_TX][BLOCKED] "
+                        f"cp_id={self.id} | "
+                        f"reason=avg_current_below_min"
+                    )
+                    return call_result.StartTransactionPayload(
+                        transaction_id=0,
+                        id_tag_info={"status": "Blocked"}
+                    )
+
+            except Exception as e:
+                # ⚠️ 保守策略：SmartCharging 出錯時，不影響原本流程
+                logging.exception(
+                    f"[SMART][START_TX][ERROR] "
+                    f"cp_id={self.id} | err={e}"
+                )
+
+
             # 確保 meter_start 有效
             try:
                 meter_start_val = float(meter_start or 0) / 1000.0
@@ -1369,6 +1640,25 @@ class ChargePoint(OcppChargePoint):
 
             conn.commit()
             logging.info(f"🚗 StartTransaction 成功 | CP={self.id} | idTag={id_tag} | transactionId={transaction_id} | start_ts={start_ts} | meter_start={meter_start_val} kWh")
+
+
+
+            # ==================================================
+            # 🟦 Smart Charging：StartTransaction 後全場 Rebalance
+            # ==================================================
+            try:
+                await rebalance_all_charging_points(
+                    reason="start_transaction"
+                )
+            except Exception as e:
+                logging.exception(
+                    f"[SMART][START_TX][REBALANCE_ERR] "
+                    f"cp_id={self.id} | err={e}"
+                )
+
+
+
+
 
 
             # ===============================
@@ -1690,6 +1980,25 @@ class ChargePoint(OcppChargePoint):
                         "reason": reason,
                     }
                 )
+
+
+
+        # ==================================================
+        # 🟦 Smart Charging：StopTransaction 後全場 Rebalance
+        # ==================================================
+        try:
+            await rebalance_all_charging_points(
+                reason="stop_transaction"
+            )
+        except Exception as e:
+            logging.exception(
+                f"[SMART][STOP_TX][REBALANCE_ERR] "
+                f"cp_id={cp_id} | err={e}"
+            )
+
+
+
+
 
         # ⚠️ 永遠回 CALLRESULT
         return call_result.StopTransactionPayload()
@@ -4754,6 +5063,52 @@ async def debug_ids():
 @app.get("/api/debug/connected-cp")
 def debug_connected_cp():
     return list(connected_charge_points.keys())
+
+
+@app.get("/api/community-settings")
+def api_get_community_settings():
+    cfg = get_community_settings()
+
+    total_current_a = 0.0
+    max_cars_by_min = 0
+
+    if cfg["enabled"] and cfg["contract_kw"] > 0:
+        total_current_a = (cfg["contract_kw"] * 1000) / cfg["voltage_v"]
+        max_cars_by_min = int(total_current_a // cfg["min_current_a"])
+
+    return {
+        **cfg,
+        "total_current_a": round(total_current_a, 2),
+        "max_cars_by_min": max_cars_by_min,
+    }
+
+
+@app.post("/api/community-settings")
+def api_update_community_settings(payload: dict = Body(...)):
+    enabled = 1 if payload.get("enabled") else 0
+    contract_kw = float(payload.get("contractKw", 0) or 0)
+    voltage_v = float(payload.get("voltageV", 220) or 220)
+    phases = int(payload.get("phases", 1) or 1)
+    min_current_a = float(payload.get("minCurrentA", 16) or 16)
+    max_current_a = float(payload.get("maxCurrentA", 32) or 32)
+
+    with sqlite3.connect(DB_FILE, check_same_thread=False, timeout=15) as conn:
+        cur = conn.cursor()
+        cur.execute('''
+            UPDATE community_settings
+            SET enabled = ?,
+                contract_kw = ?,
+                voltage_v = ?,
+                phases = ?,
+                min_current_a = ?,
+                max_current_a = ?
+            WHERE id = 1
+        ''', (enabled, contract_kw, voltage_v, phases, min_current_a, max_current_a))
+        conn.commit()
+
+    return {"ok": True}
+
+
 
 @app.post("/api/charge-points/{charge_point_id}/stop")
 async def stop_transaction_by_charge_point(charge_point_id: str):
