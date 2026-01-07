@@ -1757,9 +1757,6 @@ class ChargePoint(OcppChargePoint):
         return call_result.AuthorizePayload(id_tag_info={"status": status})
 
 
-
-
-
     @on(Action.StartTransaction)
     async def on_start_transaction(
         self,
@@ -1769,65 +1766,102 @@ class ChargePoint(OcppChargePoint):
         timestamp,
         **kwargs
     ):
+        """
+        ✅ 修正 A：保證 StartTransaction「一定回 CALLRESULT」
+        - 任何情況都回 StartTransactionPayload
+        - 絕不裸 return
+        - 絕不 await 任何會卡住的動作
+        """
 
-        # ✅ 保證 SmartCharging 能力存在（避免不同 cp instance 問題）
-        if not hasattr(self, "supports_smart_charging"):
-            self.supports_smart_charging = True
+        try:
+            # =================================================
+            # [0] SmartCharging 能力保證（debug / 防 cp instance 問題）
+            # =================================================
+            if not hasattr(self, "supports_smart_charging"):
+                self.supports_smart_charging = True
+                logging.error(
+                    f"🧪 [DEBUG][START_TX][FIX] CP={self.id} | "
+                    f"supports_smart_charging defaulted to True"
+                )
+
             logging.error(
-                f"🧪 [DEBUG][START_TX][FIX] CP={self.id} | "
-                f"supports_smart_charging defaulted to True"
+                f"🧪 [DEBUG][START_TX][ENTER] "
+                f"CP={self.id} | "
+                f"supports_smart_charging={getattr(self, 'supports_smart_charging', 'MISSING')}"
             )
 
-        logging.error(
-            f"🧪 [DEBUG][START_TX][ENTER] "
-            f"CP={self.id} | "
-            f"supports_smart_charging={getattr(self, 'supports_smart_charging', 'MISSING')}"
-        )
-
-
-
-
-        with sqlite3.connect(DB_FILE) as conn:
-            cursor = conn.cursor()
-
-            # 驗證 idTag
+            # =================================================
+            # [1] idTag 驗證
+            # =================================================
             with get_conn() as _c:
                 cur = _c.cursor()
-                cur.execute("SELECT status FROM id_tags WHERE id_tag = ?", (id_tag,))
+                cur.execute(
+                    "SELECT status FROM id_tags WHERE id_tag = ?",
+                    (id_tag,)
+                )
                 row = cur.fetchone()
 
-                if not row:
+            if not row:
+                logging.warning(
+                    f"🔴 StartTransaction Invalid：idTag={id_tag} 不存在"
+                )
+                return call_result.StartTransactionPayload(
+                    transaction_id=0,
+                    id_tag_info={"status": "Invalid"}
+                )
 
+            status_db = row[0]
+            if status_db != "Accepted":
+                logging.warning(
+                    f"🔴 StartTransaction Blocked：idTag={id_tag} | status_db={status_db}"
+                )
+                return call_result.StartTransactionPayload(
+                    transaction_id=0,
+                    id_tag_info={"status": "Blocked"}
+                )
 
+            # =================================================
+            # [2] 預約檢查（若命中 → completed）
+            # =================================================
+            now_utc = datetime.utcnow().isoformat()
 
+            with sqlite3.connect(DB_FILE) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    SELECT id FROM reservations
+                    WHERE charge_point_id=? AND id_tag=? AND status='active'
+                      AND start_time<=? AND end_time>=?
+                    """,
+                    (self.id, id_tag, now_utc, now_utc),
+                )
+                res = cursor.fetchone()
 
+                if res:
+                    cursor.execute(
+                        "UPDATE reservations SET status='completed' WHERE id=?",
+                        (res[0],)
+                    )
+                    conn.commit()
+                    logging.info(
+                        f"🟡 Reservation completed | cp={self.id} | idTag={id_tag}"
+                    )
 
-                    return call_result.StartTransactionPayload(transaction_id=0, id_tag_info={"status": "Invalid"})
+            # =================================================
+            # [3] 餘額檢查
+            # =================================================
+            with sqlite3.connect(DB_FILE) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT balance FROM cards WHERE card_id = ?",
+                    (id_tag,)
+                )
+                card = cursor.fetchone()
 
-                status_db = row[0]
-                status = "Accepted" if status_db == "Accepted" else "Blocked"
-
-                if status != "Accepted":
-                    return call_result.StartTransactionPayload(transaction_id=0, id_tag_info={"status": status})
-
-
-            # 預約檢查
-            now_str = datetime.utcnow().isoformat()
-            cursor.execute("""
-                SELECT id FROM reservations
-                WHERE charge_point_id=? AND id_tag=? AND status='active'
-                  AND start_time<=? AND end_time>=?
-            """, (self.id, id_tag, now_str, now_str))
-            res = cursor.fetchone()
-            if res:
-                cursor.execute("UPDATE reservations SET status='completed' WHERE id=?", (res[0],))
-                conn.commit()
-
-            # 餘額檢查
-            cursor.execute("SELECT balance FROM cards WHERE card_id = ?", (id_tag,))
-            card = cursor.fetchone()
             if not card:
-                logging.warning(f"🔴 StartTransaction 拒絕：卡片 {id_tag} 不存在於系統（請先於白名單建立）")
+                logging.warning(
+                    f"🔴 StartTransaction Invalid：card {id_tag} 不存在"
+                )
                 return call_result.StartTransactionPayload(
                     transaction_id=0,
                     id_tag_info={"status": "Invalid"}
@@ -1835,10 +1869,68 @@ class ChargePoint(OcppChargePoint):
 
             balance = float(card[0] or 0)
             if balance <= 0:
-                logging.warning(f"🔴 StartTransaction 被擋下：idTag={id_tag} | balance={balance}")
-                return call_result.StartTransactionPayload(transaction_id=0, id_tag_info={"status": "Blocked"})
+                logging.warning(
+                    f"🔴 StartTransaction Blocked：idTag={id_tag} | balance={balance}"
+                )
+                return call_result.StartTransactionPayload(
+                    transaction_id=0,
+                    id_tag_info={"status": "Blocked"}
+                )
 
-            logging.info(f"🟢 StartTransaction Accepted：idTag={id_tag} | balance={balance}")
+            # =================================================
+            # [4] 建立交易（⚠️ 只做 DB，不做 await）
+            # =================================================
+            with sqlite3.connect(DB_FILE) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    INSERT INTO transactions (
+                        charge_point_id,
+                        connector_id,
+                        id_tag,
+                        meter_start,
+                        start_timestamp
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        self.id,
+                        connector_id,
+                        id_tag,
+                        int(meter_start),
+                        now_utc,
+                    ),
+                )
+                tx_id = cursor.lastrowid
+                conn.commit()
+
+            logging.info(
+                f"🟢 StartTransaction Accepted | "
+                f"cp={self.id} | connector={connector_id} | "
+                f"idTag={id_tag} | tx_id={tx_id} | balance={balance}"
+            )
+
+            # =================================================
+            # [5] ✅ 正常回覆（最重要）
+            # =================================================
+            return call_result.StartTransactionPayload(
+                transaction_id=int(tx_id),
+                id_tag_info={"status": "Accepted"},
+            )
+
+        except Exception as e:
+            # =================================================
+            # [X] 防爆：任何例外都必須回 CALLRESULT
+            # =================================================
+            logging.exception(
+                f"💥 [START_TX][EXCEPTION] cp={getattr(self, 'id', '?')} | idTag={id_tag}"
+            )
+            return call_result.StartTransactionPayload(
+                transaction_id=0,
+                id_tag_info={"status": "Rejected"},
+            )
+
+
+
 
             # ==================================================
             # 🏘️ Smart Charging：最後一台車輛擋下判斷（Step 2-3）
