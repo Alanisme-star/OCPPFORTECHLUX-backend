@@ -305,13 +305,206 @@ def get_whitelist():
     }
 
 
+# =====================================================
+# 🔍 Debug API：卡片 / StartTransaction 判斷
+# =====================================================
+from fastapi import Query
 
 
+def _debug_card_state(id_tag: str, cp_id: str | None = None):
+    """
+    回傳卡片在後端 DB 的實際狀態：
+    - id_tags（授權狀態）
+    - cards（餘額）
+    - card_whitelist（允許哪些充電樁）
+    """
+    cp_norm = _normalize_cp_id(cp_id) if cp_id else None
 
+    with get_conn() as conn:
+        cur = conn.cursor()
+
+        # --- id_tags ---
+        cur.execute(
+            "SELECT id_tag, status, valid_until FROM id_tags WHERE id_tag = ?",
+            (id_tag,),
+        )
+        row = cur.fetchone()
+        id_tag_info = None
+        if row:
+            id_tag_info = {
+                "id_tag": row[0],
+                "status": row[1],
+                "valid_until": row[2],
+            }
+
+        # --- cards ---
+        cur.execute(
+            "SELECT card_id, balance FROM cards WHERE card_id = ?",
+            (id_tag,),
+        )
+        row = cur.fetchone()
+        card_info = None
+        if row:
+            card_info = {
+                "card_id": row[0],
+                "balance": float(row[1] or 0),
+            }
+
+        # --- whitelist ---
+        cur.execute(
+            "SELECT charge_point_id FROM card_whitelist WHERE card_id = ?",
+            (id_tag,),
+        )
+        rows = cur.fetchall()
+        whitelist = [r[0] for r in rows] if rows else []
+
+    return {
+        "idTag": id_tag,
+        "cp_id": cp_norm,
+        "id_tags": id_tag_info,
+        "cards": card_info,
+        "card_whitelist": whitelist,
+        "cp_allowed": (cp_norm in whitelist) if cp_norm else None,
+    }
+
+
+@app.get("/api/debug/card/{id_tag}")
+def debug_card(id_tag: str, cp_id: str | None = Query(default=None)):
+    """
+    Debug 用 API：
+    直接查看某張卡在後端 DB 的真實狀態
+    """
+    data = _debug_card_state(id_tag=id_tag, cp_id=cp_id)
+    logging.warning(f"[DEBUG][CARD] {data}")
+    return data
+
+
+@app.get("/api/debug/start-transaction-check")
+def debug_start_transaction_check(
+    cp_id: str = Query(...),
+    id_tag: str = Query(...),
+):
+    """
+    Debug 用 API：
+    不真的建立交易，只模擬 StartTransaction 的判斷流程，
+    告訴你為什麼會 Accepted / Blocked / Invalid
+    """
+    cp_norm = _normalize_cp_id(cp_id)
+
+    # ========== Step 1：id_tags ==========
+    with get_conn() as conn:
+        cur = conn.cursor()
+
+        cur.execute(
+            "SELECT status FROM id_tags WHERE id_tag = ?",
+            (id_tag,),
+        )
+        row = cur.fetchone()
+        if not row:
+            out = {
+                "cp_id": cp_norm,
+                "idTag": id_tag,
+                "decision": "Invalid",
+                "reason": "id_tag_not_found",
+                "hint": "請確認 id_tags 表中有這張卡",
+            }
+            logging.warning(f"[DEBUG][START_TX_CHECK] {out}")
+            return out
+
+        status_db = row[0]
+        if status_db != "Accepted":
+            out = {
+                "cp_id": cp_norm,
+                "idTag": id_tag,
+                "decision": "Blocked",
+                "reason": "id_tag_status_not_accepted",
+                "id_tag_status": status_db,
+            }
+            logging.warning(f"[DEBUG][START_TX_CHECK] {out}")
+            return out
+
+        # ========== Step 2：cards / balance ==========
+        cur.execute(
+            "SELECT balance FROM cards WHERE card_id = ?",
+            (id_tag,),
+        )
+        row = cur.fetchone()
+        if not row:
+            out = {
+                "cp_id": cp_norm,
+                "idTag": id_tag,
+                "decision": "Invalid",
+                "reason": "card_not_found",
+                "hint": "請確認 cards 表有此卡片",
+            }
+            logging.warning(f"[DEBUG][START_TX_CHECK] {out}")
+            return out
+
+        balance = float(row[0] or 0)
+        if balance <= 0:
+            out = {
+                "cp_id": cp_norm,
+                "idTag": id_tag,
+                "decision": "Blocked",
+                "reason": "balance_le_0",
+                "balance": balance,
+            }
+            logging.warning(f"[DEBUG][START_TX_CHECK] {out}")
+            return out
+
+    # ========== Step 3：Smart Charging 試算 ==========
+    try:
+        active_now = get_active_charging_count()
+        trial_count = active_now + 1
+        allowed_a = calculate_allowed_current(
+            active_charging_count=trial_count
+        )
+
+        if allowed_a is None:
+            out = {
+                "cp_id": cp_norm,
+                "idTag": id_tag,
+                "decision": "Blocked",
+                "reason": "smart_charging_limit_reached",
+                "active_now": active_now,
+                "trial_count": trial_count,
+                "community_settings": get_community_settings(),
+            }
+            logging.warning(f"[DEBUG][START_TX_CHECK] {out}")
+            return out
+
+        out = {
+            "cp_id": cp_norm,
+            "idTag": id_tag,
+            "decision": "Accepted",
+            "reason": "ok",
+            "balance": balance,
+            "active_now": active_now,
+            "trial_count": trial_count,
+            "allowed_current_a": allowed_a,
+        }
+        logging.warning(f"[DEBUG][START_TX_CHECK] {out}")
+        return out
+
+    except Exception as e:
+        out = {
+            "cp_id": cp_norm,
+            "idTag": id_tag,
+            "decision": "Accepted",
+            "reason": "smart_charging_check_error_but_allowed",
+            "error": str(e),
+        }
+        logging.exception(f"[DEBUG][START_TX_CHECK] {out}")
+        return out
+
+
+# =====================================================
 # ==== Live 快取工具 ====
+# =====================================================
 import time
 
 LIVE_TTL = 15  # 秒：視情況調整
+
 
 def _to_kw(value, unit):
     try:
@@ -323,6 +516,7 @@ def _to_kw(value, unit):
         return v / 1000.0
     return v  # 視為 kW（或已是 kW）
 
+
 def _energy_to_kwh(value, unit):
     try:
         v = float(value)
@@ -332,6 +526,7 @@ def _energy_to_kwh(value, unit):
     if u in ("wh", "w*h", "w_h"):
         return v / 1000.0
     return v  # 視為 kWh
+
 
 def _upsert_live(cp_id: str, **kv):
     cur = live_status_cache.get(cp_id, {})
@@ -2005,13 +2200,13 @@ class ChargePoint(OcppChargePoint):
 
 
 
-
-
-
     @on(Action.MeterValues)
     async def on_meter_values(self, **kwargs):
         """
-        相容多種鍵名風格，並加入異常值過濾，避免電量/電費暴增。
+        ✅ 穩定版：
+        - 先收齊 voltage / current / power
+        - 再一次性更新 live_status_cache
+        - 避免多段 upsert 互相覆蓋
         """
         try:
             cp_id = getattr(self, "id", None)
@@ -2019,43 +2214,37 @@ class ChargePoint(OcppChargePoint):
                 logging.error("❌ 無法識別充電樁 ID（self.id 為空）")
                 return call_result.MeterValuesPayload()
 
-            # === ✅ 新增：STOP 後仍收到 MeterValues 的觀察 log（只觀察，不中斷）===
-            # 位置：function 一進來、cp_id 確認後就插入（你截圖說的第一/第二行附近）
-            _observe_tx_id = pick(kwargs, "transactionId", "transaction_id", "TransactionId", default="")
-            if _observe_tx_id and str(_observe_tx_id) in pending_stop_transactions:
-                logging.warning(
-                    f"[STOP][OBSERVE] MeterValues still coming AFTER RemoteStop "
-                    f"| cp_id={cp_id} "
-                    f"| tx_id={_observe_tx_id} "
-                    f"| pending_keys={list(pending_stop_transactions.keys())} "
-                    f"| raw={kwargs}"
-                )
-
             connector_id = pick(kwargs, "connectorId", "connector_id", default=0)
             try:
                 connector_id = int(connector_id or 0)
             except Exception:
                 connector_id = 0
 
-            transaction_id = pick(kwargs, "transactionId", "transaction_id", "TransactionId", default="")
-            if not transaction_id:
-                with sqlite3.connect(DB_FILE) as _c:
-                    _cur = _c.cursor()
-                    _cur.execute("""
-                        SELECT transaction_id FROM transactions
-                        WHERE charge_point_id=? AND stop_timestamp IS NULL
-                        ORDER BY start_timestamp DESC LIMIT 1
-                    """, (cp_id,))
-                    row = _cur.fetchone()
-                    if row:
-                        transaction_id = str(row[0])
+            transaction_id = pick(
+                kwargs,
+                "transactionId",
+                "transaction_id",
+                "TransactionId",
+                default=""
+            )
 
-            meter_value_list = pick(kwargs, "meterValue", "meter_value", "MeterValue", default=[]) or []
+            meter_value_list = pick(
+                kwargs,
+                "meterValue",
+                "meter_value",
+                "MeterValue",
+                default=[]
+            ) or []
             if not isinstance(meter_value_list, list):
                 meter_value_list = [meter_value_list]
 
+            # === 本批次即時量測（先收齊）===
+            batch_voltage = None
+            batch_current = None
+            batch_power_kw = None
+            last_ts = None
+
             insert_count = 0
-            last_ts_in_batch = None
 
             with sqlite3.connect(DB_FILE) as _c:
                 _cur = _c.cursor()
@@ -2063,13 +2252,17 @@ class ChargePoint(OcppChargePoint):
                 for mv in meter_value_list:
                     ts = pick(mv, "timestamp", "timeStamp", "Timestamp")
                     if ts:
-                        last_ts_in_batch = ts
+                        last_ts = ts
 
-                    sampled_list = pick(mv, "sampledValue", "sampled_value", "SampledValue", default=[]) or []
+                    sampled_list = pick(
+                        mv,
+                        "sampledValue",
+                        "sampled_value",
+                        "SampledValue",
+                        default=[]
+                    ) or []
                     if not isinstance(sampled_list, list):
                         sampled_list = [sampled_list]
-
-                    seen = {}
 
                     for sv in sampled_list:
                         if not isinstance(sv, dict):
@@ -2086,61 +2279,48 @@ class ChargePoint(OcppChargePoint):
                         try:
                             val = float(raw_val)
                         except Exception:
-                            logging.warning(f"⚠️ 無法轉換 value 為 float：{raw_val} | measurand={meas}")
                             continue
 
-
-
-                        # === 存入 DB ===
+                        # === 寫 DB（你原本的功能，保留）===
                         _cur.execute("""
                             INSERT INTO meter_values
                               (charge_point_id, connector_id, transaction_id,
                                value, measurand, unit, timestamp, phase)
                             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                        """, (cp_id, connector_id, transaction_id, val, meas, unit, ts, phase))
+                        """, (
+                            cp_id,
+                            connector_id,
+                            transaction_id,
+                            val,
+                            meas,
+                            unit,
+                            ts,
+                            phase
+                        ))
                         insert_count += 1
 
-                        # === 插入後再進行即時多時段電價計算 ===
-                        try:
-                            res = _calculate_multi_period_cost_detailed(transaction_id)
-                            _upsert_live(cp_id,
-                                         estimated_energy=res["segments"][-1]["kwh"] if res["segments"] else 0,
-                                         estimated_amount=res["total"],
-                                         price_per_kwh=res["segments"][-1]["price"] if res["segments"] else 6.0,
-                                         timestamp=ts)
-                        except Exception as e:
-                            logging.warning(f"⚠️ 即時多時段電價計算失敗：{e}")
-
-
-                        # === 更新快取 ===
-                        if meas == "Power.Active.Import":
-                            kw = _to_kw(val, unit)
-                            if kw is not None:
-                                _upsert_live(cp_id, power=round(kw, 3), timestamp=ts, derived=False)
-
+                        # === 收集即時量測 ===
+                        if meas == "Voltage":
+                            batch_voltage = val
                         elif meas.startswith("Current.Import"):
-                            try:
-                                cur_a = float(val)
-                                _upsert_live(cp_id, current=cur_a, timestamp=ts)
-                                seen["current"] = cur_a
-                            except Exception:
-                                pass
+                            batch_current = val
+                        elif meas == "Power.Active.Import":
+                            batch_power_kw = _to_kw(val, unit)
 
-                        elif meas.startswith("Voltage"):
-                            try:
-                                vv = float(val)
-                                _upsert_live(cp_id, voltage=vv, timestamp=ts)
-                                seen["voltage"] = vv
-                            except Exception:
-                                pass
-
-                        elif "Energy.Active.Import" in meas:
+                        # === 能量 / 金額（原邏輯保留）===
+                        if "Energy.Active.Import" in meas:
                             try:
                                 res = _calculate_multi_period_cost_detailed(transaction_id)
+                                used_kwh = (
+                                    sum(s["kwh"] for s in res["segments"])
+                                    if res["segments"] else 0
+                                )
                                 total = res["total"]
-                                last_seg = res["segments"][-1] if res["segments"] else None
-                                price = last_seg["price"] if last_seg else _price_for_timestamp(ts)
-                                used_kwh = sum([s["kwh"] for s in res["segments"]]) if res["segments"] else 0
+                                price = (
+                                    res["segments"][-1]["price"]
+                                    if res["segments"]
+                                    else _price_for_timestamp(ts)
+                                )
 
                                 _upsert_live(
                                     cp_id,
@@ -2151,73 +2331,51 @@ class ChargePoint(OcppChargePoint):
                                     timestamp=ts,
                                 )
 
-
-                                # ===== 方案 B：餘額不足自動停充 =====
-                                try:
-                                    await _auto_stop_if_balance_insufficient(
-                                        cp_id=cp_id,
-                                        transaction_id=int(transaction_id),
-                                        estimated_amount=float(total),
-                                    )
-                                except Exception as e:
-                                    logger.error(f"[AUTO-STOP] exception: {e}")
-
-
-
-
-                                logging.info(f"✅ 即時計算多時段金額成功：{total} 元")
-                            except Exception as e:
-                                logging.warning(f"⚠️ 即時計算多時段金額失敗：{e}")
-
-                                logging.info(
-                                    f"[LIVE] 更新能量 {cp_id}: {kwh:.4f} kWh, 電價 {unit_price}, 預估金額 {est_amount}"
+                                await _auto_stop_if_balance_insufficient(
+                                    cp_id=cp_id,
+                                    transaction_id=int(transaction_id),
+                                    estimated_amount=float(total),
                                 )
-
-                                # 計算用電量與金額
-                                try:
-                                    with sqlite3.connect(DB_FILE) as _c2:
-                                        _cur2 = _c2.cursor()
-                                        _cur2.execute("SELECT meter_start FROM transactions WHERE transaction_id = ?", (transaction_id,))
-                                        row_tx = _cur2.fetchone()
-                                        if row_tx:
-                                            meter_start_wh = float(row_tx[0] or 0)
-                                            used_kwh = max(0.0, (kwh - (meter_start_wh / 1000.0)))
-                                            unit_price = float(_price_for_timestamp(ts)) if ts else 6.0
-                                            est_amount = round(used_kwh * unit_price, 2)
-                                            _upsert_live(cp_id,
-                                                         estimated_energy=round(used_kwh, 6),
-                                                         estimated_amount=est_amount,
-                                                         price_per_kwh=unit_price,
-                                                         timestamp=ts)
-
-
-
-
-                                except Exception as e:
-                                    logging.warning(f"⚠️ 預估金額計算失敗: {e}")
-
-                        # Debug log
-                        logging.info(f"[DEBUG][MeterValues] tx={transaction_id} | measurand={meas} | value={val}{unit} | ts={ts}")
-
-                    # (推算功率)
-                    live_now = live_status_cache.get(cp_id) or {}
-                    if "power" not in live_now:
-                        v = seen.get("voltage") or live_now.get("voltage")
-                        i = seen.get("current") or live_now.get("current")
-                        if isinstance(v, (int, float)) and isinstance(i, (int, float)):
-                            vi_kw = max(0.0, (v * i) / 1000.0)
-                            _upsert_live(cp_id, power=round(vi_kw, 3), timestamp=ts, derived=True)
+                            except Exception as e:
+                                logging.warning(
+                                    f"⚠️ 能量/金額即時計算失敗：{e}"
+                                )
 
                 _c.commit()
 
-        
-            logging.info(f"📊 MeterValues 寫入完成，共 {insert_count} 筆 | tx={transaction_id}")
+            # === 推算功率（若樁沒送 Power）===
+            if batch_power_kw is None:
+                if isinstance(batch_voltage, (int, float)) and isinstance(batch_current, (int, float)):
+                    batch_power_kw = round(
+                        (batch_voltage * batch_current) / 1000.0,
+                        3
+                    )
+
+            # === ✅ 一次性更新即時狀態（關鍵）===
+            _upsert_live(
+                cp_id,
+                voltage=batch_voltage,
+                current=batch_current,
+                power=batch_power_kw,
+                timestamp=last_ts,
+            )
+
+            logging.info(
+                f"[LIVE][OK] cp={cp_id} "
+                f"V={batch_voltage}V "
+                f"I={batch_current}A "
+                f"P={batch_power_kw}kW "
+                f"| meter_rows={insert_count}"
+            )
 
             return call_result.MeterValuesPayload()
 
         except Exception as e:
             logging.exception(f"❌ 處理 MeterValues 例外：{e}")
             return call_result.MeterValuesPayload()
+
+
+
 
 
 
