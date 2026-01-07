@@ -698,8 +698,7 @@ async def websocket_endpoint(websocket: WebSocket, charge_point_id: str):
         connected_charge_points.pop(cp_norm, None)
 
         # ==================================================
-        # 4) 🔴 關鍵修正：
-        #    WebSocket 中斷時，自動結束未完成交易
+        # 4) WebSocket 中斷時，自動結束未完成交易（DB）
         # ==================================================
         try:
             with sqlite3.connect(DB_FILE, check_same_thread=False) as conn:
@@ -735,6 +734,39 @@ async def websocket_endpoint(websocket: WebSocket, charge_point_id: str):
             logger.exception(
                 f"[AUTO-STOP][WS_DISCONNECT][ERR] cp_id={cp_norm} | err={e}"
             )
+
+        # ==================================================
+        # 5) 🔴【關鍵修正】清除 / 覆寫 live_status_cache
+        #    避免前端誤判仍在 Charging
+        # ==================================================
+        try:
+            prev = live_status_cache.get(cp_norm, {})
+
+            live_status_cache[cp_norm] = {
+                "status": "Available",          # ← 明確回到可用
+                "power": 0,
+                "voltage": 0,
+                "current": 0,
+
+                # 能量可保留（不影響）
+                "energy": prev.get("energy", 0),
+
+                "estimated_energy": 0,
+                "estimated_amount": 0,
+                "derived": True,                # ← 標記為後端補寫
+                "updated_at": time.time(),
+            }
+
+            logger.warning(
+                f"[LIVE][WS_DISCONNECT][RESET] "
+                f"cp_id={cp_norm} | force status=Available"
+            )
+
+        except Exception as e:
+            logger.exception(
+                f"[LIVE][WS_DISCONNECT][ERR] cp_id={cp_norm} | err={e}"
+            )
+
 
 
 
