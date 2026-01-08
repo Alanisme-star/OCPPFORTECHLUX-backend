@@ -861,6 +861,28 @@ def get_community_settings():
     }
 
 
+def is_community_smart_charging_enabled():
+    """
+    回傳 (enabled: bool, cfg: dict)
+    enabled=True 表示：社區 Smart Charging「條件完整且啟用」
+    """
+    cfg = get_community_settings()
+
+    try:
+        enabled = (
+            bool(cfg.get("enabled"))
+            and float(cfg.get("contract_kw", 0) or 0) > 0
+            and float(cfg.get("voltage_v", 0) or 0) > 0
+            and float(cfg.get("min_current_a", 0) or 0) > 0
+            and float(cfg.get("max_current_a", 0) or 0) > 0
+        )
+    except Exception:
+        enabled = False
+
+    return enabled, cfg
+
+
+
 
 def calculate_allowed_current(
     *,
@@ -5471,11 +5493,27 @@ def api_get_community_settings():
         total_current_a = (cfg["contract_kw"] * 1000) / cfg["voltage_v"]
         max_cars_by_min = int(total_current_a // cfg["min_current_a"])
 
+    # ✅ 關鍵：補上「目前充電車輛」與「每台可用電流」
+    active_count = get_active_charging_count()
+
+    allowed_a = None
+    smart_reason = None
+    if cfg["enabled"]:
+        allowed_a = calculate_allowed_current(active_charging_count=active_count)
+        if allowed_a is None:
+            smart_reason = "avg_current_below_min"
+
     return {
         **cfg,
         "total_current_a": round(total_current_a, 2),
         "max_cars_by_min": max_cars_by_min,
+
+        # ✅ LiveStatus.jsx 會用到的欄位
+        "active_charging_count": active_count,
+        "allowed_current_a": allowed_a,
+        "smart_reason": smart_reason,
     }
+
 
 
 @app.post("/api/community-settings")
