@@ -684,6 +684,12 @@ async def websocket_endpoint(websocket: WebSocket, charge_point_id: str):
 
         # 2) 啟動 OCPP handler
         cp = ChargePoint(cp_id, FastAPIWebSocketAdapter(websocket))
+
+
+        # ✅ 修法 A（正確位置）：模擬樁支援 Smart Charging
+        if cp_id.startswith("SIM-CP-"):
+            cp.supports_smart_charging = True
+
         connected_charge_points[cp_id] = cp
         await cp.start()
 
