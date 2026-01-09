@@ -1854,22 +1854,36 @@ class ChargePoint(OcppChargePoint):
             # =====================================================
             # 🔍 SmartCharging 能力判定（選項 A：模擬器強制）
             # =====================================================
-            if FORCE_SMART_CHARGING:
-                # ✅ 開發 / 模擬器：強制視為支援
+            cp_id = str(self.id or "")
+            is_simulator = cp_id.startswith("SIM-CP-")
+
+            if is_simulator:
+                # ✅ 模擬樁：一律強制視為支援（否則永遠收不到 SetChargingProfile）
+                self.supports_smart_charging = True
+
+                logging.warning(
+                    f"[CAPABILITY][SIM_FORCE] CP={self.id} | "
+                    f"supports_smart_charging=True"
+                )
+
+            elif FORCE_SMART_CHARGING:
+                # ✅ 開發 / 全場測試：強制視為支援
                 self.supports_smart_charging = True
 
                 logging.warning(
                     f"[CAPABILITY][FORCE] CP={self.id} | "
                     f"FORCE_SMART_CHARGING=1 | supports_smart_charging=True"
                 )
+
             else:
-                # 🟡 正式環境：預設一律不支援（安全）
+                # 🟡 正式環境：真實樁預設不支援（安全）
                 self.supports_smart_charging = False
 
                 logging.info(
                     f"[CAPABILITY][DEFAULT] CP={self.id} | "
                     f"FORCE_SMART_CHARGING=0 | supports_smart_charging=False"
                 )
+
             # =====================================================
 
             # =====================================================
