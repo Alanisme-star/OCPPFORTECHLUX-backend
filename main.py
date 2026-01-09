@@ -61,6 +61,14 @@ from ocpp.routing import on
 from urllib.parse import urlparse, parse_qsl
 from reportlab.pdfgen import canvas
 
+# ===============================
+# 🧪 模擬充電控制狀態（Step4）
+# ===============================
+simulator_charging_state = {
+    "mode": "none",      # none | all | count
+    "count": 0,
+    "updated_at": None,
+}
 
 # ===============================
 # 🔌 OCPP 電流限制（TxProfile）
@@ -1054,9 +1062,7 @@ async def rebalance_all_charging_points(reason: str):
 
 def ensure_charge_points_table():
     """
-    ✅ 保證 charge_points 表一定存在
-    - 新 DB 第一次啟動：建立表（直接包含 max_current_a）
-    - 舊 DB：若已存在，不影響
+    ✅ 保證 charge_points 表一定存在（含模擬樁欄位）
     """
     with get_conn() as c:
         cur = c.cursor()
@@ -1067,7 +1073,15 @@ def ensure_charge_points_table():
                 name TEXT,
                 status TEXT,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                max_current_a REAL DEFAULT 16
+
+                -- 🔌 電流上限
+                max_current_a REAL DEFAULT 16,
+
+                -- 🧪 是否為模擬樁
+                is_simulated INTEGER DEFAULT 0,
+
+                -- ✅ 是否啟用（停用的模擬樁要被前端隱藏）
+                enabled INTEGER DEFAULT 1
             )
         """)
         c.commit()
@@ -1076,23 +1090,17 @@ def ensure_charge_points_table():
 def ensure_charge_points_schema():
     """
     ✅ 舊 DB 相容用：
-    - 表存在但沒有 max_current_a → 自動補欄位
-    - 表不存在 → 直接跳過（避免 Deploy 炸掉）
+    - 自動補齊模擬樁相關欄位
     """
     with get_conn() as c:
         cur = c.cursor()
-
 
         cur.execute("""
             SELECT name FROM sqlite_master
             WHERE type='table' AND name='charge_points'
         """)
         if not cur.fetchone():
-            logging.warning(
-                "⚠️ [MIGRATION] charge_points table not found, skip ALTER"
-            )
             return
-
 
         cur.execute("PRAGMA table_info(charge_points);")
         cols = [r[1] for r in cur.fetchall()]
@@ -1102,7 +1110,6 @@ def ensure_charge_points_schema():
                 "ALTER TABLE charge_points "
                 "ADD COLUMN max_current_a REAL DEFAULT 16"
             )
-            c.commit()
             logging.warning(
                 "🛠️ [MIGRATION] charge_points add column max_current_a REAL DEFAULT 16"
             )
@@ -1110,6 +1117,28 @@ def ensure_charge_points_schema():
             logging.info(
                 "✅ [MIGRATION] charge_points.max_current_a exists"
             )
+
+        if "is_simulated" not in cols:
+            cur.execute(
+                "ALTER TABLE charge_points "
+                "ADD COLUMN is_simulated INTEGER DEFAULT 0"
+            )
+            logging.warning(
+                "🛠️ [MIGRATION] charge_points add column is_simulated INTEGER DEFAULT 0"
+            )
+
+        if "enabled" not in cols:
+            cur.execute(
+                "ALTER TABLE charge_points "
+                "ADD COLUMN enabled INTEGER DEFAULT 1"
+            )
+            logging.warning(
+                "🛠️ [MIGRATION] charge_points add column enabled INTEGER DEFAULT 1"
+            )
+
+        c.commit()
+
+
 
 
 # 建立一個全域連線（僅供少數 legacy 用途）
@@ -2668,6 +2697,52 @@ def update_card_owner(card_id: str, data: dict = Body(...)):
     return {"message": "住戶名稱已更新", "card_id": card_id, "name": name}
 
 
+@app.post("/api/simulators/charging")
+def set_simulator_charging(payload: dict = Body(...)):
+    """
+    設定模擬充電控制狀態（僅供測試）
+    - 不送 OCPP
+    - 不影響實體樁
+    """
+    mode = payload.get("mode")
+    count = payload.get("count", 0)
+
+    if mode not in ("none", "all", "count"):
+        raise HTTPException(status_code=400, detail="invalid mode")
+
+    if mode == "count":
+        try:
+            count = int(count)
+            if count < 0:
+                raise ValueError
+        except Exception:
+            raise HTTPException(status_code=400, detail="count must be >= 0")
+    else:
+        count = 0
+
+    simulator_charging_state["mode"] = mode
+    simulator_charging_state["count"] = count
+    simulator_charging_state["updated_at"] = datetime.utcnow().isoformat()
+
+    logger.warning(
+        f"[SIMULATOR][CHARGING][SET] "
+        f"mode={mode} count={count}"
+    )
+
+    return {
+        "ok": True,
+        "state": simulator_charging_state,
+    }
+
+
+@app.get("/api/simulators/charging")
+def get_simulator_charging():
+    """
+    取得目前模擬充電控制狀態
+    - 供前端顯示
+    - 供模擬器 Step5 輪詢
+    """
+    return dict(simulator_charging_state)
 
 
 
@@ -2697,6 +2772,106 @@ def force_add_charge_point(
         "charge_point_id": charge_point_id,
         "name": name
     }
+
+
+@app.post("/api/simulators/set")
+def set_simulators(payload: dict = Body(...)):
+    """
+    設定「啟用中的模擬樁」數量
+    - 自動建立 / 停用模擬樁
+    - 不影響實體樁
+    """
+    try:
+        target = int(payload.get("count", 0))
+        if target < 0:
+            raise ValueError("count must be >= 0")
+
+        with get_conn() as conn:
+            cur = conn.cursor()
+
+
+            cur.execute("""
+                SELECT charge_point_id
+                FROM charge_points
+                WHERE is_simulated = 1
+                ORDER BY charge_point_id ASC
+            """)
+            all_sim = [r[0] for r in cur.fetchall()]
+
+
+            keep = all_sim[:target]
+
+
+            for i in range(len(all_sim) + 1, target + 1):
+                cp_id = f"SIM-CP-{i:03d}"
+                id_tag = f"SIMTAG-{i:03d}"
+
+                # charge_points
+                cur.execute("""
+                    INSERT OR IGNORE INTO charge_points
+                    (charge_point_id, name, is_simulated, enabled)
+                    VALUES (?, ?, 1, 1)
+                """, (cp_id, f"模擬樁 {i}"))
+
+                # id_tags
+                cur.execute("""
+                    INSERT OR IGNORE INTO id_tags
+                    (id_tag, status)
+                    VALUES (?, 'Accepted')
+                """, (id_tag,))
+
+                # cards
+                cur.execute("""
+                    INSERT OR IGNORE INTO cards
+                    (card_id, balance)
+                    VALUES (?, 999999)
+                """, (id_tag,))
+
+                # whitelist
+                cur.execute("""
+                    INSERT OR IGNORE INTO card_whitelist
+                    (card_id, charge_point_id)
+                    VALUES (?, ?)
+                """, (id_tag, cp_id))
+
+                keep.append(cp_id)
+
+
+            if keep:
+                cur.execute(
+                    f"""
+                    UPDATE charge_points
+                    SET enabled = 1
+                    WHERE is_simulated = 1
+                      AND charge_point_id IN ({",".join("?"*len(keep))})
+                    """,
+                    keep,
+                )
+
+
+            cur.execute("""
+                UPDATE charge_points
+                SET enabled = 0
+                WHERE is_simulated = 1
+                  AND charge_point_id NOT IN (
+                    SELECT charge_point_id
+                    FROM charge_points
+                    WHERE is_simulated = 1
+                    ORDER BY charge_point_id ASC
+                    LIMIT ?
+                  )
+            """, (target,))
+
+            conn.commit()
+
+        return {
+            "ok": True,
+            "enabled_simulators": target,
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
 
 
 # ------------------------------------------------------------
