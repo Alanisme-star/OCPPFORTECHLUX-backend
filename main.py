@@ -4909,22 +4909,37 @@ def get_cards():
 
 @app.get("/api/charge-points")
 async def list_charge_points():
-    cursor.execute(
-        "SELECT id, charge_point_id, name, status, created_at, max_current_a FROM charge_points"
-    )
+    cursor.execute("""
+        SELECT
+            id,
+            charge_point_id,
+            name,
+            status,
+            created_at,
+            max_current_a,
+            is_simulated,
+            enabled
+        FROM charge_points
+        ORDER BY charge_point_id ASC
+    """)
     rows = cursor.fetchall()
+
     return [
         {
             "id": r[0],
-            "chargePointId": r[1],  # 注意：這是駝峰命名，對應前端
+            "chargePointId": r[1],      # 前端使用
             "name": r[2],
             "status": r[3],
             "createdAt": r[4],
-            # ⭐ 關鍵修正：把最大電流回傳給前端
             "maxCurrent": r[5],
+
+            # ⭐⭐【關鍵修正】⭐⭐
+            "is_simulated": bool(r[6]),
+            "enabled": bool(r[7]),
         }
         for r in rows
     ]
+
 
 
 
