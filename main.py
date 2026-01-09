@@ -2803,7 +2803,7 @@ def set_simulators(payload: dict = Body(...)):
         with get_conn() as conn:
             cur = conn.cursor()
 
-
+            # 1️⃣ 取出所有模擬樁（依 charge_point_id 穩定排序）
             cur.execute("""
                 SELECT charge_point_id
                 FROM charge_points
@@ -2812,10 +2812,10 @@ def set_simulators(payload: dict = Body(...)):
             """)
             all_sim = [r[0] for r in cur.fetchall()]
 
-
+            # 2️⃣ 要保留（啟用）的模擬樁
             keep = all_sim[:target]
 
-
+            # 3️⃣ 若數量不足，補齊模擬樁
             for i in range(len(all_sim) + 1, target + 1):
                 cp_id = f"SIM-CP-{i:03d}"
                 id_tag = f"SIMTAG-{i:03d}"
@@ -2850,31 +2850,24 @@ def set_simulators(payload: dict = Body(...)):
 
                 keep.append(cp_id)
 
+            # 4️⃣ 先「全部關閉」模擬樁（⭐ 關鍵）
+            cur.execute("""
+                UPDATE charge_points
+                SET enabled = 0
+                WHERE is_simulated = 1
+            """)
 
+            # 5️⃣ 再啟用 keep 清單中的模擬樁
             if keep:
                 cur.execute(
                     f"""
                     UPDATE charge_points
                     SET enabled = 1
                     WHERE is_simulated = 1
-                      AND charge_point_id IN ({",".join("?"*len(keep))})
+                      AND charge_point_id IN ({",".join("?" * len(keep))})
                     """,
                     keep,
                 )
-
-
-            cur.execute("""
-                UPDATE charge_points
-                SET enabled = 0
-                WHERE is_simulated = 1
-                  AND charge_point_id NOT IN (
-                    SELECT charge_point_id
-                    FROM charge_points
-                    WHERE is_simulated = 1
-                    ORDER BY charge_point_id ASC
-                    LIMIT ?
-                  )
-            """, (target,))
 
             conn.commit()
 
@@ -2885,6 +2878,7 @@ def set_simulators(payload: dict = Body(...)):
 
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
 
 
 
