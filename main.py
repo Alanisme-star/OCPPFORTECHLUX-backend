@@ -59,7 +59,6 @@ from ocpp.v16 import call, call_result, ChargePoint as OcppChargePoint
 from ocpp.v16.enums import Action, RegistrationStatus
 from ocpp.routing import on
 from urllib.parse import urlparse, parse_qsl
-from reportlab.pdfgen import canvas
 
 # ===============================
 # 🧪 模擬充電控制狀態（Step4）
