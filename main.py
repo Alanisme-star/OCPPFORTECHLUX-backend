@@ -2649,11 +2649,12 @@ def force_add_charge_point(
 
 
 @app.post("/api/simulators/set")
-def set_simulators(payload: dict = Body(...)):
+async def set_simulators(payload: dict = Body(...)):
     """
     設定「啟用中的模擬樁」數量
     - 自動建立 / 停用模擬樁
     - 不影響實體樁
+    - ⭐ 會即時觸發 Smart Charging 重新計算並下發限流
     """
     try:
         target = int(payload.get("count", 0))
@@ -2710,7 +2711,7 @@ def set_simulators(payload: dict = Body(...)):
 
                 keep.append(cp_id)
 
-            # 4️⃣ 先「全部關閉」模擬樁（⭐ 關鍵）
+            # 4️⃣ 先「全部關閉」模擬樁
             cur.execute("""
                 UPDATE charge_points
                 SET enabled = 0
@@ -2730,6 +2731,13 @@ def set_simulators(payload: dict = Body(...)):
                 )
 
             conn.commit()
+
+        # =====================================================
+        # ⭐⭐ 關鍵修正：即時觸發 Smart Charging 重算 ⭐⭐
+        # =====================================================
+        await rebalance_all_charging_points(
+            reason=f"simulator_count_changed:{target}"
+        )
 
         return {
             "ok": True,
