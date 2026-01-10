@@ -1,13 +1,6 @@
-fastapi>=0.110,<1.0
-uvicorn[standard]>=0.27,<1.0
-
-# WebSocket / OCPP
-websockets>=10.4,<12
+fastapi
+uvicorn[standard]
+websockets
 ocpp==0.26.0
-
-# Utilities
-requests>=2.31
-python-dateutil>=2.8
-
-# PDF（⚠️ 固定版本，避免 Python 3.10/3.11 相容問題）
-reportlab==4.0.8
+python-dateutil
+pytz
