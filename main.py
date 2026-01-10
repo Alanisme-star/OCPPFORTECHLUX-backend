@@ -4654,50 +4654,54 @@ async def export_reservations_csv():
     })
 
 @app.get("/api/report/monthly")
-async def generate_monthly_pdf(month: str):
-    # 取得指定月份的起始與結束日期
-    try:
-        start_date = f"{month}-01"
-        end_date = f"{month}-31"
-    except:
-        return {"error": "Invalid month format"}
+async def generate_monthly_report(month: str):
+    """
+    📊 月報資料（JSON 版）
+    - month 格式：YYYY-MM
+    - 暫不產 PDF，避免 deploy 失敗
+    """
 
-    # 查詢交易資料
+    # === 基本格式檢查 ===
+    if len(month) != 7 or month[4] != "-":
+        return {"error": "Invalid month format, expected YYYY-MM"}
+
+    start_date = f"{month}-01"
+    end_date = f"{month}-31"
+
+    # === 查詢交易資料 ===
     cursor.execute("""
-        SELECT id_tag, charge_point_id, SUM(meter_stop - meter_start) AS total_energy, COUNT(*) as txn_count
+        SELECT
+            id_tag,
+            charge_point_id,
+            SUM(meter_stop - meter_start) AS total_energy,
+            COUNT(*) AS txn_count
         FROM transactions
-        WHERE start_timestamp >= ? AND start_timestamp <= ? AND meter_stop IS NOT NULL
+        WHERE start_timestamp >= ?
+          AND start_timestamp <= ?
+          AND meter_stop IS NOT NULL
         GROUP BY id_tag, charge_point_id
     """, (start_date, end_date))
+
     rows = cursor.fetchall()
 
-    # PDF 產出
-    buffer = io.BytesIO()
-    p = canvas.Canvas(buffer)
-    p.setTitle(f"Monthly Report - {month}")
+    # === 整理回傳資料 ===
+    results = []
+    for id_tag, cp_id, energy, count in rows:
+        kwh = round((energy or 0) / 1000.0, 2)
+        results.append({
+            "idTag": id_tag,
+            "chargePointId": cp_id,
+            "transactionCount": count,
+            "energyKwh": kwh
+        })
 
-    p.drawString(50, 800, f"🔌 Monthly Electricity Report - {month}")
-    p.drawString(50, 780, "----------------------------------------")
-    y = 760
-    for row in rows:
-        id_tag, cp_id, energy, count = row
-        kwh = round(energy / 1000, 2)
-        p.drawString(50, y, f"ID: {id_tag} | 樁: {cp_id} | 次數: {count} | 用電: {kwh} kWh")
-        y -= 20
-        if y < 50:
-            p.showPage()
-            y = 800
+    return {
+        "month": month,
+        "totalRecords": len(results),
+        "data": results,
+        "note": "PDF export temporarily disabled"
+    }
 
-    if not rows:
-        p.drawString(50, 760, "⚠️ 本月無任何有效交易紀錄")
-
-    p.showPage()
-    p.save()
-    buffer.seek(0)
-
-    return StreamingResponse(buffer, media_type="application/pdf", headers={
-        "Content-Disposition": f"attachment; filename=monthly_report_{month}.pdf"
-    })
 
 
 
