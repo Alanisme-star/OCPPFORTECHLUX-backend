@@ -3,4 +3,5 @@ uvicorn[standard]
 websockets
 ocpp==0.26.0
 python-dateutil
+requests>=2.31.0
 pytz
