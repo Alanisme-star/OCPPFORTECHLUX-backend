@@ -36,7 +36,6 @@ import os
 # 🔧 SmartCharging 強制開關（模擬器 / 開發用）
 # =====================================================
 FORCE_SMART_CHARGING = os.getenv("FORCE_SMART_CHARGING", "0") == "1"
-import io
 import csv
 import uuid
 import logging
