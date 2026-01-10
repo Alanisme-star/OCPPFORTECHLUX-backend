@@ -105,6 +105,18 @@ async def send_current_limit_profile(
     cp_id = getattr(cp, "id", "unknown")
 
     # =====================================================
+    # [0] OCPP 合規修正：limit 必須是 0.1A 的倍數
+    # =====================================================
+    try:
+        limit_a_raw = float(limit_a)
+        limit_a = round(limit_a_raw, 1)
+    except Exception:
+        logging.error(
+            f"[LIMIT][INVALID] cp_id={cp_id} | raw_limit={limit_a}"
+        )
+        return
+
+    # =====================================================
     # [1] 進入點（確認一定有進來）
     # =====================================================
     logging.error(
@@ -114,7 +126,7 @@ async def send_current_limit_profile(
     )
 
     # =====================================================
-    # [2] 組 payload（ocpp 0.26.0 合法格式）
+    # [2] 組 payload（OCPP 1.6 合法格式）
     # =====================================================
     payload = call.SetChargingProfilePayload(
         connector_id=int(connector_id),
@@ -128,7 +140,7 @@ async def send_current_limit_profile(
                 "charging_schedule_period": [
                     {
                         "start_period": 0,
-                        "limit": float(limit_a),
+                        "limit": float(limit_a),   # ✅ 一定是 0.1 的倍數
                         "number_phases": 1,
                     }
                 ],
@@ -191,7 +203,7 @@ async def send_current_limit_profile(
 
     except Exception as e:
         # =================================================
-        # ❌ 唯一的 Exception handler（修正 deploy 失敗關鍵）
+        # ❌ 唯一的 Exception handler（避免炸 OCPP loop）
         # =================================================
         now_iso = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
         st = current_limit_state.setdefault(cp_id, {})
