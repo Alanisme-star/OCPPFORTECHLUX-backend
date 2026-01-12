@@ -2733,6 +2733,20 @@ def get_simulator_charging():
         return {
             "mode": "count",
             "count": int(effective),
+            "auto_count": int(auto_count),
+            "manual_cap": int(manual_cap),
+            "source": source,
+            "smart_charging": True,
+        }
+
+    # ❌ Smart Charging 未啟用 → 直接回人工設定
+    return {
+        "mode": simulator_charging_state.get("mode"),
+        "count": int(simulator_charging_state.get("count", 0)),
+        "source": "manual",
+        "smart_charging": False,
+    }
+
 
 
 
