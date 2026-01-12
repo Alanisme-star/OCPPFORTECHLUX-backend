@@ -906,6 +906,47 @@ def calculate_allowed_current(
 
 
 
+def calculate_max_concurrent_chargers() -> int:
+    """
+    依社區 Smart Charging 設定，計算「最多允許同時充電台數」
+    公式：floor(total_current_a / min_current_a)
+    """
+    cfg = get_community_settings()
+    if not cfg.get("enabled"):
+        return 0
+
+    contract_kw = float(cfg.get("contract_kw", 0) or 0)
+    voltage_v = float(cfg.get("voltage_v", 0) or 0)
+    min_a = float(cfg.get("min_current_a", 0) or 0)
+
+    if contract_kw <= 0 or voltage_v <= 0 or min_a <= 0:
+        return 0
+
+    total_current_a = (contract_kw * 1000.0) / voltage_v
+    return max(0, int(total_current_a // min_a))
+
+
+def get_enabled_simulator_count() -> int:
+    """
+    DB 內目前 enabled=1 的模擬樁數量
+    """
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT COUNT(*)
+            FROM charge_points
+            WHERE is_simulated = 1
+              AND enabled = 1
+        """)
+        row = cur.fetchone()
+    try:
+        return int(row[0] or 0)
+    except Exception:
+        return 0
+
+
+
+
 
 def get_active_charging_count():
     """
@@ -2655,11 +2696,29 @@ def set_simulator_charging(payload: dict = Body(...)):
 @app.get("/api/simulators/charging")
 def get_simulator_charging():
     """
-    取得目前模擬充電控制狀態
-    - 供前端顯示
-    - 供模擬器 Step5 輪詢
+    ✅ Smart-Charging aware 模擬器補位機制：
+    - 若社區 Smart Charging 啟用 → 自動回傳 mode=count 與「可同充台數」
+      count = min(啟用模擬樁數量, SmartCharging最多可同充台數)
+    - 若未啟用 → 回傳人工設定的 simulator_charging_state
     """
+    smart_enabled, _cfg = is_community_smart_charging_enabled()
+
+    if smart_enabled:
+        enabled_sim = get_enabled_simulator_count()
+        max_concurrent = calculate_max_concurrent_chargers()
+        count = min(enabled_sim, max_concurrent)
+
+        return {
+            "mode": "count",
+            "count": int(count),
+            "updated_at": datetime.utcnow().isoformat(),
+            "source": "smart_charging_auto",
+            "enabled_simulators": int(enabled_sim),
+            "max_concurrent_by_min_current": int(max_concurrent),
+        }
+
     return dict(simulator_charging_state)
+
 
 
 
