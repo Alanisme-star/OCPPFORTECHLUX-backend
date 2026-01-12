@@ -2696,28 +2696,43 @@ def set_simulator_charging(payload: dict = Body(...)):
 @app.get("/api/simulators/charging")
 def get_simulator_charging():
     """
-    ✅ Smart-Charging aware 模擬器補位機制：
-    - 若社區 Smart Charging 啟用 → 自動回傳 mode=count 與「可同充台數」
-      count = min(啟用模擬樁數量, SmartCharging最多可同充台數)
-    - 若未啟用 → 回傳人工設定的 simulator_charging_state
+    ✅ Smart-Charging aware 模擬器補位機制（解法A：允許手動蓋帽）
+    - 若社區 Smart Charging 啟用：
+        auto_count = min(啟用模擬樁數量, SmartCharging最多可同充台數)
+        若使用者手動設定 mode=count：
+            effective_count = min(auto_count, manual_count)  # ✅ 手動往下蓋帽
+        否則：
+            effective_count = auto_count
+        一律回傳 mode=count 與 effective_count
+    - 若未啟用：回傳人工設定的 simulator_charging_state
     """
     smart_enabled, _cfg = is_community_smart_charging_enabled()
 
     if smart_enabled:
         enabled_sim = get_enabled_simulator_count()
         max_concurrent = calculate_max_concurrent_chargers()
-        count = min(enabled_sim, max_concurrent)
+        auto_count = min(int(enabled_sim), int(max_concurrent))
+
+        # ✅ 解法A：若使用者選了 count，就把它當作「手動上限」
+        manual_mode = simulator_charging_state.get("mode")
+        manual_cap_raw = simulator_charging_state.get("count", 0)
+
+        try:
+            manual_cap = int(manual_cap_raw or 0)
+        except Exception:
+            manual_cap = 0
+
+        if manual_mode == "count":
+            # 允許 0：代表全部不充電
+            effective = min(auto_count, manual_cap) if manual_cap >= 0 else auto_count
+            source = "smart_charging_manual_cap"
+        else:
+            effective = auto_count
+            source = "smart_charging_auto"
 
         return {
             "mode": "count",
-            "count": int(count),
-            "updated_at": datetime.utcnow().isoformat(),
-            "source": "smart_charging_auto",
-            "enabled_simulators": int(enabled_sim),
-            "max_concurrent_by_min_current": int(max_concurrent),
-        }
-
-    return dict(simulator_charging_state)
+            "count": int(effective),
 
 
 
