@@ -2022,6 +2022,48 @@ class ChargePoint(OcppChargePoint):
                 )
 
             # =================================================
+            # [3.5] Smart Charging 准入判斷（方案 A：硬性阻擋）
+            # =================================================
+            try:
+                smart_enabled, cfg = is_community_smart_charging_enabled()
+
+                if smart_enabled:
+                    active_now = get_active_charging_count()
+                    trial_count = active_now + 1
+
+                    allowed_a = calculate_allowed_current(
+                        active_charging_count=trial_count
+                    )
+
+                    logging.warning(
+                        f"[SMART][START_TX][CHECK] "
+                        f"cp={self.id} | active_now={active_now} | "
+                        f"trial={trial_count} | allowed_a={allowed_a}"
+                    )
+
+                    if allowed_a is None:
+                        logging.error(
+                            f"⛔ StartTransaction BLOCKED by SmartCharging "
+                            f"| cp={self.id} | idTag={id_tag} | "
+                            f"active={active_now} → {trial_count}"
+                        )
+                        return call_result.StartTransactionPayload(
+                            transaction_id=0,
+                            id_tag_info={"status": "Blocked"}
+                        )
+
+            except Exception as e:
+                # ⚠️ SmartCharging 壞掉時，安全起見也阻擋
+                logging.exception(
+                    f"[SMART][START_TX][FATAL] fail-safe BLOCK | "
+                    f"cp={self.id} | idTag={id_tag} | err={e}"
+                )
+                return call_result.StartTransactionPayload(
+                    transaction_id=0,
+                    id_tag_info={"status": "Blocked"}
+                )
+
+            # =================================================
             # [4] 建立交易（僅 DB）
             # =================================================
             meter_start_i = int(meter_start or 0)
@@ -2054,6 +2096,7 @@ class ChargePoint(OcppChargePoint):
                 f"cp={self.id} | connector={connector_id} | "
                 f"idTag={id_tag} | tx_id={tx_id} | balance={balance}"
             )
+
 
             # =================================================
             # [5] Smart Charging：背景 rebalance（不 await）
