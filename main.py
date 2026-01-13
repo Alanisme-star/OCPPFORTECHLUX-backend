@@ -960,10 +960,12 @@ def get_active_charging_count():
     with sqlite3.connect(DB_FILE, check_same_thread=False, timeout=15) as conn:
         cur = conn.cursor()
         cur.execute("""
-            SELECT COUNT(*)
-            FROM transactions
-            WHERE stop_timestamp IS NULL
-              AND start_timestamp IS NOT NULL
+        SELECT COUNT(*)
+        FROM transactions
+        WHERE stop_timestamp IS NULL
+          AND start_timestamp IS NOT NULL
+          AND (smart_paused IS NULL OR smart_paused = 0)
+
         """)
         row = cur.fetchone()
 
@@ -1061,6 +1063,117 @@ async def rebalance_all_charging_points(reason: str):
         logging.exception(
             f"[SMART][REBALANCE][FATAL] err={e}"
         )
+
+
+async def promote_waiting_transactions(reason: str):
+    """
+    當有名額釋放時，從 smart_paused queue 中
+    拉起最早的一筆，解除暫停並開始充電
+    """
+
+    try:
+        smart_enabled, cfg = is_community_smart_charging_enabled()
+        if not smart_enabled:
+            return
+
+        max_concurrent = calculate_max_concurrent_chargers()
+
+        # 目前「實際在充電」的台數（排除 paused）
+        with sqlite3.connect(DB_FILE, check_same_thread=False, timeout=15) as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT COUNT(*)
+                FROM transactions
+                WHERE stop_timestamp IS NULL
+                  AND start_timestamp IS NOT NULL
+                  AND (smart_paused IS NULL OR smart_paused = 0)
+            """)
+            row = cur.fetchone()
+            active_now = int(row[0] or 0)
+
+        logging.warning(
+            f"[SMART][PROMOTE][CHECK] reason={reason} | "
+            f"active_now={active_now} | max_concurrent={max_concurrent}"
+        )
+
+        if active_now >= max_concurrent:
+            return
+
+        # 撈一筆最早排隊的交易
+        with sqlite3.connect(DB_FILE, check_same_thread=False, timeout=15) as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT transaction_id, charge_point_id, connector_id
+                FROM transactions
+                WHERE stop_timestamp IS NULL
+                  AND smart_paused = 1
+                ORDER BY smart_pause_at ASC
+                LIMIT 1
+            """)
+            row = cur.fetchone()
+
+        if not row:
+            logging.warning("[SMART][PROMOTE] no queued transaction")
+            return
+
+        tx_id, cp_id, connector_id = row
+
+        # 解除暫停
+        with sqlite3.connect(DB_FILE, check_same_thread=False, timeout=15) as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                UPDATE transactions
+                SET smart_paused = 0,
+                    smart_pause_reason = NULL,
+                    smart_pause_at = NULL
+                WHERE transaction_id = ?
+            """, (tx_id,))
+            conn.commit()
+
+        logging.warning(
+            f"[SMART][PROMOTE] unpause tx_id={tx_id} | cp={cp_id}"
+        )
+
+        # 重新計算新的 allowed_a（解除一筆後）
+        new_active = active_now + 1
+        allowed_a = calculate_allowed_current(
+            active_charging_count=new_active
+        )
+
+        if allowed_a is None:
+            logging.error(
+                f"[SMART][PROMOTE][ERR] allowed_a None after promote"
+            )
+            return
+
+        # 對該 CP 送電流
+        cp = connected_charge_points.get(cp_id)
+        if not cp:
+            logging.warning(
+                f"[SMART][PROMOTE][SKIP] cp {cp_id} not connected"
+            )
+            return
+
+        if not getattr(cp, "supports_smart_charging", False):
+            logging.warning(
+                f"[SMART][PROMOTE][SKIP] cp {cp_id} not support smart charging"
+            )
+            return
+
+        await send_current_limit_profile(
+            cp=cp,
+            connector_id=int(connector_id or 1),
+            limit_a=float(allowed_a),
+            tx_id=int(tx_id),
+        )
+
+        logging.warning(
+            f"[SMART][PROMOTE][APPLY] "
+            f"cp={cp_id} | tx_id={tx_id} | limit={allowed_a}A"
+        )
+
+    except Exception as e:
+        logging.exception(f"[SMART][PROMOTE][FATAL] err={e}")
 
 
 
@@ -1510,9 +1623,35 @@ CREATE TABLE IF NOT EXISTS transactions (
     start_timestamp TEXT,
     meter_stop INTEGER,
     stop_timestamp TEXT,
-    reason TEXT
+    reason TEXT,
+
+    -- Smart Charging queue / pause
+    smart_paused INTEGER DEFAULT 0,
+    smart_pause_reason TEXT,
+    smart_pause_at TEXT
 )
-''')
+
+
+# =================================================
+# [DB MIGRATION] transactions 加入 Smart Charging queue 欄位
+# =================================================
+cursor.execute("PRAGMA table_info(transactions)")
+tx_cols = [r[1] for r in cursor.fetchall()]
+
+if "smart_paused" not in tx_cols:
+    logging.info("DB MIGRATION: add transactions.smart_paused")
+    cursor.execute("ALTER TABLE transactions ADD COLUMN smart_paused INTEGER DEFAULT 0")
+
+if "smart_pause_reason" not in tx_cols:
+    logging.info("DB MIGRATION: add transactions.smart_pause_reason")
+    cursor.execute("ALTER TABLE transactions ADD COLUMN smart_pause_reason TEXT")
+
+if "smart_pause_at" not in tx_cols:
+    logging.info("DB MIGRATION: add transactions.smart_pause_at")
+    cursor.execute("ALTER TABLE transactions ADD COLUMN smart_pause_at TEXT")
+
+conn.commit()
+
 
 
 cursor.execute('''
@@ -2063,46 +2202,41 @@ class ChargePoint(OcppChargePoint):
                 )
 
             # =================================================
-            # [3.5] Smart Charging 准入判斷（方案 A：硬性阻擋）
+            # [3.5] Smart Charging 准入與排隊判斷（方案 B：排隊暫停）
             # =================================================
+            smart_enabled, cfg = is_community_smart_charging_enabled()
+
+            should_pause = False   # 是否要進入排隊暫停
+            pause_reason = None
+
             try:
-                smart_enabled, cfg = is_community_smart_charging_enabled()
-
                 if smart_enabled:
+                    # 目前「正在充電中的台數」（不含 paused）
                     active_now = get_active_charging_count()
-                    trial_count = active_now + 1
 
-                    allowed_a = calculate_allowed_current(
-                        active_charging_count=trial_count
-                    )
+                    # 社區最多可同時充電台數
+                    max_concurrent = calculate_max_concurrent_chargers()
 
                     logging.warning(
-                        f"[SMART][START_TX][CHECK] "
+                        f"[SMART][START_TX][QUEUE_CHECK] "
                         f"cp={self.id} | active_now={active_now} | "
-                        f"trial={trial_count} | allowed_a={allowed_a}"
+                        f"max_concurrent={max_concurrent}"
                     )
 
-                    if allowed_a is None:
-                        logging.error(
-                            f"⛔ StartTransaction BLOCKED by SmartCharging "
-                            f"| cp={self.id} | idTag={id_tag} | "
-                            f"active={active_now} → {trial_count}"
-                        )
-                        return call_result.StartTransactionPayload(
-                            transaction_id=0,
-                            id_tag_info={"status": "Blocked"}
-                        )
+                    # 若已滿位 → 這一筆要進入排隊暫停
+                    if active_now >= max_concurrent:
+                        should_pause = True
+                        pause_reason = "community_queue"
 
             except Exception as e:
-                # ⚠️ SmartCharging 壞掉時，安全起見也阻擋
+                # ⚠️ SmartCharging 壞掉時：為了不中斷用戶，改為不啟用排隊（保守放行）
                 logging.exception(
-                    f"[SMART][START_TX][FATAL] fail-safe BLOCK | "
+                    f"[SMART][START_TX][QUEUE_CHECK_ERR] "
                     f"cp={self.id} | idTag={id_tag} | err={e}"
                 )
-                return call_result.StartTransactionPayload(
-                    transaction_id=0,
-                    id_tag_info={"status": "Blocked"}
-                )
+                should_pause = False
+                pause_reason = None
+
 
             # =================================================
             # [4] 建立交易（僅 DB）
@@ -2118,8 +2252,11 @@ class ChargePoint(OcppChargePoint):
                         connector_id,
                         id_tag,
                         meter_start,
-                        start_timestamp
-                    ) VALUES (?, ?, ?, ?, ?)
+                        start_timestamp,
+                        smart_paused,
+                        smart_pause_reason,
+                        smart_pause_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         self.id,
@@ -2127,8 +2264,12 @@ class ChargePoint(OcppChargePoint):
                         id_tag,
                         meter_start_i,
                         now_utc,
+                        1 if should_pause else 0,
+                        pause_reason,
+                        now_utc if should_pause else None,
                     ),
                 )
+
                 tx_id = cursor.lastrowid
                 conn.commit()
 
@@ -2137,6 +2278,39 @@ class ChargePoint(OcppChargePoint):
                 f"cp={self.id} | connector={connector_id} | "
                 f"idTag={id_tag} | tx_id={tx_id} | balance={balance}"
             )
+
+
+
+            # =================================================
+            # [4.5] 若此交易為排隊狀態，立刻送 0A 讓車端暫停
+            # =================================================
+            if should_pause:
+                try:
+                    cp = connected_charge_points.get(self.id)
+                    if cp and getattr(cp, "supports_smart_charging", False):
+                        await send_current_limit_profile(
+                            cp=cp,
+                            connector_id=int(connector_id or 1),
+                            limit_a=0.0,
+                            tx_id=tx_id,
+                        )
+
+                        logging.warning(
+                            f"[SMART][QUEUE][PAUSE] "
+                            f"cp={self.id} | tx_id={tx_id} | limit=0A"
+                        )
+                    else:
+                        logging.warning(
+                            f"[SMART][QUEUE][SKIP] "
+                            f"cp={self.id} not connected or not support smart charging"
+                        )
+                except Exception as e:
+                    logging.exception(
+                        f"[SMART][QUEUE][PAUSE_ERR] "
+                        f"cp={self.id} | tx_id={tx_id} | err={e}"
+                    )
+
+
 
 
             # =================================================
@@ -2425,17 +2599,31 @@ class ChargePoint(OcppChargePoint):
 
 
         # ==================================================
-        # 🟦 Smart Charging：StopTransaction 後全場 Rebalance
+        # 🟦 Smart Charging：StopTransaction 後 遞補 + 重新分流
         # ==================================================
         try:
-            await rebalance_all_charging_points(
-                reason="stop_transaction"
+            asyncio.create_task(
+                promote_waiting_transactions(
+                    reason=f"stop_tx cp={cp_id} tx={transaction_id}"
+                )
             )
+
+            asyncio.create_task(
+                rebalance_all_charging_points(
+                    reason=f"stop_tx_rebalance cp={cp_id} tx={transaction_id}"
+                )
+            )
+
+            logger.warning(
+                f"[SMART][STOP][TRIGGER] promote + rebalance | "
+                f"cp={cp_id} | tx={transaction_id}"
+            )
+
         except Exception as e:
-            logging.exception(
-                f"[SMART][STOP_TX][REBALANCE_ERR] "
-                f"cp_id={cp_id} | err={e}"
+            logger.exception(
+                f"[SMART][STOP][ERR] cp={cp_id} | tx={transaction_id} | err={e}"
             )
+
 
 
 
