@@ -1035,11 +1035,38 @@ async def rebalance_all_charging_points(reason: str):
                 continue
 
             try:
-                tx_id = int(tx_id)
+                tx_id_i = int(tx_id)
             except Exception:
                 logging.warning(
                     f"[SMART][REBALANCE][SKIP] invalid tx_id={tx_id}"
                 )
+                continue
+
+            # ✅ 二次確認：避免 queued/paused 交易被 rebalance 下發非 0A
+            try:
+                with sqlite3.connect(DB_FILE, check_same_thread=False, timeout=15) as conn:
+                    cur2 = conn.cursor()
+                    cur2.execute(
+                        """
+                        SELECT smart_paused
+                        FROM transactions
+                        WHERE transaction_id = ?
+                        """,
+                        (tx_id_i,)
+                    )
+                    r2 = cur2.fetchone()
+                if r2 and int(r2[0] or 0) == 1:
+                    logging.warning(
+                        f"[SMART][REBALANCE][SKIP_PAUSED] "
+                        f"cp_id={cp_id} | tx_id={tx_id_i}"
+                    )
+                    continue
+            except Exception as e:
+                logging.exception(
+                    f"[SMART][REBALANCE][PAUSED_CHECK_ERR] "
+                    f"cp_id={cp_id} | tx_id={tx_id_i} | err={e}"
+                )
+                # 保守：查不到就不要送，避免誤啟動排隊車
                 continue
 
             try:
@@ -1047,18 +1074,18 @@ async def rebalance_all_charging_points(reason: str):
                     cp=cp,
                     connector_id=int(connector_id or 1),
                     limit_a=allowed_a,
-                    tx_id=tx_id,
+                    tx_id=tx_id_i,
                 )
 
                 logging.warning(
                     f"[SMART][REBALANCE][APPLY] "
-                    f"cp_id={cp_id} | tx_id={tx_id} | limit={allowed_a}A"
+                    f"cp_id={cp_id} | tx_id={tx_id_i} | limit={allowed_a}A"
                 )
 
             except Exception as e:
                 logging.exception(
                     f"[SMART][REBALANCE][ERR] "
-                    f"cp_id={cp_id} | tx_id={tx_id} | err={e}"
+                    f"cp_id={cp_id} | tx_id={tx_id_i} | err={e}"
                 )
 
     except Exception as e:
@@ -2319,18 +2346,27 @@ class ChargePoint(OcppChargePoint):
             # [5] Smart Charging：背景 rebalance（不 await）
             # =================================================
             try:
-                asyncio.create_task(
-                    rebalance_all_charging_points(
-                        reason=f"start_transaction cp={self.id} tx={tx_id}"
+                # ✅ 排隊暫停的交易：絕對不觸發 rebalance
+                #    否則可能被 rebalance 下發非 0A 而開始充電
+                if not should_pause:
+                    asyncio.create_task(
+                        rebalance_all_charging_points(
+                            reason=f"start_transaction cp={self.id} tx={tx_id}"
+                        )
                     )
-                )
-                logging.warning(
-                    f"[SMART][START_TX][TRIGGER] cp_id={self.id} | tx_id={tx_id}"
-                )
+                    logging.warning(
+                        f"[SMART][START_TX][TRIGGER] cp_id={self.id} | tx_id={tx_id}"
+                    )
+                else:
+                    logging.warning(
+                        f"[SMART][START_TX][SKIP_REBALANCE] "
+                        f"cp_id={self.id} | tx_id={tx_id} | reason=queued"
+                    )
             except Exception as e:
                 logging.exception(
                     f"[SMART][START_TX][REBALANCE_ERR] cp={self.id} | tx_id={tx_id} | err={e}"
                 )
+
 
             # =================================================
             # [6] 正常回覆
