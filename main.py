@@ -2283,11 +2283,19 @@ class ChargePoint(OcppChargePoint):
                         effective_now = active_now + 1
 
                         logging.warning(
+                            f"[SMART][START_TX][QUEUE_CHECK] "
+                            f"cp={self.id} | active_now={active_now} | "
+                            f"effective_now={effective_now} | "
+                            f"max_concurrent={max_concurrent}"
+                        )
+
+                        logging.warning(
                             f"[SMART][START_TX][QUEUE_CHECK_LOCKED] "
                             f"cp={self.id} | active_now={active_now} | "
                             f"effective_now={effective_now} | "
                             f"max_concurrent={max_concurrent}"
                         )
+
 
                         # ⭐ Queue 條件：超過上限才要排隊
                         if effective_now > max_concurrent:
