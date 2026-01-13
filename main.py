@@ -2231,82 +2231,104 @@ class ChargePoint(OcppChargePoint):
                 )
 
             # =================================================
-            # [3.5] Smart Charging 准入與排隊判斷（方案 B：排隊暫停）
+            # [3.5] Smart Charging 准入與排隊判斷（方案 B：排隊暫停）— ✅ 原子化避免競態
             # =================================================
             smart_enabled, cfg = is_community_smart_charging_enabled()
 
             should_pause = False   # 是否要進入排隊暫停
             pause_reason = None
 
-            try:
-                if smart_enabled:
-                    # 目前「正在充電中的台數」（不含 paused）
-                    active_now = get_active_charging_count()
-
-                    # 社區最多可同時充電台數
-                    max_concurrent = calculate_max_concurrent_chargers()
-
-                    logging.warning(
-                        f"[SMART][START_TX][QUEUE_CHECK] "
-                        f"cp={self.id} | active_now={active_now} | "
-                        f"max_concurrent={max_concurrent}"
-                    )
-
-                    # 若已滿位 → 這一筆要進入排隊暫停
-                    if active_now >= max_concurrent:
-                        should_pause = True
-                        pause_reason = "community_queue"
-
-            except Exception as e:
-                # ⚠️ SmartCharging 壞掉時：為了不中斷用戶，改為不啟用排隊（保守放行）
-                logging.exception(
-                    f"[SMART][START_TX][QUEUE_CHECK_ERR] "
-                    f"cp={self.id} | idTag={id_tag} | err={e}"
-                )
-                should_pause = False
-                pause_reason = None
-
-
             # =================================================
-            # [4] 建立交易（僅 DB）
+            # [4] 建立交易（DB）— ✅ queue_check + insert 同一把鎖
             # =================================================
             meter_start_i = int(meter_start or 0)
 
-            with sqlite3.connect(DB_FILE) as conn:
+            with sqlite3.connect(DB_FILE, check_same_thread=False, timeout=15) as conn:
                 cursor = conn.cursor()
-                cursor.execute(
-                    """
-                    INSERT INTO transactions (
-                        charge_point_id,
-                        connector_id,
-                        id_tag,
-                        meter_start,
-                        start_timestamp,
-                        smart_paused,
-                        smart_pause_reason,
-                        smart_pause_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        self.id,
-                        connector_id,
-                        id_tag,
-                        meter_start_i,
-                        now_utc,
-                        1 if should_pause else 0,
-                        pause_reason,
-                        now_utc if should_pause else None,
-                    ),
-                )
 
-                tx_id = cursor.lastrowid
-                conn.commit()
+                # ✅ 取得寫入鎖：避免 5/6 台同時 StartTransaction 時一起被放行
+                cursor.execute("BEGIN IMMEDIATE")
+
+                try:
+                    if smart_enabled:
+                        # ✅ 用同一個 conn 直接查 active_now（排除 paused）
+                        cursor.execute(
+                            """
+                            SELECT COUNT(*)
+                            FROM transactions
+                            WHERE stop_timestamp IS NULL
+                              AND start_timestamp IS NOT NULL
+                              AND (smart_paused IS NULL OR smart_paused = 0)
+                            """
+                        )
+                        active_now = int(cursor.fetchone()[0] or 0)
+
+                        max_concurrent = calculate_max_concurrent_chargers()
+
+                        logging.warning(
+                            f"[SMART][START_TX][QUEUE_CHECK_LOCKED] "
+                            f"cp={self.id} | active_now={active_now} | "
+                            f"max_concurrent={max_concurrent}"
+                        )
+
+                        if active_now >= max_concurrent:
+                            should_pause = True
+                            pause_reason = "community_queue"
+
+                        logging.warning(
+                            f"[SMART][START_TX][QUEUE_DECIDE] "
+                            f"cp={self.id} | should_pause={should_pause} | "
+                            f"reason={pause_reason}"
+                        )
+
+                    # ✅ 插入交易（同一把鎖內）
+                    cursor.execute(
+                        """
+                        INSERT INTO transactions (
+                            charge_point_id,
+                            connector_id,
+                            id_tag,
+                            meter_start,
+                            start_timestamp,
+                            smart_paused,
+                            smart_pause_reason,
+                            smart_pause_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            self.id,
+                            connector_id,
+                            id_tag,
+                            meter_start_i,
+                            now_utc,
+                            1 if should_pause else 0,
+                            pause_reason,
+                            now_utc if should_pause else None,
+                        ),
+                    )
+
+                    tx_id = cursor.lastrowid
+                    conn.commit()
+
+                except Exception as e:
+                    conn.rollback()
+                    logging.exception(
+                        f"[SMART][START_TX][DB_ATOMIC_ERR] "
+                        f"cp={self.id} | idTag={id_tag} | err={e}"
+                    )
+                    # ⚠️ 保守策略：這裡不要硬放行造成超載；直接回 Rejected（避免 6 台都充）
+                    return call_result.StartTransactionPayload(
+                        transaction_id=0,
+                        id_tag_info={"status": "Rejected"},
+                    )
 
             logging.info(
                 f"🟢 StartTransaction Accepted | "
                 f"cp={self.id} | connector={connector_id} | "
-                f"idTag={id_tag} | tx_id={tx_id} | balance={balance}"
+                f"idTag={id_tag} | tx_id={tx_id} | balance={balance} | "
+                f"smart_paused={1 if should_pause else 0}"
             )
+
 
 
 
