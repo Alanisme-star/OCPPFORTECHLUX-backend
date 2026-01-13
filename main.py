@@ -1630,7 +1630,7 @@ CREATE TABLE IF NOT EXISTS transactions (
     smart_pause_reason TEXT,
     smart_pause_at TEXT
 )
-
+''')
 
 # =================================================
 # [DB MIGRATION] transactions 加入 Smart Charging queue 欄位
