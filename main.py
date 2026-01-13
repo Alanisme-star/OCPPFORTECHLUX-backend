@@ -2265,13 +2265,18 @@ class ChargePoint(OcppChargePoint):
 
                         max_concurrent = calculate_max_concurrent_chargers()
 
+                        # ⭐ 把「現在這一台正在嘗試 StartTransaction」算進去
+                        effective_now = active_now + 1
+
                         logging.warning(
                             f"[SMART][START_TX][QUEUE_CHECK_LOCKED] "
                             f"cp={self.id} | active_now={active_now} | "
+                            f"effective_now={effective_now} | "
                             f"max_concurrent={max_concurrent}"
                         )
 
-                        if active_now >= max_concurrent:
+                        # ⭐ Queue 條件：超過上限才要排隊
+                        if effective_now > max_concurrent:
                             should_pause = True
                             pause_reason = "community_queue"
 
@@ -2280,6 +2285,7 @@ class ChargePoint(OcppChargePoint):
                             f"cp={self.id} | should_pause={should_pause} | "
                             f"reason={pause_reason}"
                         )
+
 
                     # ✅ 插入交易（同一把鎖內）
                     cursor.execute(
