@@ -1015,6 +1015,8 @@ async def rebalance_all_charging_points(reason: str):
                 FROM transactions
                 WHERE stop_timestamp IS NULL
                   AND start_timestamp IS NOT NULL
+                  AND (smart_paused IS NULL OR smart_paused = 0)
+
             """)
             rows = cur.fetchall()
 
