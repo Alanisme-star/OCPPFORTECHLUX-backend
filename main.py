@@ -2311,31 +2311,48 @@ class ChargePoint(OcppChargePoint):
 
 
             # =================================================
-            # [4.5] 若此交易為排隊狀態，立刻送 0A 讓車端暫停
+            # [4.5] 若此交易為排隊狀態，背景送 0A 讓車端暫停（不 await）
             # =================================================
             if should_pause:
                 try:
-                    cp = connected_charge_points.get(self.id)
-                    if cp and getattr(cp, "supports_smart_charging", False):
-                        await send_current_limit_profile(
-                            cp=cp,
-                            connector_id=int(connector_id or 1),
-                            limit_a=0.0,
-                            tx_id=tx_id,
-                        )
+                    # StartTransaction handler 的 self 本身就是該 CP 連線物件
+                    # supports_smart_charging 以 self 為準；避免 connected_charge_points 物件型態不一致
+                    supports = bool(getattr(self, "supports_smart_charging", True))
+
+                    if supports:
+                        async def _send_pause_limit():
+                            try:
+                                await send_current_limit_profile(
+                                    cp=self,  # ✅ 直接用 self，最穩
+                                    connector_id=int(connector_id or 1),
+                                    limit_a=0.0,
+                                    tx_id=int(tx_id),
+                                )
+                                logging.warning(
+                                    f"[SMART][QUEUE][PAUSE][SENT] "
+                                    f"cp={self.id} | tx_id={tx_id} | limit=0A"
+                                )
+                            except Exception as e:
+                                logging.exception(
+                                    f"[SMART][QUEUE][PAUSE_ERR] "
+                                    f"cp={self.id} | tx_id={tx_id} | err={e}"
+                                )
+
+                        asyncio.create_task(_send_pause_limit())
 
                         logging.warning(
-                            f"[SMART][QUEUE][PAUSE] "
-                            f"cp={self.id} | tx_id={tx_id} | limit=0A"
+                            f"[SMART][QUEUE][PAUSE][ENQUEUE] "
+                            f"cp={self.id} | tx_id={tx_id} | will_send=0A"
                         )
                     else:
                         logging.warning(
                             f"[SMART][QUEUE][SKIP] "
-                            f"cp={self.id} not connected or not support smart charging"
+                            f"cp={self.id} | tx_id={tx_id} | reason=not_support_smart_charging"
                         )
+
                 except Exception as e:
                     logging.exception(
-                        f"[SMART][QUEUE][PAUSE_ERR] "
+                        f"[SMART][QUEUE][PAUSE_SETUP_ERR] "
                         f"cp={self.id} | tx_id={tx_id} | err={e}"
                     )
 
