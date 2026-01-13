@@ -1099,6 +1099,8 @@ async def promote_waiting_transactions(reason: str):
     當有名額釋放時，從 smart_paused queue 中
     拉起最早的一筆，解除暫停並開始充電
     """
+    # 🧪 進入點：確保每次 promote 都可追蹤
+    logging.warning(f"[SMART][PROMOTE][ENTER] reason={reason}")
 
     try:
         smart_enabled, cfg = is_community_smart_charging_enabled()
@@ -1175,7 +1177,6 @@ async def promote_waiting_transactions(reason: str):
             )
             return
 
-        # 對該 CP 送電流
         cp = connected_charge_points.get(cp_id)
         if not cp:
             logging.warning(
@@ -1200,6 +1201,19 @@ async def promote_waiting_transactions(reason: str):
             f"[SMART][PROMOTE][APPLY] "
             f"cp={cp_id} | tx_id={tx_id} | limit={allowed_a}A"
         )
+
+        # ==================================================
+        # 🔥 核心補強：解除排隊後 → 立刻全體重新分流
+        # ==================================================
+        try:
+            await rebalance_all_charging_points(
+                reason=f"promote_after_unpause cp={cp_id} tx={tx_id}"
+            )
+        except Exception as e:
+            logging.exception(
+                f"[SMART][PROMOTE][REBALANCE_ERR] "
+                f"cp={cp_id} | tx={tx_id} | err={e}"
+            )
 
     except Exception as e:
         logging.exception(f"[SMART][PROMOTE][FATAL] err={e}")
@@ -2680,40 +2694,39 @@ class ChargePoint(OcppChargePoint):
                 )
 
 
+        # ==================================================
+        # 🟦 Smart Charging：StopTransaction 後 遞補 + 重新分流（強制順序）
+        # ==================================================
+        async def _stop_tx_promote_and_rebalance():
+            try:
+                logger.warning(
+                    f"[SMART][STOP][ENTER] promote start | cp={cp_id} | tx={transaction_id}"
+                )
 
-        # ==================================================
-        # 🟦 Smart Charging：StopTransaction 後 遞補 + 重新分流
-        # ==================================================
-        try:
-            asyncio.create_task(
-                promote_waiting_transactions(
+                # ① 先補位（解除 queue 中的一台）
+                await promote_waiting_transactions(
                     reason=f"stop_tx cp={cp_id} tx={transaction_id}"
                 )
-            )
 
-            asyncio.create_task(
-                rebalance_all_charging_points(
-                    reason=f"stop_tx_rebalance cp={cp_id} tx={transaction_id}"
+                logger.warning(
+                    f"[SMART][STOP][PROMOTE_OK] cp={cp_id} | tx={transaction_id}"
                 )
-            )
 
-            logger.warning(
-                f"[SMART][STOP][TRIGGER] promote + rebalance | "
-                f"cp={cp_id} | tx={transaction_id}"
-            )
+                # ② 補位完成後 → 立刻重新分流
+                await rebalance_all_charging_points(
+                    reason=f"stop_tx_rebalance_after_promote cp={cp_id} tx={transaction_id}"
+                )
 
-        except Exception as e:
-            logger.exception(
-                f"[SMART][STOP][ERR] cp={cp_id} | tx={transaction_id} | err={e}"
-            )
+                logger.warning(
+                    f"[SMART][STOP][REBALANCE_OK] cp={cp_id} | tx={transaction_id}"
+                )
 
+            except Exception as e:
+                logger.exception(
+                    f"[SMART][STOP][ERR] cp={cp_id} | tx={transaction_id} | err={e}"
+                )
 
-
-
-
-
-        # ⚠️ 永遠回 CALLRESULT
-        return call_result.StopTransactionPayload()
+        asyncio.create_task(_stop_tx_promote_and_rebalance())
 
 
 
