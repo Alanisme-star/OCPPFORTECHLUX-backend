@@ -4914,6 +4914,7 @@ def get_cards():
     result = []
     for r in rows:
         result.append({
+            "idTag": r[0],          # ⭐ 關鍵：前端用這個
             "card_id": r[0],
             "balance": r[1],
             "status": r[2],
