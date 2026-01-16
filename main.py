@@ -4447,24 +4447,35 @@ async def add_id_tag(data: dict = Body(...)):
         raise HTTPException(status_code=400, detail="Invalid validUntil format")
 
     try:
+        # ✅ 舊版一致性：建卡＝三張表同時成立（同一個 transaction）
         cursor.execute(
             'INSERT INTO id_tags (id_tag, status, valid_until) VALUES (?, ?, ?)',
             (id_tag, status, valid_str)
         )
+
+        # ✅ 關鍵補齊：確保 cards 一定存在（否則 /api/cards 會查不到）
+        cursor.execute(
+            '''
+            INSERT OR IGNORE INTO cards (card_id, balance)
+            VALUES (?, ?)
+            ''',
+            (id_tag, 0)
+        )
+
         conn.commit()
         print(f"✅ 已成功新增卡片：{id_tag}, {status}, {valid_str}")
-        # ⬇️ 新增這一行：如果卡片不存在於 cards，則自動新增餘額帳戶（初始餘額0元）
-        cursor.execute('INSERT OR IGNORE INTO cards (card_id, balance) VALUES (?, ?)', (id_tag, 0))
-        conn.commit()
 
     except sqlite3.IntegrityError as e:
+        conn.rollback()
         print(f"❌ 資料庫重複錯誤：{e}")
         raise HTTPException(status_code=409, detail="idTag already exists")
     except Exception as e:
+        conn.rollback()
         print(f"❌ 未知新增錯誤：{e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
     return {"message": "Added successfully"}
+
 
 
 @app.put("/api/id_tags/{id_tag}")
