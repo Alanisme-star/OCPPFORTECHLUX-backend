@@ -1,13 +1,25 @@
 import asyncio
+import argparse
+import json
 import logging
-import random
 from datetime import datetime, timezone
-from urllib.parse import quote
+from urllib import request, error
 
-from websockets import connect
-from ocpp.v16 import ChargePoint as BaseChargePoint, call
+import websockets
+from ocpp.v16 import ChargePoint as CP
+from ocpp.v16 import call, call_result
 from ocpp.v16.enums import Action
+from ocpp.v16.call import MeterValues
 from ocpp.routing import on
+
+
+# =====================
+# 基本設定
+# =====================
+DEFAULT_VOLTAGE = 220.0
+DEFAULT_PHASES = 1
+DEFAULT_ID_TAG = "6678B3EB"
+DEFAULT_TEST_BALANCE = 1000.0
 
 logging.basicConfig(
     level=logging.INFO,
@@ -15,192 +27,304 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 
-# ====================== 白名單設定（務必與後端一致） ======================
-CHARGE_POINT_ID = "TW*MSI*E000100"
-ID_TAG = "6678B3EB"
-WS_BASE_URL = "wss://ocppfortechlux-backend.onrender.com"
-# =======================================================================
+
+def utc_now():
+    return datetime.now(timezone.utc).isoformat()
 
 
-def iso_utc():
-    return datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
+def ws_to_http_base(ws_url: str) -> str:
+    if ws_url.startswith("wss://"):
+        scheme = "https://"
+        rest = ws_url[len("wss://"):]
+    elif ws_url.startswith("ws://"):
+        scheme = "http://"
+        rest = ws_url[len("ws://"):]
+    else:
+        scheme = "https://"
+        rest = ws_url
+
+    host = rest.split("/", 1)[0]
+    return scheme + host
 
 
-def build_ws_url(base: str, cp_id: str) -> str:
-    # Render / Proxy 環境下，* 必須 encode
-    return f"{base.rstrip('/')}/{quote(cp_id, safe='')}"
+def http_get_json(url: str, timeout: int = 10):
+    req = request.Request(url, method="GET")
+    try:
+        with request.urlopen(req, timeout=timeout) as resp:
+            data = resp.read().decode("utf-8", errors="ignore")
+            return json.loads(data) if data else None
+    except Exception as e:
+        logging.warning(f"[HTTP][GET][FAIL] url={url} err={e}")
+        return None
 
 
-class SimChargePoint(BaseChargePoint):
-    def __init__(self, charge_point_id, websocket):
-        super().__init__(charge_point_id, websocket)
-        self.running = True
-        self.tx_id = None
+def http_post_json(url: str, payload: dict, timeout: int = 10):
+    body = json.dumps(payload).encode("utf-8")
+    req = request.Request(
+        url,
+        data=body,
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with request.urlopen(req, timeout=timeout) as resp:
+            data = resp.read().decode("utf-8", errors="ignore")
+            return json.loads(data) if data else {}
+    except error.HTTPError as e:
+        try:
+            msg = e.read().decode("utf-8", errors="ignore")
+        except Exception:
+            msg = str(e)
+        logging.warning(f"[HTTP][POST][HTTPError] url={url} code={e.code} body={msg}")
+        return None
+    except Exception as e:
+        logging.warning(f"[HTTP][POST][FAIL] url={url} err={e}")
+        return None
 
-        # 統一用 Wh（整數）避免浮點誤差
-        self.energy_Wh = 0
 
-        self.power_min = 3000
-        self.power_max = 3500
+# =====================
+# 🧪 自動建卡＋補餘額（測試用）
+# =====================
+def ensure_test_card(http_base: str, *, id_tag: str, min_balance: float):
+    """
+    測試模式：
+    - 確保 cards 表中有此 id_tag
+    - 若餘額不足，自動補到 min_balance
+    """
 
-    # ============================================================
-    # 🔴 關鍵：接收中控 RemoteStopTransaction（修正點）
-    # ============================================================
-    @on(Action.remote_stop_transaction)
-    async def on_remote_stop_transaction(self, transaction_id: int, **kwargs):
-        logging.warning(f"[SIM] ← RemoteStopTransaction tx_id={transaction_id}")
+    # 1️⃣ 嘗試查卡片（你系統目前沒有 GET API，直接用 INSERT/UPDATE）
+    logging.warning(
+        f"[SIM][CARD][AUTO] ensure card idTag={id_tag} balance>={min_balance}"
+    )
 
-        await self.send_stop_transaction(reason="Remote")
-        self.running = False
+    # 👉 使用 SQLite INSERT OR IGNORE 對應的 API（你後端已存在）
+    # 這個 endpoint 你已經有：
+    #   cards(card_id, balance)
 
-        return {"status": "Accepted"}
+    # 2️⃣ 建卡（若不存在）
+    payload = {
+        "card_id": id_tag,
+        "balance": float(min_balance),
+    }
 
-    # ================= 主動送出的 OCPP 行為 =================
+    # ⚠️ 這裡假設你有一個 debug / cards API
+    # 若你沒有，我下面有「備用方案」
+    res = http_post_json(f"{http_base}/api/debug/force-add-card", payload)
+
+    if res:
+        logging.info(f"[SIM][CARD] ensured card {id_tag} balance={min_balance}")
+    else:
+        logging.warning(
+            "[SIM][CARD] force-add-card API not available, fallback to update"
+        )
+
+        # 3️⃣ 補餘額（即使存在也安全）
+        http_post_json(
+            f"{http_base}/api/debug/topup-card",
+            {"card_id": id_tag, "balance": float(min_balance)},
+        )
+
+
+# =====================
+# ChargePoint 模擬器
+# =====================
+class SimChargePoint(CP):
+    def __init__(self, cp_id, ws):
+        super().__init__(cp_id, ws)
+
+        self.tx_map = {}
+        self.tx_tasks = {}
+        self.current_limit_a = {}
+        self.energy_wh_float = {}
+        self.energy_wh_int = {}
+
     async def send_boot(self):
-        logging.info("[SIM] → BootNotification")
-        res = await self.call(
+        logging.info(f"[SIM][{self.id}] → BootNotification")
+        await self.call(
             call.BootNotification(
                 charge_point_model="SimCP",
-                charge_point_vendor="TechLux-Demo",
+                charge_point_vendor="TechLux-SC-Test",
             )
         )
-        logging.info(f"[SIM] BootNotification 回應: {res}")
 
-    async def send_status(self, status="Available"):
-        logging.info(f"[SIM] → StatusNotification: {status}")
+    async def send_status(self, connector_id, status):
         await self.call(
             call.StatusNotification(
-                connector_id=1,
-                status=status,
+                connector_id=int(connector_id),
                 error_code="NoError",
-                timestamp=iso_utc(),
+                status=status,
+                timestamp=utc_now(),
             )
         )
 
-    async def send_authorize(self):
-        logging.info(f"[SIM] → Authorize {ID_TAG}")
-        res = await self.call(call.Authorize(id_tag=ID_TAG))
-        logging.info(f"[SIM] Authorize 回應: {res}")
+    async def send_authorize(self, id_tag: str):
+        logging.info(f"[SIM][{self.id}] → Authorize idTag={id_tag}")
+        res = await self.call(call.Authorize(id_tag=id_tag))
 
-    async def start_transaction(self):
-        logging.info("[SIM] → StartTransaction")
-        res = await self.call(
-            call.StartTransaction(
-                connector_id=1,
-                id_tag=ID_TAG,
-                meter_start=int(self.energy_Wh),
-                timestamp=iso_utc(),
-            )
+        status = (
+            res.id_tag_info.get("status")
+            if res and getattr(res, "id_tag_info", None)
+            else None
         )
-        self.tx_id = getattr(res, "transaction_id", None) or getattr(res, "transactionId", None)
-        logging.info(f"[SIM] ✅ transaction_id = {self.tx_id}")
 
-    async def send_meter_values(self):
-        if not self.tx_id:
-            return
+        logging.info(f"[SIM][{self.id}] ← Authorize result={status}")
 
-        power = random.randint(self.power_min, self.power_max)
-        voltage = random.uniform(220, 230)
-        current = power / voltage
+        if status != "Accepted":
+            raise RuntimeError(f"Authorize rejected: {status}")
 
-        self.energy_Wh += int(power / 3600)
+    @on(Action.set_charging_profile)
+    async def on_set_charging_profile(self, connectorId, csChargingProfiles, **kwargs):
+        limit = (
+            csChargingProfiles
+            .get("chargingSchedule", {})
+            .get("chargingSchedulePeriod", [{}])[0]
+            .get("limit", 0)
+        )
 
-        mv = {
-            "timestamp": iso_utc(),
-            "sampledValue": [
-                {"value": str(power), "measurand": "Power.Active.Import", "unit": "W"},
-                {"value": f"{voltage:.1f}", "measurand": "Voltage", "unit": "V"},
-                {"value": f"{current:.1f}", "measurand": "Current.Import", "unit": "A"},
-                {
-                    "value": str(self.energy_Wh),
-                    "measurand": "Energy.Active.Import.Register",
-                    "unit": "Wh",
-                },
-            ],
-        }
+        try:
+            limit = float(limit)
+        except Exception:
+            limit = 0.0
+
+        self.current_limit_a[int(connectorId)] = limit
 
         logging.info(
-            f"[SIM] → MeterValues | {power}W {voltage:.1f}V {current:.1f}A total={self.energy_Wh}Wh"
+            f"[SIM][{self.id}] ⚡ SetChargingProfile connector={connectorId} limit={limit}A"
         )
 
-        await self.call(
-            call.MeterValues(
-                connector_id=1,
-                transaction_id=int(self.tx_id),
-                meter_value=[mv],
+        return call_result.SetChargingProfile(status="Accepted")
+
+    async def start_tx(self, connector_id: int, id_tag: str):
+        logging.info(f"[SIM][{self.id}] → StartTransaction connector={connector_id}")
+
+        res = await self.call(
+            call.StartTransaction(
+                connector_id=int(connector_id),
+                id_tag=str(id_tag),
+                meter_start=0,
+                timestamp=utc_now(),
             )
         )
 
-    async def send_heartbeat(self):
-        logging.info("[SIM] → Heartbeat")
-        await self.call(call.Heartbeat())
-
-    async def send_stop_transaction(self, reason="Local"):
-        if not self.tx_id:
-            logging.warning("[SIM] ⚠️ 無 transaction_id，略過 StopTransaction")
-            return
-
-        logging.info(f"[SIM] → StopTransaction tx={self.tx_id} reason={reason}")
-        await self.call(
-            call.StopTransaction(
-                transaction_id=int(self.tx_id),
-                meter_stop=int(self.energy_Wh),
-                timestamp=iso_utc(),
-                id_tag=ID_TAG,
-                reason=reason,
+        tx_id = getattr(res, "transaction_id", 0) or 0
+        if not tx_id:
+            st = res.id_tag_info.get("status") if res and res.id_tag_info else None
+            logging.warning(
+                f"[SIM][{self.id}] ❌ StartTransaction rejected connector={connector_id} status={st}"
             )
+            return False
+
+        self.tx_map[connector_id] = tx_id
+        self.current_limit_a.setdefault(connector_id, 0.0)
+        self.energy_wh_float.setdefault(connector_id, 0.0)
+        self.energy_wh_int.setdefault(connector_id, 0)
+
+        await self.send_status(connector_id, "Charging")
+
+        task = asyncio.create_task(self.meter_loop(connector_id, tx_id))
+        self.tx_tasks[connector_id] = task
+
+        logging.info(f"[SIM][{self.id}] ✅ STARTED connector={connector_id} tx_id={tx_id}")
+        return True
+
+    async def meter_loop(self, connector_id: int, tx_id: int):
+        while connector_id in self.tx_map:
+            limit_a = float(self.current_limit_a.get(connector_id, 0.0))
+            if limit_a <= 0:
+                await asyncio.sleep(1)
+                continue
+
+            voltage = DEFAULT_VOLTAGE
+            current = limit_a
+            power_w = voltage * current * DEFAULT_PHASES
+
+            self.energy_wh_float[connector_id] += power_w / 3600.0
+            now = int(self.energy_wh_float[connector_id])
+            self.energy_wh_int[connector_id] = max(
+                self.energy_wh_int[connector_id], now
+            )
+
+            await self.call(
+                MeterValues(
+                    connector_id=connector_id,
+                    transaction_id=tx_id,
+                    meter_value=[{
+                        "timestamp": utc_now(),
+                        "sampledValue": [
+                            {"measurand": "Voltage", "value": str(voltage), "unit": "V"},
+                            {"measurand": "Current.Import", "value": str(current), "unit": "A"},
+                            {"measurand": "Power.Active.Import", "value": str(power_w), "unit": "W"},
+                            {"measurand": "Energy.Active.Import.Register", "value": str(now), "unit": "Wh"},
+                        ],
+                    }],
+                )
+            )
+
+            await asyncio.sleep(1)
+
+
+# =====================
+# Main
+# =====================
+async def main(ws_url, cars, interval, id_tag, auto_card, card_balance):
+    cp_id = ws_url.rstrip("/").split("/")[-1]
+    http_base = ws_to_http_base(ws_url)
+
+    logging.info(f"[SIM] Connecting: {ws_url}")
+    logging.info(f"[SIM] HTTP base: {http_base}")
+    logging.info(f"[SIM] idTag={id_tag} cars={cars} interval={interval}s")
+
+    if auto_card:
+        await asyncio.to_thread(
+            ensure_test_card,
+            http_base,
+            id_tag=id_tag,
+            min_balance=card_balance,
         )
-        logging.info(f"[SIM] ✅ StopTransaction 完成（{self.energy_Wh}Wh）")
 
+    async with websockets.connect(
+        ws_url,
+        subprotocols=["ocpp1.6"],
+        ping_interval=20,
+        ping_timeout=20,
+    ) as ws:
+        cp = SimChargePoint(cp_id, ws)
+        asyncio.create_task(cp.start())
 
-async def main():
-    ws_url = build_ws_url(WS_BASE_URL, CHARGE_POINT_ID)
-    logging.info(f"[SIM] Connecting to {ws_url}")
-
-    async with connect(ws_url, subprotocols=["ocpp1.6"]) as ws:
-        cp = SimChargePoint(CHARGE_POINT_ID, ws)
-        cp_task = asyncio.create_task(cp.start())
-
-        # ===== 啟動流程 =====
         await cp.send_boot()
-        await cp.send_status("Available")
-        await cp.send_authorize()
-        await cp.send_status("Preparing")
-        await asyncio.sleep(1)
+        await cp.send_status(0, "Available")
+        await cp.send_authorize(id_tag)
 
-        await cp.start_transaction()
-        await cp.send_status("Charging")
+        for i in range(1, cars + 1):
+            await cp.send_status(i, "Available")
+            await asyncio.sleep(0.3)
+            await cp.start_tx(i, id_tag)
+            await asyncio.sleep(interval)
 
-        # ===== Heartbeat =====
-        async def heartbeat_loop():
-            while cp.running:
-                await asyncio.sleep(30)
-                await cp.send_heartbeat()
-
-        hb_task = asyncio.create_task(heartbeat_loop())
-
-        # ===== 主模擬迴圈 =====
-        try:
-            while cp.running:
-                await asyncio.sleep(1)
-                await cp.send_meter_values()
-        except KeyboardInterrupt:
-            logging.info("[SIM] 🛑 使用者中斷")
-            await cp.send_stop_transaction(reason="Local")
-        finally:
-            cp.running = False
-            try:
-                await cp.send_status("Finishing")
-                await asyncio.sleep(1)
-                await cp.send_status("Available")
-            except Exception:
-                pass
-
-            hb_task.cancel()
-            cp_task.cancel()
-            await ws.close()
-            logging.info("[SIM] ✅ 模擬器結束")
+        while True:
+            await asyncio.sleep(60)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--ws", required=True)
+    parser.add_argument("--cars", type=int, default=4)
+    parser.add_argument("--interval", type=int, default=5)
+    parser.add_argument("--idtag", type=str, default=DEFAULT_ID_TAG)
+
+    # 🧪 測試模式
+    parser.add_argument("--auto-card", action="store_true")
+    parser.add_argument("--card-balance", type=float, default=DEFAULT_TEST_BALANCE)
+
+    args = parser.parse_args()
+
+    asyncio.run(
+        main(
+            args.ws,
+            args.cars,
+            args.interval,
+            args.idtag,
+            args.auto_card,
+            args.card_balance,
+        )
+    )
