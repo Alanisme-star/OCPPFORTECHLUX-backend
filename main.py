@@ -1100,6 +1100,71 @@ ensure_charge_points_schema()
 
 
 
+def _price_for_timestamp(ts: str) -> float:
+    """
+    查當下 timestamp 所對應的電價，
+    修正 24:00 整天規則與跨午夜邏輯。
+    """
+    try:
+        # 1. 解析時間
+        dt = (
+            datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            if "Z" in ts
+            else datetime.fromisoformat(ts)
+        )
+        dt = dt.astimezone(TZ_TAIPEI)
+
+        date_str = dt.strftime("%Y-%m-%d")
+        time_str = dt.strftime("%H:%M")
+
+        # 2. 查這一天的規則
+        with sqlite3.connect(DB_FILE) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT start_time, end_time, price
+                FROM daily_pricing_rules
+                WHERE date = ?
+                ORDER BY start_time ASC
+                """,
+                (date_str,),
+            )
+            rules = cur.fetchall()
+
+        # ------ 沒規則 → 預設 ------
+        if not rules:
+            return 6.0
+
+        # ------ 將 24:00 → 23:59 ------
+        normalized = []
+        for s, e, p in rules:
+            s2 = "23:59" if s == "24:00" else s
+            e2 = "23:59" if e == "24:00" else e
+            normalized.append((s2, e2, p))
+
+        # ------ 時段比對 ------
+        for s, e, price in normalized:
+            if s <= e:
+                if s <= time_str <= e:
+                    return float(price)
+            else:
+                # 跨午夜
+                if time_str >= s or time_str <= e:
+                    return float(price)
+
+        # ------ 整天設定 fallback ------
+        overs = [p for s, e, p in normalized if s == "00:00" and e == "23:59"]
+        if overs:
+            return float(overs[0])
+
+    except Exception as e:
+        logging.warning(f"⚠️ 電價查詢失敗: {e}")
+
+    return 6.0
+
+
+
+
 
 # 📌 預設電價規則資料表（只會存一筆）
 cursor.execute("""
@@ -1145,9 +1210,8 @@ def _calculate_multi_period_cost(transaction_id: int) -> float:
 
 def _calculate_multi_period_cost_detailed(transaction_id: int):
     import sqlite3
-    from datetime import datetime, timedelta, timezone
+    from datetime import datetime
 
-    # 讀取該 transaction 的 Energy.Active.Import（Wh）序列
     with sqlite3.connect(DB_FILE) as conn:
         cur = conn.cursor()
         cur.execute("""
@@ -1167,67 +1231,84 @@ def _calculate_multi_period_cost_detailed(transaction_id: int):
         ts_prev, val_prev = rows[i - 1]
         ts_curr, val_curr = rows[i]
 
-        # 以相鄰差分計算本段新增用電量（Wh -> kWh）
         diff_kwh = max(0.0, (float(val_curr) - float(val_prev)) / 1000.0)
-        if diff_kwh <= 0:
-            continue
+        price = _price_for_timestamp(ts_curr)
 
-        # 正規化 timestamp → 轉換為台北時間（用 ts_curr 當作本段歸屬時間）
-        ts_norm = ts_curr.replace("Z", "+00:00")
+        # 正規化 UTC timestamp → 轉換為台北時間
+        ts_norm = ts_curr.replace("Z", "+00:00")  # 處理帶 Z 格式
         dt_parsed = datetime.fromisoformat(ts_norm)
+
+        # 若 timestamp 無 tzinfo，視為 UTC，再轉台北
         if dt_parsed.tzinfo is None:
             dt_parsed = dt_parsed.replace(tzinfo=timezone.utc)
+
         dt_local = dt_parsed.astimezone(TZ_TAIPEI)
 
-        # ✅ 統一用 Step 1 的規則比對函式（同時考慮當天 & 前一天跨日規則）
-        # 回傳：(rule_date, start_hm, end_hm, price, label)
-        rule_date, start_t, end_t, price, _label = _match_rule_for_dt(dt_local)
+        date_key = dt_local.strftime("%Y-%m-%d")
+        time_str = dt_local.strftime("%H:%M")
 
-        # 分段 key：用「命中的規則」當 key（不是用 dt_local 的 date_key）
-        key = (rule_date, start_t, end_t, float(price))
+
+        # ★ 查電價時段（start_time, end_time）
+        with sqlite3.connect(DB_FILE) as conn:
+            c2 = conn.cursor()
+            c2.execute("""
+                SELECT start_time, end_time
+                FROM daily_pricing_rules
+                WHERE date = ?
+                  AND ? >= start_time
+                  AND ? < end_time
+                ORDER BY start_time ASC LIMIT 1
+            """, (date_key, time_str, time_str))
+            rule = c2.fetchone()
+
+        if rule:
+            start_t, end_t = rule
+        else:
+            # 🩵 新增：若當天查不到規則，嘗試往前一天查
+            prev_date = (dt_local - timedelta(days=1)).strftime("%Y-%m-%d")
+            with sqlite3.connect(DB_FILE) as conn_prev:
+                c_prev = conn_prev.cursor()
+                c_prev.execute("""
+                    SELECT start_time, end_time, price
+                    FROM daily_pricing_rules
+                    WHERE date = ?
+                      AND ? >= start_time
+                      AND ? < end_time
+                    ORDER BY start_time ASC LIMIT 1
+                """, (prev_date, time_str, time_str))
+                rule_prev = c_prev.fetchone()
+            if rule_prev:
+                start_t, end_t, price = rule_prev
+            else:
+                # 最終 fallback（完全查不到）
+                start_t, end_t = "00:00", "23:59"
+                price = 6.0
+
+
+        key = (date_key, start_t, end_t, price)
 
         if key not in segments_map:
-            # 處理 end=24:00 / 跨日 end 的日期
-            # end=24:00 → 以隔日 00:00 表示（ISO 不能用 24:00:00）
-            start_min = _hm_to_min(start_t)
-            end_min = _hm_to_min(end_t)
-
-            start_date = datetime.fromisoformat(rule_date).date()
-            # 預設 end_date 跟 start_date 一樣
-            end_date = start_date
-
-            # 若 start > end 表示跨日（例如 22:00~06:00），end_date 要 +1
-            # 若 end=24:00 也視為到隔日 00:00（end_date +1）
-            if (start_min != end_min) and (start_min > end_min or end_min == 1440):
-                end_date = start_date + timedelta(days=1)
-
-            seg_start = f"{rule_date}T{start_t}:00"
-
-            # end=24:00 → 用隔日 00:00
-            end_hm_for_iso = "00:00" if end_t == "24:00" else end_t
-            seg_end_date_str = end_date.strftime("%Y-%m-%d")
-            seg_end = f"{seg_end_date_str}T{end_hm_for_iso}:00"
-
             segments_map[key] = {
-                "start": seg_start,
-                "end": seg_end,
+                "start": f"{date_key}T{start_t}:00",
+                "end": f"{date_key}T{end_t}:00",
                 "kwh": 0.0,
-                "price": float(price),
+                "price": price,
                 "subtotal": 0.0
             }
 
         seg = segments_map[key]
         seg["kwh"] += diff_kwh
-        seg["subtotal"] += diff_kwh * float(price)
-        total += diff_kwh * float(price)
+        seg["subtotal"] += diff_kwh * price
+        total += diff_kwh * price
 
-    # 按 start 排序
+    # 轉格式：按時間排序
     segments = sorted(segments_map.values(), key=lambda s: s["start"])
 
-    # 延後 round，避免誤差（subtotal 以 round 後 kwh * price 重算）
+    # 🔧 延後 round，避免四捨五入誤差
+    raw_total = sum(seg["subtotal"] for seg in segments)
     for seg in segments:
         seg["kwh"] = round(seg["kwh"], 6)
-        seg["subtotal"] = round(seg["kwh"] * seg["price"], 2)
+        seg["subtotal"] = round(seg["kwh"] * seg["price"], 2)  # 精確以最新 kWh×單價計算
 
     return {
         "total": float(round(sum(seg["subtotal"] for seg in segments), 2)),
@@ -2415,8 +2496,6 @@ class ChargePoint(OcppChargePoint):
             batch_current = None
             batch_power_kw = None
             last_ts = None
-            last_energy_ts = None
-            energy_seen_in_batch = False
 
             insert_count = 0
 
@@ -2483,38 +2562,39 @@ class ChargePoint(OcppChargePoint):
 
                         # === 能量 / 金額（原邏輯保留）===
                         if "Energy.Active.Import" in meas:
-                            energy_seen_in_batch = True
-                            last_energy_ts = ts or last_energy_ts
+                            try:
+                                res = _calculate_multi_period_cost_detailed(transaction_id)
+                                used_kwh = (
+                                    sum(s["kwh"] for s in res["segments"])
+                                    if res["segments"] else 0
+                                )
+                                total = res["total"]
+                                price = (
+                                    res["segments"][-1]["price"]
+                                    if res["segments"]
+                                    else _price_for_timestamp(ts)
+                                )
+
+                                _upsert_live(
+                                    cp_id,
+                                    energy=round(used_kwh, 6),
+                                    estimated_energy=round(used_kwh, 6),
+                                    estimated_amount=round(total, 2),
+                                    price_per_kwh=price,
+                                    timestamp=ts,
+                                )
+
+                                await _auto_stop_if_balance_insufficient(
+                                    cp_id=cp_id,
+                                    transaction_id=int(transaction_id),
+                                    estimated_amount=float(total),
+                                )
+                            except Exception as e:
+                                logging.warning(
+                                    f"⚠️ 能量/金額即時計算失敗：{e}"
+                                )
 
                 _c.commit()
-
-            # ✅ commit 後再做能量/金額計算（避免另一個連線看不到未 commit 資料，造成 2段/3段跳動）
-            if energy_seen_in_batch and transaction_id:
-                try:
-                    res = _calculate_multi_period_cost_detailed(int(transaction_id))
-                    used_kwh = sum(s["kwh"] for s in res["segments"]) if res["segments"] else 0.0
-                    total = res["total"]
-                    price = res["segments"][-1]["price"] if res["segments"] else _price_for_timestamp(last_energy_ts or last_ts)
-
-                    _upsert_live(
-                        cp_id,
-                        energy=round(used_kwh, 6),
-                        estimated_energy=round(used_kwh, 6),
-                        estimated_amount=round(total, 2),
-                        price_per_kwh=price,
-                        timestamp=(last_energy_ts or last_ts),
-                    )
-
-                    await _auto_stop_if_balance_insufficient(
-                        cp_id=cp_id,
-                        transaction_id=int(transaction_id),
-                        estimated_amount=float(total),
-                    )
-                except Exception as e:
-                    logging.warning(f"⚠️ 能量/金額計算失敗（commit 後）：{e}")
-
-
-
 
             # === 推算功率（若樁沒送 Power）===
             if batch_power_kw is None:
@@ -4859,126 +4939,65 @@ async def get_daily_by_chargepoint_range(
 
 
 
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
+from datetime import datetime, timedelta, timezone
+from fastapi import Query
 
-# ✅ 統一使用 ZoneInfo（你前面已經有 TZ_TAIPEI = ZoneInfo("Asia/Taipei") 也可以保留那份，只要別再重複定義）
-TZ_TAIPEI = ZoneInfo("Asia/Taipei")
+TZ_TAIPEI = timezone(timedelta(hours=8))
 
-def _hm_to_min(hm: str) -> int:
-    """HH:MM → minutes。支援 24:00 = 1440。"""
-    if hm == "24:00":
-        return 1440
-    h, m = hm.split(":")
-    return int(h) * 60 + int(m)
-
-def _min_to_hm(m: int) -> str:
-    """minutes → HH:MM（1440 會回 24:00）。"""
-    if m == 1440:
-        return "24:00"
-    h = m // 60
-    mm = m % 60
-    return f"{h:02d}:{mm:02d}"
-
-def _time_in_range(now_min: int, start_min: int, end_min: int) -> bool:
-    """
-    半開區間：start <= t < end
-    - start == end 視為全天
-    - start > end 視為跨日（例如 22:00~06:00）
-    """
-    if start_min == end_min:
+def _price_time_in_range(now_hm: str, start: str, end: str) -> bool:
+    """HH:MM；處理跨日，且 start==end 視為全天。"""
+    if start == end:
         return True
-    if start_min < end_min:
-        return start_min <= now_min < end_min
-    return now_min >= start_min or now_min < end_min
-
-def _load_rules_for_date(date_str: str):
-    """讀取某天的 daily_pricing_rules，回傳 list[dict]"""
-    with sqlite3.connect(DB_FILE) as conn:
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT start_time, end_time, price, COALESCE(label,'')
-            FROM daily_pricing_rules
-            WHERE date = ?
-            ORDER BY start_time ASC
-        """, (date_str,))
-        rows = cur.fetchall()
-
-    rules = []
-    for s, e, p, lbl in rows:
-        rules.append({
-            "date": date_str,
-            "start": s,
-            "end": e,
-            "start_min": _hm_to_min(s),
-            "end_min": _hm_to_min(e),
-            "price": float(p),
-            "label": lbl or "",
-        })
-    return rules
-
-def _match_rule_for_dt(dt_local: datetime):
-    """
-    回傳 (rule_date, start_hm, end_hm, price, label)
-    規則比對同時考慮：
-    - 當天規則
-    - 前一天規則（處理「前一天跨日規則」延伸到凌晨）
-    多條命中時：取最高價（避免重疊時段不穩）
-    """
-    date_str = dt_local.strftime("%Y-%m-%d")
-    prev_date = (dt_local - timedelta(days=1)).strftime("%Y-%m-%d")
-    now_min = dt_local.hour * 60 + dt_local.minute
-
-    candidates = []
-    for d in (date_str, prev_date):
-        for r in _load_rules_for_date(d):
-            if _time_in_range(now_min, r["start_min"], r["end_min"]):
-                candidates.append(r)
-
-    if candidates:
-        r = max(candidates, key=lambda x: x["price"])  # 命中多段取最高價
-        return (r["date"], r["start"], r["end"], r["price"], r["label"])
-
-    # fallback
-    return (date_str, "00:00", "24:00", 6.0, "")
-
-def _price_for_timestamp(ts_iso: str) -> float:
-    """✅ 全專案唯一電價查價入口（統一跨日/24:00/重疊規則處理）。"""
-    try:
-        dt = datetime.fromisoformat(ts_iso.replace("Z", "+00:00"))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        dt_local = dt.astimezone(TZ_TAIPEI)
-    except Exception:
-        dt_local = datetime.now(TZ_TAIPEI)
-
-    _, _, _, price, _ = _match_rule_for_dt(dt_local)
-    return float(price)
-
+    if start < end:
+        return start <= now_hm < end
+    return now_hm >= start or now_hm < end  # 跨日，如 22:00~06:00
 
 
 @app.get("/api/pricing/price-now")
 def price_now(date: str | None = Query(None), time: str | None = Query(None)):
-    # 沒帶參數 → 用現在時間
     now = datetime.now(TZ_TAIPEI)
-
     d = date or now.strftime("%Y-%m-%d")
     t = time or now.strftime("%H:%M")
 
-    # 組成台北時間 datetime
-    dt_local = datetime.fromisoformat(f"{d}T{t}:00").replace(tzinfo=TZ_TAIPEI)
+    c = conn.cursor()
+    c.execute("""
+        SELECT start_time, end_time, price, COALESCE(label,'')
+        FROM daily_pricing_rules
+        WHERE date = ?
+        ORDER BY start_time
+    """, (d,))
+    rows = c.fetchall()
 
-    rule_date, start_t, end_t, price, label = _match_rule_for_dt(dt_local)
+    hits = [(s, e, float(p), lbl) for (s, e, p, lbl) in rows if _price_time_in_range(t, s, e)]
+    if hits:
+        s, e, price, lbl = max(hits, key=lambda r: r[2])  # 時段重疊取最高價
+        return {"date": d, "time": t, "price": price, "label": lbl}
 
-    return {
-        "date": d,
-        "time": t,
-        "rule_date": rule_date,
-        "start_time": start_t,
-        "end_time": end_t,
-        "price": float(price),
-        "label": label,
-    }
+    # 找不到對應時段 → 回預設（你也可改成 0 或 404）
+    return {"date": d, "time": t, "price": 6.0, "fallback": True}
+
+
+
+# === Helper: 依時間算電價（找不到就回預設 6.0 元/kWh） ===
+def _price_for_timestamp(ts_iso: str) -> float:
+    try:
+        dt = datetime.fromisoformat(ts_iso.replace("Z", "+00:00")).astimezone(TZ_TAIPEI)
+    except Exception:
+        dt = datetime.now(TZ_TAIPEI)
+    d = dt.strftime("%Y-%m-%d")
+    t = dt.strftime("%H:%M")
+
+    c = conn.cursor()
+    c.execute("""
+        SELECT start_time, end_time, price
+        FROM daily_pricing_rules
+        WHERE date = ?
+        ORDER BY start_time
+    """, (d,))
+    rows = c.fetchall()
+
+    hits = [float(p) for (s, e, p) in rows if _price_time_in_range(t, s, e)]
+    return max(hits) if hits else 6.0
 
 
 
