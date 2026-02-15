@@ -3550,22 +3550,19 @@ def get_live_status(charge_point_id: str):
         }
 
 
-    ts = live.get("timestamp")
-    try:
-        ts_dt = datetime.fromisoformat(ts.replace("Z", "+00:00")) if ts else None
-    except Exception:
-        ts_dt = None
-
-    if ts_dt:
-        age_sec = (datetime.now(timezone.utc) - ts_dt).total_seconds()
+    # ✅ 用後端收到資料的時間做 TTL 判斷（最穩，避免樁端 timestamp 不準造成立刻 stale）
+    updated_at = live.get("updated_at")
+    if isinstance(updated_at, (int, float)):
+        age_sec = time.time() - updated_at
         if age_sec > LIVE_TTL:
+            ts = live.get("timestamp")
             stale = {
                 "timestamp": ts,
                 "power": 0,
                 "voltage": 0,
                 "current": 0,
 
-                # ✅ 關鍵：保留停電當下的金額與電量
+                # ✅ 保留最後一次的金額與電量
                 "energy": live.get("energy", 0),
                 "estimated_energy": live.get("estimated_energy", 0),
                 "estimated_amount": live.get("estimated_amount", 0),
@@ -3576,6 +3573,7 @@ def get_live_status(charge_point_id: str):
             }
             live_status_cache[cp_id] = stale
             return stale
+
 
 
 
@@ -3877,18 +3875,45 @@ def get_card_balance(id_tag: str):
 
 @app.get("/api/charge-points/{charge_point_id}/status")
 def get_charge_point_status(charge_point_id: str):
-    cp = _normalize_cp_id(charge_point_id)          # ← 先正規化 key
-    status = charging_point_status.get(cp)
+    cp = _normalize_cp_id(charge_point_id)
 
-    # 沒有快取 → 統一回英文 Unknown
+    # ✅ 1) 優先用 DB 判斷：只要有未結束交易，就視為 Charging（避免被 WS 斷線強制 Available 影響）
+    try:
+        with sqlite3.connect(DB_FILE, check_same_thread=False) as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT transaction_id, connector_id, start_timestamp
+                FROM transactions
+                WHERE charge_point_id = ?
+                  AND stop_timestamp IS NULL
+                ORDER BY start_timestamp DESC
+                LIMIT 1
+            """, (cp,))
+            row = cur.fetchone()
+
+        if row:
+            tx_id, connector_id, start_ts = row
+            return {
+                "connector_id": int(connector_id or 0),
+                "status": "Charging",
+                "timestamp": start_ts,
+                "error_code": "NoError",
+                "derived": True,
+                "transaction_id": int(tx_id),
+            }
+    except Exception as e:
+        logging.exception(f"❌ status derive from DB failed | cp_id={cp} | err={e}")
+
+    # ✅ 2) DB 沒有進行中交易才回快取
+    status = charging_point_status.get(cp)
     if not status:
         return {"status": "Unknown"}
 
-    # 快取裡萬一混入中文，也強制轉英文
     if status.get("status") == "未知":
         status = {**status, "status": "Unknown"}
 
     return status
+
 
 
 
