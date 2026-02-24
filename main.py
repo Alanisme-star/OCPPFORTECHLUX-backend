@@ -4760,8 +4760,13 @@ async def add_charge_point(data: dict = Body(...)):
     name = data.get("name", "")
     status = (data.get("status") or "enabled").lower()
 
-    # ★ 新增：預設電流上限
-    max_current_a = data.get("maxCurrentA") or data.get("max_current_a") or 16
+    # ★ 修正：前端新增送的是 maxCurrent，仍保留相容 maxCurrentA / max_current_a
+    max_current_a = (
+        data.get("maxCurrent")
+        or data.get("maxCurrentA")
+        or data.get("max_current_a")
+        or 16
+    )
     try:
         max_current_a = float(max_current_a)
     except Exception:
