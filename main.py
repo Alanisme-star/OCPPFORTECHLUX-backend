@@ -5569,6 +5569,9 @@ def debug_connected_cp():
 def api_get_community_settings():
     cfg = get_community_settings()
 
+    # ✅ 新增：目前正在充電台數
+    active_count = get_active_charging_count()
+
     total_current_a = 0.0
     max_cars_by_min = 0
 
@@ -5576,8 +5579,20 @@ def api_get_community_settings():
         total_current_a = (cfg["contract_kw"] * 1000) / cfg["voltage_v"]
         max_cars_by_min = int(total_current_a // cfg["min_current_a"])
 
+    # ✅ 新增：依目前台數計算允許電流
+    allowed_a = None
+    blocked_reason = ""
+
+    if cfg["enabled"] and cfg["contract_kw"] > 0:
+        allowed_a = calculate_allowed_current(active_charging_count=active_count)
+        if active_count > 0 and allowed_a is None:
+            blocked_reason = "avg_current_below_min"
+
     return {
         **cfg,
+        "active_charging_count": int(active_count),          # ✅ 前端要的欄位
+        "allowed_current_a": allowed_a,                      # ✅ 前端會顯示
+        "blocked_reason": blocked_reason,                    # ✅ 前端會顯示
         "total_current_a": round(total_current_a, 2),
         "max_cars_by_min": max_cars_by_min,
     }
