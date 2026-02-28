@@ -184,6 +184,13 @@ async def send_current_limit_profile(
 
         ok = status_str.lower() == "accepted"
 
+        try:
+            if not ok:
+                setattr(cp, "supports_smart_charging", False)
+        except Exception:
+            pass
+
+
         now_iso = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
         st = current_limit_state.setdefault(cp_id, {})
         st.update(
@@ -1784,7 +1791,7 @@ class ChargePoint(OcppChargePoint):
                 )
             else:
                 # 🟡 正式環境：預設一律不支援（安全）
-                self.supports_smart_charging = False
+                self.supports_smart_charging = True
 
                 logging.info(
                     f"[CAPABILITY][DEFAULT] CP={self.id} | "
@@ -5624,6 +5631,8 @@ def api_update_community_settings(payload: dict = Body(...)):
         )
         conn.commit()
 
+
+    await rebalance_all_charging_points(reason="community_settings_updated")
     return {"ok": True}
 
 
