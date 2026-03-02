@@ -2010,8 +2010,7 @@ class ChargePoint(OcppChargePoint):
             # [4.5] 🟦 Smart Charging：StartTransaction 後全場 Rebalance
             # ==================================================
             try:
-                import asyncio
-                asyncio.create_task(rebalance_all_charging_points(reason="start_transaction"))
+                await rebalance_all_charging_points(reason="start_transaction")
             except Exception as e:
                 logging.exception(
                     f"[SMART][START_TX][REBALANCE_ERR] cp_id={self.id} | err={e}"
