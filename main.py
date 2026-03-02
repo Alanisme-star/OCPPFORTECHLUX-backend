@@ -5889,19 +5889,19 @@ def get_current_price_breakdown(charge_point_id: str):
 
 from fastapi import HTTPException
 from datetime import datetime
+import sqlite3
 
 def _row_to_dict(row):
-    # sqlite3 row -> dict
     return {k: row[k] for k in row.keys()}
 
 @app.get("/api/debug/active-transactions")
 def debug_active_transactions():
     """
     列出 DB 認定的 active 交易（stop_timestamp is NULL）
-    用來確認後端到底認定幾支樁正在充電、分配到底用哪幾支。
     """
+    conn = None
     try:
-        conn = get_db_connection()
+        conn = get_connection()
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
 
@@ -5921,36 +5921,43 @@ def debug_active_transactions():
         """).fetchall()
 
         active = [_row_to_dict(r) for r in rows]
-        return {
-            "active_count": len(active),
-            "active_transactions": active
-        }
+        return {"active_count": len(active), "active_transactions": active}
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"debug_active_transactions error: {e}")
+
     finally:
-        try:
+        if conn:
             conn.close()
-        except Exception:
-            pass
 
 
 @app.get("/api/debug/smart-charging-snapshot")
 def debug_smart_charging_snapshot():
     """
-    直接把 Smart Charging 的關鍵判斷吐出來：
-    - active_count（後端用 DB 算的）
-    - allowed_current_a（後端理論值）
-    - 本次會對哪些 cp 下發（active cp 清單）
+    Smart Charging 快照：
+    - active_count（DB active 交易筆數）
+    - allowed_current_a（用契約kW/220V/台數）
+    - active cp 清單（後端實際會拿去分配的）
     """
+    conn = None
     try:
-        contract_kw = 20.0  # 如果你有設定檔/DB 來源，改成讀設定即可
-        assumed_voltage_v = 220.0  # 你目前 UI 試算是用 220V，debug 也用同一個
+        assumed_voltage_v = 220.0  # 你前端試算用 220V，debug 也用同一個
 
-        conn = get_db_connection()
+        conn = get_connection()
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
 
-        # 1) active 交易清單
+        # 讀取社區設定（避免寫死 20kW）
+        settings = cur.execute("""
+            SELECT contract_capacity_kw
+            FROM community_settings
+            ORDER BY id DESC
+            LIMIT 1
+        """).fetchone()
+
+        contract_kw = float(settings["contract_capacity_kw"]) if settings and settings["contract_capacity_kw"] is not None else 20.0
+
+        # active 交易清單
         rows = cur.execute("""
             SELECT
                 charge_point_id,
@@ -5966,32 +5973,30 @@ def debug_smart_charging_snapshot():
         active_list = [_row_to_dict(r) for r in rows]
         active_count = len(active_list)
 
-        # 2) 後端理論分配電流（跟你前端顯示邏輯一致）
-        #    I = P / (V * N)
         if active_count <= 0:
             allowed_current_a = None
         else:
             allowed_current_a = (contract_kw * 1000.0) / (assumed_voltage_v * active_count)
 
-        # 3) 回傳快照
+        active_cps = sorted(list({x["charge_point_id"] for x in active_list}))
+
         return {
             "ts": datetime.utcnow().isoformat() + "Z",
             "contract_kw": contract_kw,
             "assumed_voltage_v": assumed_voltage_v,
             "active_count": active_count,
             "allowed_current_a": allowed_current_a,
-            "active_charge_points": sorted(list({x["charge_point_id"] for x in active_list})),
+            "active_charge_points": active_cps,
             "active_transactions": active_list,
-            "note": "若你看到 30.3A，通常代表 active_count=3（20kW/220V/3≈30.3A）"
+            "note": "若 allowed_current_a 約 30.3A，通常代表 active_count=3（20kW/220V/3≈30.3A）"
         }
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"debug_smart_charging_snapshot error: {e}")
+
     finally:
-        try:
+        if conn:
             conn.close()
-        except Exception:
-            pass
 
 
 
