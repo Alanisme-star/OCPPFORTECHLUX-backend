@@ -5564,6 +5564,56 @@ async def debug_ids():
 def debug_connected_cp():
     return list(connected_charge_points.keys())
 
+from fastapi import Query
+from datetime import datetime, timezone
+
+@app.get("/api/debug/current-limit-state")
+def debug_current_limit_state(cp_id: str | None = Query(default=None)):
+    """
+    Debug 用 API：回傳後端「實際限流下發狀態」current_limit_state
+    - 若帶 cp_id 參數：只回傳單台
+    - 不帶 cp_id：回傳全部
+    """
+    server_time = datetime.now(timezone.utc).isoformat()
+
+    def _sanitize_state_item(_cp_id: str, st: dict):
+        # st 來自 current_limit_state[cp_id]，避免缺 key 造成前端噴錯
+        return {
+            "cp_id": _cp_id,
+            "requested_limit_a": st.get("requested_limit_a"),
+            "requested_at": st.get("requested_at"),
+            "applied": st.get("applied", False),
+            "last_try_at": st.get("last_try_at"),
+            "last_ok_at": st.get("last_ok_at"),
+            "last_err_at": st.get("last_err_at"),
+            "last_error": st.get("last_error"),
+            "last_tx_id": st.get("last_tx_id"),
+            "last_connector_id": st.get("last_connector_id"),
+        }
+
+    # 單台查詢
+    if cp_id:
+        cp_norm = _normalize_cp_id(cp_id)
+        st = current_limit_state.get(cp_norm)
+        if not st:
+            return {"server_time": server_time, "items": []}
+        return {"server_time": server_time, "items": [_sanitize_state_item(cp_norm, st)]}
+
+    # 全部
+    items = []
+    for _cp_id, st in current_limit_state.items():
+        items.append(_sanitize_state_item(_cp_id, st))
+
+    # 排序：有 requested_at 的排前面、再依時間新到舊
+    def _sort_key(x):
+        ra = x.get("requested_at") or ""
+        return ra
+    items.sort(key=_sort_key, reverse=True)
+
+    return {"server_time": server_time, "items": items}
+
+
+
 
 @app.get("/api/community-settings")
 def api_get_community_settings():
