@@ -127,19 +127,37 @@ async def send_current_limit_profile(
 
     # =====================================================
     # [1.5] 🧯 SAFETY GUARD：下發值不得高於「契約試算理論值」
+    # 🔥 修正版：使用同一批交易 rows 計算 active_count
     # =====================================================
     raw_limit_a = limit_a
+
     try:
         limit_a = float(limit_a)
     except Exception:
         limit_a = float(DEVICE_HARD_LIMIT)
 
-    # 永遠先套硬體上限保護
+    # 永遠先套硬體上限
     limit_a = min(limit_a, float(DEVICE_HARD_LIMIT))
 
     try:
-        active_count_now = get_active_charging_count()
-        theory_a = calculate_allowed_current(active_charging_count=active_count_now)
+        # 🔥 重新抓目前所有 active 交易（避免 get_active_charging_count 時序問題）
+        with sqlite3.connect(DB_FILE, check_same_thread=False, timeout=15) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT transaction_id
+                FROM transactions
+                WHERE stop_timestamp IS NULL
+                  AND start_timestamp IS NOT NULL
+            """
+            )
+            rows = cur.fetchall()
+
+        active_count_now = len(rows)
+
+        theory_a = calculate_allowed_current(
+            active_charging_count=active_count_now
+        )
 
         if theory_a is not None:
             theory_a = float(theory_a)
@@ -148,9 +166,10 @@ async def send_current_limit_profile(
                 logging.warning(
                     f"[LIMIT][CLAMP] cp_id={cp_id} | "
                     f"raw={raw_limit_a}A -> clamp={theory_a}A | "
-                    f"reason=greater_than_theory | active_count={active_count_now}"
+                    f"active_count={active_count_now}"
                 )
                 limit_a = theory_a
+
     except Exception as e:
         logging.warning(
             f"[LIMIT][CLAMP][SKIP] cp_id={cp_id} | raw={raw_limit_a}A | err={e}"
