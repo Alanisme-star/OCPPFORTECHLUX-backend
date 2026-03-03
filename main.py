@@ -126,6 +126,39 @@ async def send_current_limit_profile(
     )
 
     # =====================================================
+    # [1.5] 🧯 SAFETY GUARD：下發值不得高於「契約試算理論值」
+    # =====================================================
+    raw_limit_a = limit_a
+    try:
+        limit_a = float(limit_a)
+    except Exception:
+        limit_a = float(DEVICE_HARD_LIMIT)
+
+    # 永遠先套硬體上限保護
+    limit_a = min(limit_a, float(DEVICE_HARD_LIMIT))
+
+    try:
+        active_count_now = get_active_charging_count()
+        theory_a = calculate_allowed_current(active_charging_count=active_count_now)
+
+        if theory_a is not None:
+            theory_a = float(theory_a)
+
+            if limit_a > theory_a:
+                logging.warning(
+                    f"[LIMIT][CLAMP] cp_id={cp_id} | "
+                    f"raw={raw_limit_a}A -> clamp={theory_a}A | "
+                    f"reason=greater_than_theory | active_count={active_count_now}"
+                )
+                limit_a = theory_a
+    except Exception as e:
+        logging.warning(
+            f"[LIMIT][CLAMP][SKIP] cp_id={cp_id} | raw={raw_limit_a}A | err={e}"
+        )
+
+
+
+    # =====================================================
     # [2] 組 payload（ocpp 0.26.0 合法格式）
     # =====================================================
     payload = call.SetChargingProfilePayload(
@@ -878,71 +911,112 @@ def calculate_allowed_current(*, active_charging_count: int):
 
     return round(safe_limit, 2)
 
+
 def get_active_charging_count():
     """
     取得目前「正在充電中的車輛數」
 
-    修正重點：
-    - 原本只用 DB(transactions) 計數，可能少算（導致下發電流偏大）
-    - 現在改為：max(DB計數, Live計數)
-      Live 計數用 live_status_cache 推斷：TTL 內有更新且 current/power > 0
+    判定依據：
+    - stop_timestamp IS NULL
+    - start_timestamp IS NOT NULL
     """
-    import time
 
-    # ===== 1) DB 計數（原本邏輯）=====
-    db_count = 0
+    with sqlite3.connect(DB_FILE, check_same_thread=False, timeout=15) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT COUNT(*)
+            FROM transactions
+            WHERE stop_timestamp IS NULL
+              AND start_timestamp IS NOT NULL
+        """
+        )
+        row = cur.fetchone()
+
     try:
+        return int(row[0] or 0)
+    except Exception:
+        return 0
+
+
+async def rebalance_all_charging_points(reason: str):
+    """
+    Smart Charging 核心調度器（Step 2-4）
+    """
+
+    try:
+        active_count = get_active_charging_count()
+
+        allowed_a = calculate_allowed_current(active_charging_count=active_count)
+
+        logging.warning(
+            f"[SMART][REBALANCE] reason={reason} | "
+            f"active_count={active_count} | allowed_a={allowed_a}"
+        )
+
+        if allowed_a is None:
+            logging.error(
+                f"[SMART][REBALANCE][SKIP] " f"allowed_a=None | reason={reason}"
+            )
+            return
+
+        try:
+            allowed_a = float(allowed_a)
+        except Exception:
+            logging.error(f"[SMART][REBALANCE][SKIP] " f"allowed_a invalid={allowed_a}")
+            return
+
         with sqlite3.connect(DB_FILE, check_same_thread=False, timeout=15) as conn:
             cur = conn.cursor()
             cur.execute(
                 """
-                SELECT COUNT(*)
+                SELECT charge_point_id, connector_id, transaction_id
                 FROM transactions
                 WHERE stop_timestamp IS NULL
                   AND start_timestamp IS NOT NULL
-                """
+            """
             )
-            row = cur.fetchone()
-        db_count = int(row[0] or 0)
-    except Exception:
-        db_count = 0
+            rows = cur.fetchall()
 
-    # ===== 2) Live 計數（新邏輯）=====
-    now = time.time()
-    ttl = 15  # 與 LIVE_TTL 一致即可；這裡用常數避免定義順序問題
-    live_count = 0
-
-    try:
-        for _cp_id, live in (live_status_cache or {}).items():
-            updated_at = live.get("updated_at") or 0
-            if (now - float(updated_at)) > ttl:
+        for cp_id, connector_id, tx_id in rows:
+            cp = connected_charge_points.get(cp_id)
+            if not cp:
+                logging.warning(f"[SMART][REBALANCE][SKIP] cp_id={cp_id} not connected")
                 continue
 
-            cur_a = live.get("current") or 0
-            p_kw = live.get("power") or 0
+            if not getattr(cp, "supports_smart_charging", False):
+                logging.warning(
+                    f"[SMART][REBALANCE][SKIP] cp_id={cp_id} not support smart charging"
+                )
+                continue
 
-            is_charging = False
             try:
-                if isinstance(cur_a, (int, float)) and float(cur_a) > 1.0:
-                    is_charging = True
-                if isinstance(p_kw, (int, float)) and float(p_kw) > 0.1:
-                    is_charging = True
+                tx_id = int(tx_id)
             except Exception:
-                is_charging = False
+                logging.warning(f"[SMART][REBALANCE][SKIP] invalid tx_id={tx_id}")
+                continue
 
-            if is_charging:
-                live_count += 1
-    except Exception:
-        live_count = 0
+            try:
+                await send_current_limit_profile(
+                    cp=cp,
+                    connector_id=int(connector_id or 1),
+                    limit_a=allowed_a,
+                    tx_id=tx_id,
+                )
 
-    # ===== 3) 取最大值（避免少算導致下發過大）=====
-    chosen = max(db_count, live_count)
+                logging.warning(
+                    f"[SMART][REBALANCE][APPLY] "
+                    f"cp_id={cp_id} | tx_id={tx_id} | limit={allowed_a}A"
+                )
 
-    logging.warning(
-        f"[SMART][ACTIVE_COUNT] db={db_count} live={live_count} chosen={chosen}"
-    )
+            except Exception as e:
+                logging.exception(
+                    f"[SMART][REBALANCE][ERR] "
+                    f"cp_id={cp_id} | tx_id={tx_id} | err={e}"
+                )
 
-    return chosen
+    except Exception as e:
+        logging.exception(f"[SMART][REBALANCE][FATAL] err={e}")
 
 
 def ensure_charge_points_table():
