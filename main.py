@@ -986,22 +986,24 @@ def get_active_charging_count():
 
 async def rebalance_all_charging_points(reason: str):
     """
-    🔥 終極穩定版
-    - 不依賴 DB rows
-    - 對所有 connected CP 強制覆寫限流
+    ✅ 修正版（可直接覆蓋）
+    - 先用 DB 找出所有 active 交易，建立 cp_id -> (tx_id, connector_id) 對照
+    - 對所有 connected CP 送 SetChargingProfile
+      - 有 tx_id：送 TxProfile
+      - 沒 tx_id：退回 ChargePointMaxProfile（仍可限流）
     """
 
     try:
-
         with sqlite3.connect(DB_FILE, check_same_thread=False, timeout=15) as conn:
             cur = conn.cursor()
             cur.execute(
                 """
-                SELECT transaction_id
+                SELECT transaction_id, charge_point_id, connector_id
                 FROM transactions
                 WHERE stop_timestamp IS NULL
                   AND start_timestamp IS NOT NULL
-            """
+                ORDER BY transaction_id DESC
+                """
             )
             rows = cur.fetchall()
 
@@ -1021,23 +1023,31 @@ async def rebalance_all_charging_points(reason: str):
 
         allowed_a = float(allowed_a)
 
+        # 建立 cp_id -> (tx_id, connector_id)（取最新一筆交易）
+        tx_map = {}
+        for tx_id, cp_id, connector_id in rows:
+            cp_id = _normalize_cp_id(cp_id)
+            if cp_id not in tx_map:
+                tx_map[cp_id] = (int(tx_id), int(connector_id or 1))
 
         for cp_id, cp in connected_charge_points.items():
 
             if not getattr(cp, "supports_smart_charging", False):
                 continue
 
+            tx_id, connector_id = tx_map.get(cp_id, (None, 1))
+
             try:
                 await send_current_limit_profile(
                     cp=cp,
-                    connector_id=connector_id,
+                    connector_id=int(connector_id or 1),
                     limit_a=allowed_a,
                     tx_id=tx_id,
                 )
 
                 logging.warning(
                     f"[SMART][FORCE_APPLY] "
-                    f"cp_id={cp_id} | limit={allowed_a}A"
+                    f"cp_id={cp_id} | connector_id={connector_id} | tx_id={tx_id} | limit={allowed_a}A"
                 )
 
             except Exception as e:
@@ -1049,7 +1059,6 @@ async def rebalance_all_charging_points(reason: str):
         logging.exception(
             f"[SMART][REBALANCE][FATAL] err={e}"
         )
-
 
 def ensure_charge_points_table():
     """
