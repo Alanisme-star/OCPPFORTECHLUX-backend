@@ -164,9 +164,9 @@ async def send_current_limit_profile(
     payload = call.SetChargingProfilePayload(
         connector_id=int(connector_id),
         cs_charging_profiles={
-            "charging_profile_id": int(tx_id % 100000 if tx_id else 1),
-            "stack_level": 1,
-            "charging_profile_purpose": "TxProfile",
+            "charging_profile_id": 999,
+            "stack_level": 10,
+            "charging_profile_purpose": "ChargePointMaxProfile",
             "charging_profile_kind": "Absolute",
             "charging_schedule": {
                 "charging_rate_unit": "A",
@@ -178,7 +178,6 @@ async def send_current_limit_profile(
                     }
                 ],
             },
-            **({"transaction_id": int(tx_id)} if tx_id else {}),
         },
     )
 
