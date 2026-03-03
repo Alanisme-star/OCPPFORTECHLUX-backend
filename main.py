@@ -878,112 +878,71 @@ def calculate_allowed_current(*, active_charging_count: int):
 
     return round(safe_limit, 2)
 
-
 def get_active_charging_count():
     """
     取得目前「正在充電中的車輛數」
 
-    判定依據：
-    - stop_timestamp IS NULL
-    - start_timestamp IS NOT NULL
+    修正重點：
+    - 原本只用 DB(transactions) 計數，可能少算（導致下發電流偏大）
+    - 現在改為：max(DB計數, Live計數)
+      Live 計數用 live_status_cache 推斷：TTL 內有更新且 current/power > 0
     """
+    import time
 
-    with sqlite3.connect(DB_FILE, check_same_thread=False, timeout=15) as conn:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT COUNT(*)
-            FROM transactions
-            WHERE stop_timestamp IS NULL
-              AND start_timestamp IS NOT NULL
-        """
-        )
-        row = cur.fetchone()
-
+    # ===== 1) DB 計數（原本邏輯）=====
+    db_count = 0
     try:
-        return int(row[0] or 0)
-    except Exception:
-        return 0
-
-
-async def rebalance_all_charging_points(reason: str):
-    """
-    Smart Charging 核心調度器（Step 2-4）
-    """
-
-    try:
-        active_count = get_active_charging_count()
-
-        allowed_a = calculate_allowed_current(active_charging_count=active_count)
-
-        logging.warning(
-            f"[SMART][REBALANCE] reason={reason} | "
-            f"active_count={active_count} | allowed_a={allowed_a}"
-        )
-
-        if allowed_a is None:
-            logging.error(
-                f"[SMART][REBALANCE][SKIP] " f"allowed_a=None | reason={reason}"
-            )
-            return
-
-        try:
-            allowed_a = float(allowed_a)
-        except Exception:
-            logging.error(f"[SMART][REBALANCE][SKIP] " f"allowed_a invalid={allowed_a}")
-            return
-
         with sqlite3.connect(DB_FILE, check_same_thread=False, timeout=15) as conn:
             cur = conn.cursor()
             cur.execute(
                 """
-                SELECT charge_point_id, connector_id, transaction_id
+                SELECT COUNT(*)
                 FROM transactions
                 WHERE stop_timestamp IS NULL
                   AND start_timestamp IS NOT NULL
-            """
+                """
             )
-            rows = cur.fetchall()
+            row = cur.fetchone()
+        db_count = int(row[0] or 0)
+    except Exception:
+        db_count = 0
 
-        for cp_id, connector_id, tx_id in rows:
-            cp = connected_charge_points.get(cp_id)
-            if not cp:
-                logging.warning(f"[SMART][REBALANCE][SKIP] cp_id={cp_id} not connected")
+    # ===== 2) Live 計數（新邏輯）=====
+    now = time.time()
+    ttl = 15  # 與 LIVE_TTL 一致即可；這裡用常數避免定義順序問題
+    live_count = 0
+
+    try:
+        for _cp_id, live in (live_status_cache or {}).items():
+            updated_at = live.get("updated_at") or 0
+            if (now - float(updated_at)) > ttl:
                 continue
 
-            if not getattr(cp, "supports_smart_charging", False):
-                logging.warning(
-                    f"[SMART][REBALANCE][SKIP] cp_id={cp_id} not support smart charging"
-                )
-                continue
+            cur_a = live.get("current") or 0
+            p_kw = live.get("power") or 0
 
+            is_charging = False
             try:
-                tx_id = int(tx_id)
+                if isinstance(cur_a, (int, float)) and float(cur_a) > 1.0:
+                    is_charging = True
+                if isinstance(p_kw, (int, float)) and float(p_kw) > 0.1:
+                    is_charging = True
             except Exception:
-                logging.warning(f"[SMART][REBALANCE][SKIP] invalid tx_id={tx_id}")
-                continue
+                is_charging = False
 
-            try:
-                await send_current_limit_profile(
-                    cp=cp,
-                    connector_id=int(connector_id or 1),
-                    limit_a=allowed_a,
-                    tx_id=tx_id,
-                )
+            if is_charging:
+                live_count += 1
+    except Exception:
+        live_count = 0
 
-                logging.warning(
-                    f"[SMART][REBALANCE][APPLY] "
-                    f"cp_id={cp_id} | tx_id={tx_id} | limit={allowed_a}A"
-                )
+    # ===== 3) 取最大值（避免少算導致下發過大）=====
+    chosen = max(db_count, live_count)
 
-            except Exception as e:
-                logging.exception(
-                    f"[SMART][REBALANCE][ERR] "
-                    f"cp_id={cp_id} | tx_id={tx_id} | err={e}"
-                )
+    logging.warning(
+        f"[SMART][ACTIVE_COUNT] db={db_count} live={live_count} chosen={chosen}"
+    )
 
-    except Exception as e:
-        logging.exception(f"[SMART][REBALANCE][FATAL] err={e}")
+    return chosen
 
 
 def ensure_charge_points_table():
@@ -5885,119 +5844,6 @@ def get_current_price_breakdown(charge_point_id: str):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-
-from fastapi import HTTPException
-from datetime import datetime
-import sqlite3
-
-def _row_to_dict(row):
-    return {k: row[k] for k in row.keys()}
-
-@app.get("/api/debug/active-transactions")
-def debug_active_transactions():
-    """
-    列出 DB 認定的 active 交易（stop_timestamp is NULL）
-    """
-    conn = None
-    try:
-        conn = get_connection()
-        conn.row_factory = sqlite3.Row
-        cur = conn.cursor()
-
-        rows = cur.execute("""
-            SELECT
-                transaction_id,
-                charge_point_id,
-                connector_id,
-                id_tag,
-                start_timestamp,
-                stop_timestamp,
-                start_meter
-            FROM transactions
-            WHERE stop_timestamp IS NULL
-              AND start_timestamp IS NOT NULL
-            ORDER BY start_timestamp DESC
-        """).fetchall()
-
-        active = [_row_to_dict(r) for r in rows]
-        return {"active_count": len(active), "active_transactions": active}
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"debug_active_transactions error: {e}")
-
-    finally:
-        if conn:
-            conn.close()
-
-
-@app.get("/api/debug/smart-charging-snapshot")
-def debug_smart_charging_snapshot():
-    """
-    Smart Charging 快照：
-    - active_count（DB active 交易筆數）
-    - allowed_current_a（用契約kW/220V/台數）
-    - active cp 清單（後端實際會拿去分配的）
-    """
-    conn = None
-    try:
-        assumed_voltage_v = 220.0  # 你前端試算用 220V，debug 也用同一個
-
-        conn = get_connection()
-        conn.row_factory = sqlite3.Row
-        cur = conn.cursor()
-
-        # 讀取社區設定（避免寫死 20kW）
-        settings = cur.execute("""
-            SELECT contract_capacity_kw
-            FROM community_settings
-            ORDER BY id DESC
-            LIMIT 1
-        """).fetchone()
-
-        contract_kw = float(settings["contract_capacity_kw"]) if settings and settings["contract_capacity_kw"] is not None else 20.0
-
-        # active 交易清單
-        rows = cur.execute("""
-            SELECT
-                charge_point_id,
-                connector_id,
-                transaction_id,
-                start_timestamp
-            FROM transactions
-            WHERE stop_timestamp IS NULL
-              AND start_timestamp IS NOT NULL
-            ORDER BY start_timestamp DESC
-        """).fetchall()
-
-        active_list = [_row_to_dict(r) for r in rows]
-        active_count = len(active_list)
-
-        if active_count <= 0:
-            allowed_current_a = None
-        else:
-            allowed_current_a = (contract_kw * 1000.0) / (assumed_voltage_v * active_count)
-
-        active_cps = sorted(list({x["charge_point_id"] for x in active_list}))
-
-        return {
-            "ts": datetime.utcnow().isoformat() + "Z",
-            "contract_kw": contract_kw,
-            "assumed_voltage_v": assumed_voltage_v,
-            "active_count": active_count,
-            "allowed_current_a": allowed_current_a,
-            "active_charge_points": active_cps,
-            "active_transactions": active_list,
-            "note": "若 allowed_current_a 約 30.3A，通常代表 active_count=3（20kW/220V/3≈30.3A）"
-        }
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"debug_smart_charging_snapshot error: {e}")
-
-    finally:
-        if conn:
-            conn.close()
-
 
 
 # ✅ 要讓除錯更直觀，在 /api/debug/price 增加目前伺服器時間顯示
