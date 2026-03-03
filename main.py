@@ -937,34 +937,18 @@ def get_active_charging_count():
     except Exception:
         return 0
 
-
 async def rebalance_all_charging_points(reason: str):
     """
     Smart Charging 核心調度器（Step 2-4）
+    🔥 修正版：
+    - active_count 與 rows 使用同一批資料
+    - 避免某一支樁用舊 active_count=3 算出 30.3A
     """
 
     try:
-        active_count = get_active_charging_count()
-
-        allowed_a = calculate_allowed_current(active_charging_count=active_count)
-
-        logging.warning(
-            f"[SMART][REBALANCE] reason={reason} | "
-            f"active_count={active_count} | allowed_a={allowed_a}"
-        )
-
-        if allowed_a is None:
-            logging.error(
-                f"[SMART][REBALANCE][SKIP] " f"allowed_a=None | reason={reason}"
-            )
-            return
-
-        try:
-            allowed_a = float(allowed_a)
-        except Exception:
-            logging.error(f"[SMART][REBALANCE][SKIP] " f"allowed_a invalid={allowed_a}")
-            return
-
+        # =====================================================
+        # 🔥 1️⃣ 先抓「目前所有正在充電」的交易（只查一次）
+        # =====================================================
         with sqlite3.connect(DB_FILE, check_same_thread=False, timeout=15) as conn:
             cur = conn.cursor()
             cur.execute(
@@ -977,10 +961,44 @@ async def rebalance_all_charging_points(reason: str):
             )
             rows = cur.fetchall()
 
+        active_count = len(rows)
+
+        # =====================================================
+        # 🔥 2️⃣ 用同一批 rows 計算 allowed_a
+        # =====================================================
+        allowed_a = calculate_allowed_current(
+            active_charging_count=active_count
+        )
+
+        logging.warning(
+            f"[SMART][REBALANCE] reason={reason} | "
+            f"active_count={active_count} | allowed_a={allowed_a}"
+        )
+
+        if allowed_a is None:
+            logging.error(
+                f"[SMART][REBALANCE][SKIP] allowed_a=None | reason={reason}"
+            )
+            return
+
+        try:
+            allowed_a = float(allowed_a)
+        except Exception:
+            logging.error(
+                f"[SMART][REBALANCE][SKIP] allowed_a invalid={allowed_a}"
+            )
+            return
+
+        # =====================================================
+        # 🔥 3️⃣ 對同一批 rows 逐台下發
+        # =====================================================
         for cp_id, connector_id, tx_id in rows:
+
             cp = connected_charge_points.get(cp_id)
             if not cp:
-                logging.warning(f"[SMART][REBALANCE][SKIP] cp_id={cp_id} not connected")
+                logging.warning(
+                    f"[SMART][REBALANCE][SKIP] cp_id={cp_id} not connected"
+                )
                 continue
 
             if not getattr(cp, "supports_smart_charging", False):
@@ -992,7 +1010,9 @@ async def rebalance_all_charging_points(reason: str):
             try:
                 tx_id = int(tx_id)
             except Exception:
-                logging.warning(f"[SMART][REBALANCE][SKIP] invalid tx_id={tx_id}")
+                logging.warning(
+                    f"[SMART][REBALANCE][SKIP] invalid tx_id={tx_id}"
+                )
                 continue
 
             try:
@@ -1015,7 +1035,10 @@ async def rebalance_all_charging_points(reason: str):
                 )
 
     except Exception as e:
-        logging.exception(f"[SMART][REBALANCE][FATAL] err={e}")
+        logging.exception(
+            f"[SMART][REBALANCE][FATAL] err={e}"
+        )
+
 
 
 def ensure_charge_points_table():
