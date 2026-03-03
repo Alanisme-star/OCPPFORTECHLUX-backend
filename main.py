@@ -2474,9 +2474,9 @@ class ChargePoint(OcppChargePoint):
                         insert_count += 1
 
                         # === 收集即時量測 ===
-                        if meas == "Voltage":
+                        if meas == "Voltage" or str(meas).startswith("Voltage."):
                             batch_voltage = val
-                        elif meas.startswith("Current.Import"):
+                        elif str(meas).startswith("Current.Import"):
                             batch_current = val
                         elif meas == "Power.Active.Import":
                             batch_power_kw = _to_kw(val, unit)
@@ -2535,10 +2535,10 @@ class ChargePoint(OcppChargePoint):
                     active_charging_count=active_count_now
                 )
 
-                if theory_a is not None and current is not None:
+                if theory_a is not None and batch_current is not None:
                     theory_a = float(theory_a)
 
-                    if float(current) > theory_a + 0.5:  # 容忍 0.5A 誤差
+                    if float(batch_current) > theory_a + 0.5:  # 容忍 0.5A 誤差
                         logging.error(
                             f"[FORCE-CLAMP] cp_id={self.id} | "
                             f"measured={current}A > theory={theory_a}A | "
