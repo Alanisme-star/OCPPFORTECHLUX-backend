@@ -185,7 +185,7 @@ async def send_current_limit_profile(
         cs_charging_profiles={
             "charging_profile_id": 999,
             "stack_level": 10,
-            "charging_profile_purpose": "ChargePointMaxProfile",
+            "charging_profile_purpose": "TxProfile",
             "charging_profile_kind": "Absolute",
             "charging_schedule": {
                 "charging_rate_unit": "A",
@@ -1002,9 +1002,9 @@ async def rebalance_all_charging_points(reason: str):
             try:
                 await send_current_limit_profile(
                     cp=cp,
-                    connector_id=1,
+                    connector_id=connector_id,
                     limit_a=allowed_a,
-                    tx_id=None,
+                    tx_id=tx_id,
                 )
 
                 logging.warning(
