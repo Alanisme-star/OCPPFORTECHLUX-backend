@@ -2484,6 +2484,42 @@ class ChargePoint(OcppChargePoint):
                 ):
                     batch_power_kw = round((batch_voltage * batch_current) / 1000.0, 3)
 
+
+            # =====================================================
+            # 🔥 強制電流壓制（實測值 > 理論值）
+            # =====================================================
+            try:
+                active_count_now = get_active_charging_count()
+                theory_a = calculate_allowed_current(
+                    active_charging_count=active_count_now
+                )
+
+                if theory_a is not None and current is not None:
+                    theory_a = float(theory_a)
+
+                    if float(current) > theory_a + 0.5:  # 容忍 0.5A 誤差
+                        logging.error(
+                            f"[FORCE-CLAMP] cp_id={self.id} | "
+                            f"measured={current}A > theory={theory_a}A | "
+                            f"RE-SEND LIMIT"
+                        )
+
+                        await send_current_limit_profile(
+                            cp=self,
+                            connector_id=connector_id or 1,
+                            limit_a=theory_a,
+                            tx_id=transaction_id
+                        )
+
+            except Exception as e:
+                logging.warning(
+                    f"[FORCE-CLAMP][ERR] cp_id={self.id} | err={e}"
+                )
+
+
+
+
+
             # === ✅ 一次性更新即時狀態（關鍵）===
             _upsert_live(
                 cp_id,
