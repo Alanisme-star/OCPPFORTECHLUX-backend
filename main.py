@@ -125,6 +125,26 @@ async def send_current_limit_profile(
         f"| tx_id={tx_id} | limit={limit_a}A"
     )
 
+
+    # =====================================================
+    # [1.2] 先寫入狀態（保底：就算後面送失敗，前端也看的到 requested）
+    # =====================================================
+    now_iso = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
+    st = current_limit_state.setdefault(cp_id, {})
+    st.update(
+        {
+            "requested_limit_a": float(limit_a),
+            "requested_at": now_iso,
+            "applied": False,
+            "last_tx_id": tx_id,
+            "last_connector_id": connector_id,
+            "last_error": None,
+        }
+    )
+
+
+
+
     # =====================================================
     # [1.5] 🧯 SAFETY GUARD：下發值不得高於「契約試算理論值」
     # 🔥 修正版：使用同一批交易 rows 計算 active_count
@@ -178,26 +198,34 @@ async def send_current_limit_profile(
 
 
     # =====================================================
-    # [2] 組 payload（ocpp 0.26.0 合法格式）
+    # [2] 組 payload（TxProfile 需要 transaction_id；沒有 tx_id 就退回 CP Max Profile）
     # =====================================================
+    purpose = "TxProfile" if tx_id is not None else "ChargePointMaxProfile"
+
+    cs_profile = {
+        "charging_profile_id": 999,
+        "stack_level": 10,
+        "charging_profile_purpose": purpose,
+        "charging_profile_kind": "Absolute",
+        "charging_schedule": {
+            "charging_rate_unit": "A",
+            "charging_schedule_period": [
+                {
+                    "start_period": 0,
+                    "limit": float(limit_a),
+                    "number_phases": 1,
+                }
+            ],
+        },
+    }
+
+    # 🔥 TxProfile 必須帶 transaction_id（snake_case）
+    if tx_id is not None:
+        cs_profile["transaction_id"] = int(tx_id)
+
     payload = call.SetChargingProfilePayload(
         connector_id=int(connector_id),
-        cs_charging_profiles={
-            "charging_profile_id": 999,
-            "stack_level": 10,
-            "charging_profile_purpose": "TxProfile",
-            "charging_profile_kind": "Absolute",
-            "charging_schedule": {
-                "charging_rate_unit": "A",
-                "charging_schedule_period": [
-                    {
-                        "start_period": 0,
-                        "limit": float(limit_a),
-                        "number_phases": 1,
-                    }
-                ],
-            },
-        },
+        cs_charging_profiles=cs_profile,
     )
 
     # =====================================================
