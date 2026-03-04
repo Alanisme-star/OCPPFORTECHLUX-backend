@@ -196,6 +196,24 @@ async def send_current_limit_profile(
         )
 
 
+    # =====================================================
+    # [1.8] ✅ OCPP schema 要求：limit 必須是 0.1 的倍數
+    # 例如 22.73 -> 22.7（避免 ValidationError / FormatViolation）
+    # =====================================================
+    try:
+        limit_a = float(limit_a)
+    except Exception:
+        limit_a = float(DEVICE_HARD_LIMIT)
+
+    # 量化到 0.1A（符合 multipleOf 0.1）
+    limit_a = round(limit_a * 10.0) / 10.0
+
+    # 保底：避免出現 -0.0
+    if abs(limit_a) < 1e-9:
+        limit_a = 0.0
+
+
+
 
     # =====================================================
     # [2] 組 payload（TxProfile 需要 transaction_id；沒有 tx_id 就退回 CP Max Profile）
@@ -261,7 +279,14 @@ async def send_current_limit_profile(
         status = getattr(resp, "status", None)
         status_str = str(status) if status is not None else "UNKNOWN"
 
-        ok = status_str.lower() == "accepted"
+        status_low = status_str.strip().lower()
+        ok = (
+            status_low == "accepted"
+            or status_low.endswith(".accepted")
+            or status_low.endswith("_accepted")
+        )
+
+        logging.error(f"[LIMIT][SEND][RESP-RAW] cp_id={cp_id} | resp={repr(resp)} | type={type(resp)}")
 
         now_iso = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
         st = current_limit_state.setdefault(cp_id, {})
