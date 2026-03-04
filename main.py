@@ -1031,7 +1031,7 @@ async def rebalance_all_charging_points(reason: str):
             if cp_id not in tx_map:
                 tx_map[cp_id] = (int(tx_id), int(connector_id or 1))
 
-        for cp_id, cp in connected_charge_points.items():
+        for cp_id, cp in list(connected_charge_points.items()):
 
             if getattr(cp, "supports_smart_charging", True) is False:
                 continue
