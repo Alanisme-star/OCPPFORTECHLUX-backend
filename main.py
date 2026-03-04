@@ -748,6 +748,7 @@ async def websocket_endpoint(websocket: WebSocket, charge_point_id: str):
 
         # 2) 啟動 OCPP handler
         cp = ChargePoint(cp_id, FastAPIWebSocketAdapter(websocket))
+        cp.supports_smart_charging = True  # 模擬器/開發環境建議直接 True
         connected_charge_points[cp_id] = cp
         await cp.start()
 
@@ -1032,7 +1033,7 @@ async def rebalance_all_charging_points(reason: str):
 
         for cp_id, cp in connected_charge_points.items():
 
-            if not getattr(cp, "supports_smart_charging", False):
+            if getattr(cp, "supports_smart_charging", True) is False:
                 continue
 
             tx_id, connector_id = tx_map.get(cp_id, (None, 1))
@@ -1858,7 +1859,7 @@ class ChargePoint(OcppChargePoint):
                 )
             else:
                 # 🟡 正式環境：預設一律不支援（安全）
-                self.supports_smart_charging = True
+                self.supports_smart_charging = False
 
                 logging.info(
                     f"[CAPABILITY][DEFAULT] CP={self.id} | "
