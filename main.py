@@ -1,3 +1,4 @@
+import asyncio
 
 from urllib.parse import unquote  # ← 新增
 
@@ -273,7 +274,7 @@ async def send_current_limit_profile(
         )
 
         # ✅ 等待樁端回應（加 timeout，避免卡死）
-        resp = await asyncio.wait_for(cp.call(payload), timeout=10.0)
+        resp = await asyncio.wait_for(cp.call(payload), timeout=60.0)
 
         # OCPP 1.6 標準回傳通常有 status
         status = getattr(resp, "status", None)
@@ -2110,7 +2111,9 @@ class ChargePoint(OcppChargePoint):
             # [4.5] 🟦 Smart Charging：StartTransaction 後全場 Rebalance
             # ==================================================
             try:
-                await rebalance_all_charging_points(reason="start_transaction")
+                asyncio.create_task(
+                    rebalance_all_charging_points(reason="start_transaction")
+                )
             except Exception as e:
                 logging.exception(
                     f"[SMART][START_TX][REBALANCE_ERR] cp_id={self.id} | err={e}"
