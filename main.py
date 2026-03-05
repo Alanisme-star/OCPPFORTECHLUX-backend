@@ -2591,41 +2591,8 @@ class ChargePoint(OcppChargePoint):
 
 
             # =====================================================
-            # 🔥 強制電流壓制（實測值 > 理論值）
+            # ✅ 先更新即時狀態（讓 ΣV 計算拿得到最新 voltage）
             # =====================================================
-            try:
-                active_count_now = get_active_charging_count()
-                theory_a = calculate_allowed_current(
-                    active_charging_count=active_count_now
-                )
-
-                if theory_a is not None and batch_current is not None:
-                    theory_a = float(theory_a)
-
-                    if float(batch_current) > theory_a + 0.5:  # 容忍 0.5A 誤差
-                        logging.error(
-                            f"[FORCE-CLAMP] cp_id={self.id} | "
-                            f"measured={current}A > theory={theory_a}A | "
-                            f"RE-SEND LIMIT"
-                        )
-
-                        await send_current_limit_profile(
-                            cp=self,
-                            connector_id=connector_id or 1,
-                            limit_a=theory_a,
-                            tx_id=transaction_id
-                        )
-
-            except Exception as e:
-                logging.warning(
-                    f"[FORCE-CLAMP][ERR] cp_id={self.id} | err={e}"
-                )
-
-
-
-
-
-            # === ✅ 一次性更新即時狀態（關鍵）===
             _upsert_live(
                 cp_id,
                 voltage=batch_voltage,
@@ -2633,6 +2600,57 @@ class ChargePoint(OcppChargePoint):
                 power=batch_power_kw,
                 timestamp=last_ts,
             )
+
+
+            # =====================================================
+            # 🔥 強制電流壓制（實測值 > 理論值）— 改用 ΣV 封頂
+            # =====================================================
+            try:
+                # 取出所有 active 交易的 cp_id 清單（與 B/C 同邏輯）
+                with sqlite3.connect(DB_FILE, check_same_thread=False, timeout=15) as conn:
+                    cur = conn.cursor()
+                    cur.execute(
+                        """
+                        SELECT charge_point_id
+                        FROM transactions
+                        WHERE stop_timestamp IS NULL
+                          AND start_timestamp IS NOT NULL
+                        """
+                    )
+                    rows = cur.fetchall()
+
+                active_cp_ids = []
+                for (cpid,) in rows:
+                    cpid = _normalize_cp_id(str(cpid))
+                    if cpid not in active_cp_ids:
+                        active_cp_ids.append(cpid)
+
+                # 只算仍連線的（避免斷線樁 voltage=0 影響 ΣV）
+                active_cp_ids = [cid for cid in active_cp_ids if cid in connected_charge_points]
+
+                theory_a = calculate_allowed_current_by_cp_ids(active_cp_ids)
+
+                if theory_a is not None and batch_current is not None:
+                    theory_a = float(theory_a)
+
+                    if float(batch_current) > theory_a + 0.5:  # 容忍 0.5A 誤差
+                        logging.error(
+                            f"[FORCE-CLAMP] cp_id={cp_id} | "
+                            f"measured={float(batch_current):.2f}A > theory={theory_a:.2f}A | "
+                            f"active_cp_ids={active_cp_ids} | RE-SEND LIMIT"
+                        )
+
+                        await send_current_limit_profile(
+                            cp=self,
+                            connector_id=int(connector_id or 1),
+                            limit_a=theory_a,
+                            tx_id=int(transaction_id) if str(transaction_id).isdigit() else None,
+                        )
+
+            except Exception as e:
+                logging.warning(
+                    f"[FORCE-CLAMP][ERR] cp_id={cp_id} | err={e}"
+                )
 
             logging.info(
                 f"[LIVE][OK] cp={cp_id} "
