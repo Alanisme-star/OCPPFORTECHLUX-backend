@@ -413,8 +413,12 @@ _recent_stop_requests = {}  # {cp_id: last_stop_time}
 # 允許跨域（若前端使用）
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # ✅ 改為英文半形引號
-    allow_credentials=True,
+    allow_origins=[
+        "https://ocppfortechlux-frontend.onrender.com",
+        "http://localhost:5173",
+        "http://localhost:3000",
+    ],
+    allow_credentials=False,  # ✅ 前端目前不需要 cookie，關掉最穩
     allow_methods=["*"],
     allow_headers=["*"],
 )
