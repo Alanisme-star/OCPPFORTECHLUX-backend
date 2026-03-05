@@ -166,7 +166,7 @@ async def send_current_limit_profile(
             cur = conn.cursor()
             cur.execute(
                 """
-                SELECT transaction_id
+                SELECT charge_point_id
                 FROM transactions
                 WHERE stop_timestamp IS NULL
                   AND start_timestamp IS NOT NULL
@@ -174,11 +174,13 @@ async def send_current_limit_profile(
             )
             rows = cur.fetchall()
 
-        active_count_now = len(rows)
+        active_cp_ids = []
+        for (cpid,) in rows:
+            cpid = _normalize_cp_id(str(cpid))
+            if cpid not in active_cp_ids:
+                active_cp_ids.append(cpid)
 
-        theory_a = calculate_allowed_current(
-            active_charging_count=active_count_now
-        )
+        theory_a = calculate_allowed_current_by_cp_ids(active_cp_ids)
 
         if theory_a is not None:
             theory_a = float(theory_a)
@@ -187,7 +189,7 @@ async def send_current_limit_profile(
                 logging.warning(
                     f"[LIMIT][CLAMP] cp_id={cp_id} | "
                     f"raw={raw_limit_a}A -> clamp={theory_a}A | "
-                    f"active_count={active_count_now}"
+                    f"active_cp_ids={active_cp_ids}"
                 )
                 limit_a = theory_a
 
@@ -195,6 +197,7 @@ async def send_current_limit_profile(
         logging.warning(
             f"[LIMIT][CLAMP][SKIP] cp_id={cp_id} | raw={raw_limit_a}A | err={e}"
         )
+
 
 
     # =====================================================
@@ -960,29 +963,53 @@ def get_community_settings():
     }
 
 
-def calculate_allowed_current(*, active_charging_count: int):
+def _live_voltage_v(cp_id: str, fallback_v: float) -> float:
+    """
+    從 live_status_cache 取即時電壓，取不到就回退到 community_settings.voltage_v
+    """
+    try:
+        v = live_status_cache.get(cp_id, {}).get("voltage")
+        v = float(v)
+        if v > 50:   # 過濾 0 / 異常值
+            return v
+    except Exception:
+        pass
+    return float(fallback_v)
+
+
+def calculate_allowed_current_by_cp_ids(active_cp_ids: list[str]):
+    """
+    ✅ 以 ΣV 封頂契約功率（公平：每台同電流）
+    allowed_A = (contract_kw*1000) / sum(voltage_i)
+    """
     cfg = get_community_settings()
 
-    contract_kw = cfg["contract_kw"]
+    contract_kw = float(cfg.get("contract_kw") or 0)
     if contract_kw <= 0:
         return None
 
-    voltage_v = cfg["voltage_v"]
-    min_a = cfg["min_current_a"]
+    min_a = float(cfg.get("min_current_a") or 16)
+    per_cp_max_a = float(cfg.get("max_current_a") or DEVICE_HARD_LIMIT)
 
-    if active_charging_count <= 0:
+    if not active_cp_ids:
         return DEVICE_HARD_LIMIT
 
-    total_current_a = (contract_kw * 1000.0) / voltage_v
-    avg_a = total_current_a / active_charging_count
+    fallback_v = float(cfg.get("voltage_v") or 220)
 
-    if avg_a < min_a:
+    voltages = [_live_voltage_v(cp_id, fallback_v) for cp_id in active_cp_ids]
+    sum_v = sum(voltages)
+
+    if sum_v <= 0:
         return None
 
-    # 🔥 單機安全保護
-    safe_limit = min(avg_a, DEVICE_HARD_LIMIT)
+    total_w = contract_kw * 1000.0
+    allowed_a = total_w / sum_v
 
-    return round(safe_limit, 2)
+    if allowed_a < min_a:
+        return None
+
+    allowed_a = min(float(allowed_a), float(per_cp_max_a), float(DEVICE_HARD_LIMIT))
+    return round(allowed_a, 2)
 
 
 def get_active_charging_count():
@@ -1011,13 +1038,13 @@ def get_active_charging_count():
     except Exception:
         return 0
 
+
 async def rebalance_all_charging_points(reason: str):
     """
-    ✅ 修正版（可直接覆蓋）
+    ✅ 修正版（ΣV 封頂，不會因電壓漂移超約）
     - 先用 DB 找出所有 active 交易，建立 cp_id -> (tx_id, connector_id) 對照
-    - 對所有 connected CP 送 SetChargingProfile
-      - 有 tx_id：送 TxProfile
-      - 沒 tx_id：退回 ChargePointMaxProfile（仍可限流）
+    - 用 active_cp_ids + live_status_cache 的 voltage 做 ΣV 封頂，算 allowed_a
+    - 只對 active_cp_ids 下發限流
     """
 
     try:
@@ -1034,15 +1061,24 @@ async def rebalance_all_charging_points(reason: str):
             )
             rows = cur.fetchall()
 
-        active_count = len(rows)
+        # 建立 cp_id -> (tx_id, connector_id)（取最新一筆交易）
+        tx_map = {}
+        active_cp_ids = []
+        for tx_id, cp_id, connector_id in rows:
+            cp_id = _normalize_cp_id(cp_id)
+            if cp_id not in tx_map:
+                tx_map[cp_id] = (int(tx_id), int(connector_id or 1))
+            if cp_id not in active_cp_ids:
+                active_cp_ids.append(cp_id)
 
-        allowed_a = calculate_allowed_current(
-            active_charging_count=active_count
-        )
+        # ✅ 只算「仍連線」的 active CP（避免把斷線樁的電壓也算進來）
+        active_cp_ids = [cid for cid in active_cp_ids if cid in connected_charge_points]
+
+        allowed_a = calculate_allowed_current_by_cp_ids(active_cp_ids)
 
         logging.warning(
             f"[SMART][REBALANCE] reason={reason} | "
-            f"active_count={active_count} | allowed_a={allowed_a}"
+            f"active_cp_ids={active_cp_ids} | allowed_a={allowed_a}"
         )
 
         if allowed_a is None:
@@ -1050,14 +1086,10 @@ async def rebalance_all_charging_points(reason: str):
 
         allowed_a = float(allowed_a)
 
-        # 建立 cp_id -> (tx_id, connector_id)（取最新一筆交易）
-        tx_map = {}
-        for tx_id, cp_id, connector_id in rows:
-            cp_id = _normalize_cp_id(cp_id)
-            if cp_id not in tx_map:
-                tx_map[cp_id] = (int(tx_id), int(connector_id or 1))
-
-        for cp_id, cp in list(connected_charge_points.items()):
+        for cp_id in active_cp_ids:
+            cp = connected_charge_points.get(cp_id)
+            if not cp:
+                continue
 
             if getattr(cp, "supports_smart_charging", True) is False:
                 continue
@@ -1086,6 +1118,9 @@ async def rebalance_all_charging_points(reason: str):
         logging.exception(
             f"[SMART][REBALANCE][FATAL] err={e}"
         )
+
+
+
 
 def ensure_charge_points_table():
     """
