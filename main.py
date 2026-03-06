@@ -418,7 +418,7 @@ app.add_middleware(
         "http://localhost:5173",
         "http://localhost:3000",
     ],
-    allow_credentials=False,  # ✅ 前端目前不需要 cookie，關掉最穩
+    allow_credentials=False,  # ✅ 你目前前端沒用 cookie/session，關掉最穩
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -1183,6 +1183,90 @@ def ensure_charge_points_schema():
             logging.info("✅ [MIGRATION] charge_points.max_current_a exists")
 
 
+def ensure_community_settings_table():
+    """
+    ✅ 保證 community_settings 表一定存在
+    - 新 DB 第一次啟動：直接建立表
+    - 並保證 id=1 這筆預設資料存在
+    """
+    with get_conn() as c:
+        cur = c.cursor()
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS community_settings (
+                id INTEGER PRIMARY KEY,
+                enabled INTEGER DEFAULT 1,
+                contract_kw REAL DEFAULT 0,
+                voltage_v REAL DEFAULT 220,
+                phases INTEGER DEFAULT 1,
+                min_current_a REAL DEFAULT 16,
+                max_current_a REAL DEFAULT 32
+            )
+            """
+        )
+
+        # 保證 id=1 一定存在
+        cur.execute("SELECT id FROM community_settings WHERE id = 1")
+        row = cur.fetchone()
+
+        if not row:
+            cur.execute(
+                """
+                INSERT INTO community_settings
+                (id, enabled, contract_kw, voltage_v, phases, min_current_a, max_current_a)
+                VALUES (1, 1, 0, 220, 1, 16, 32)
+                """
+            )
+
+        c.commit()
+
+
+def ensure_community_settings_schema():
+    """
+    ✅ 舊 DB 相容用：
+    - 表存在但少欄位 → 自動補欄位
+    - 表不存在 → 直接跳過（避免 Deploy 炸掉）
+    """
+    with get_conn() as c:
+        cur = c.cursor()
+
+        cur.execute(
+            """
+            SELECT name FROM sqlite_master
+            WHERE type='table' AND name='community_settings'
+            """
+        )
+        if not cur.fetchone():
+            logging.warning("⚠️ [MIGRATION] community_settings table not found, skip ALTER")
+            return
+
+        cur.execute("PRAGMA table_info(community_settings);")
+        cols = [r[1] for r in cur.fetchall()]
+
+        if "enabled" not in cols:
+            cur.execute("ALTER TABLE community_settings ADD COLUMN enabled INTEGER DEFAULT 1")
+
+        if "contract_kw" not in cols:
+            cur.execute("ALTER TABLE community_settings ADD COLUMN contract_kw REAL DEFAULT 0")
+
+        if "voltage_v" not in cols:
+            cur.execute("ALTER TABLE community_settings ADD COLUMN voltage_v REAL DEFAULT 220")
+
+        if "phases" not in cols:
+            cur.execute("ALTER TABLE community_settings ADD COLUMN phases INTEGER DEFAULT 1")
+
+        if "min_current_a" not in cols:
+            cur.execute("ALTER TABLE community_settings ADD COLUMN min_current_a REAL DEFAULT 16")
+
+        if "max_current_a" not in cols:
+            cur.execute("ALTER TABLE community_settings ADD COLUMN max_current_a REAL DEFAULT 32")
+
+        c.commit()
+        logging.info("✅ [MIGRATION] community_settings schema checked")
+
+
+
+
 # 建立一個全域連線（僅供少數 legacy 用途）
 conn = sqlite3.connect(DB_FILE, check_same_thread=False, timeout=15)
 cursor = conn.cursor()
@@ -1191,6 +1275,8 @@ cursor = conn.cursor()
 ensure_charge_points_table()
 ensure_charge_points_schema()
 
+ensure_community_settings_table()
+ensure_community_settings_schema()
 
 def _price_for_timestamp(ts: str) -> float:
     """
@@ -5809,39 +5895,47 @@ def debug_current_limit_state(cp_id: str | None = Query(default=None)):
     return {"server_time": server_time, "items": items}
 
 
-
-
 @app.get("/api/community-settings")
 def api_get_community_settings():
-    cfg = get_community_settings()
+    try:
+        cfg = get_community_settings()
 
-    # ✅ 新增：目前正在充電台數
-    active_count = get_active_charging_count()
+        # ✅ 目前正在充電台數
+        active_count = get_active_charging_count()
 
-    total_current_a = 0.0
-    max_cars_by_min = 0
+        total_current_a = 0.0
+        max_cars_by_min = 0
+        allowed_a = None
+        blocked_reason = ""
 
-    if cfg["enabled"] and cfg["contract_kw"] > 0:
-        total_current_a = (cfg["contract_kw"] * 1000) / cfg["voltage_v"]
-        max_cars_by_min = int(total_current_a // cfg["min_current_a"])
+        if cfg["enabled"] and cfg["contract_kw"] > 0:
+            total_current_a = (cfg["contract_kw"] * 1000) / cfg["voltage_v"]
+            max_cars_by_min = int(total_current_a // cfg["min_current_a"])
 
-    # ✅ 新增：依目前台數計算允許電流
-    allowed_a = None
-    blocked_reason = ""
+            try:
+                allowed_a = calculate_allowed_current(
+                    active_charging_count=active_count
+                )
+                if active_count > 0 and allowed_a is None:
+                    blocked_reason = "avg_current_below_min"
+            except Exception as e:
+                logging.exception(f"[COMMUNITY_SETTINGS][CALC_ERR] {e}")
+                allowed_a = None
+                blocked_reason = "calculate_allowed_current_error"
 
-    if cfg["enabled"] and cfg["contract_kw"] > 0:
-        allowed_a = calculate_allowed_current(active_charging_count=active_count)
-        if active_count > 0 and allowed_a is None:
-            blocked_reason = "avg_current_below_min"
+        return {
+            **cfg,
+            "active_charging_count": int(active_count),
+            "allowed_current_a": allowed_a,
+            "blocked_reason": blocked_reason,
+            "total_current_a": round(total_current_a, 2),
+            "max_cars_by_min": int(max_cars_by_min),
+        }
 
-    return {
-        **cfg,
-        "active_charging_count": int(active_count),          # ✅ 前端要的欄位
-        "allowed_current_a": allowed_a,                      # ✅ 前端會顯示
-        "blocked_reason": blocked_reason,                    # ✅ 前端會顯示
-        "total_current_a": round(total_current_a, 2),
-        "max_cars_by_min": max_cars_by_min,
-    }
+    except Exception as e:
+        logging.exception(f"[COMMUNITY_SETTINGS][GET_ERR] {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 
 @app.post("/api/community-settings")
