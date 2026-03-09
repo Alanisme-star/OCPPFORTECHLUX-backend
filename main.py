@@ -82,6 +82,11 @@ from reportlab.pdfgen import canvas
 # ===============================
 DEVICE_HARD_LIMIT = 32  # 單位：安培
 
+# ===============================
+# 第一階段：單機功率管理上限（固定值，不提供前端修改）
+# ===============================
+SINGLE_CP_MAX_POWER_KW = 7.0
+
 
 # ===============================
 # 🔌 OCPP 電流限制（TxProfile）
@@ -147,8 +152,8 @@ async def send_current_limit_profile(
 
 
     # =====================================================
-    # [1.5] 🧯 SAFETY GUARD：下發值不得高於「契約試算理論值」
-    # 🔥 修正版：使用同一批交易 rows 計算 active_count
+    # [1.5] 🧯 SAFETY GUARD：下發值不得高於「功率分配換算後理論值」
+    # 第一階段：管理邏輯改成功率，實際下發仍為電流
     # =====================================================
     raw_limit_a = limit_a
 
@@ -161,7 +166,7 @@ async def send_current_limit_profile(
     limit_a = min(limit_a, float(DEVICE_HARD_LIMIT))
 
     try:
-        # 🔥 重新抓目前所有 active 交易（避免 get_active_charging_count 時序問題）
+        # 重新抓目前所有 active 交易
         with sqlite3.connect(DB_FILE, check_same_thread=False, timeout=15) as conn:
             cur = conn.cursor()
             cur.execute(
@@ -170,7 +175,7 @@ async def send_current_limit_profile(
                 FROM transactions
                 WHERE stop_timestamp IS NULL
                   AND start_timestamp IS NOT NULL
-            """
+                """
             )
             rows = cur.fetchall()
 
@@ -180,7 +185,12 @@ async def send_current_limit_profile(
             if cpid not in active_cp_ids:
                 active_cp_ids.append(cpid)
 
-        theory_a = calculate_allowed_current_by_cp_ids(active_cp_ids)
+        allocated_kw = calculate_allocated_power_kw_by_cp_ids(active_cp_ids)
+        theory_a = (
+            convert_power_kw_to_current_a(allocated_kw, cp_id)
+            if allocated_kw is not None
+            else None
+        )
 
         if theory_a is not None:
             theory_a = float(theory_a)
@@ -189,7 +199,7 @@ async def send_current_limit_profile(
                 logging.warning(
                     f"[LIMIT][CLAMP] cp_id={cp_id} | "
                     f"raw={raw_limit_a}A -> clamp={theory_a}A | "
-                    f"active_cp_ids={active_cp_ids}"
+                    f"allocated_kw={allocated_kw} | active_cp_ids={active_cp_ids}"
                 )
                 limit_a = theory_a
 
@@ -630,23 +640,34 @@ def debug_start_transaction_check(
             logging.warning(f"[DEBUG][START_TX_CHECK] {out}")
             return out
 
-    # ========== Step 3：社區 Smart Charging 試算（純社區模式） ==========
+    # ========== Step 3：社區 Smart Charging 試算（第一階段：功率分配模式） ==========
     try:
         active_now = get_active_charging_count()
         trial_count = active_now + 1
 
         community_cfg = get_community_settings()
-        allowed_a = calculate_allowed_current(active_charging_count=trial_count)
 
-        if allowed_a is None:
+        # 模擬「若這台也加入充電」後的活躍樁數
+        trial_cp_ids = [f"TRIAL_CP_{i+1}" for i in range(trial_count)]
+        allocated_kw = calculate_allocated_power_kw_by_cp_ids(trial_cp_ids)
+        preview_current_a = (
+            convert_power_kw_to_current_a(allocated_kw, cp_norm)
+            if allocated_kw is not None
+            else None
+        )
+
+        if allocated_kw is None:
             out = {
                 "cp_id": cp_norm,
                 "idTag": id_tag,
                 "decision": "Blocked",
-                "reason": "avg_current_below_min",
+                "reason": "avg_power_below_min_threshold",
                 "balance": balance,
                 "active_now": active_now,
                 "trial_count": trial_count,
+                "allocated_power_kw": None,
+                "preview_current_a": None,
+                "single_cp_max_power_kw": SINGLE_CP_MAX_POWER_KW,
                 "community_settings": community_cfg,
             }
             logging.warning(f"[DEBUG][START_TX_CHECK] {out}")
@@ -660,7 +681,9 @@ def debug_start_transaction_check(
             "balance": balance,
             "active_now": active_now,
             "trial_count": trial_count,
-            "allowed_current_a": allowed_a,
+            "allocated_power_kw": allocated_kw,
+            "preview_current_a": preview_current_a,
+            "single_cp_max_power_kw": SINGLE_CP_MAX_POWER_KW,
             "community_settings": community_cfg,
         }
         logging.warning(f"[DEBUG][START_TX_CHECK] {out}")
@@ -676,7 +699,6 @@ def debug_start_transaction_check(
         }
         logging.exception(f"[DEBUG][START_TX_CHECK] {out}")
         return out
-
 
 # =====================================================
 # ==== Live 快取工具 ====
@@ -966,25 +988,99 @@ def get_community_settings():
         "max_current_a": float(row[5] or 32),
     }
 
+def calculate_allocated_power_kw_by_cp_ids(active_cp_ids: list[str]):
+    """
+    第一階段：改用功率作為管理主體
+    ------------------------------------------------
+    規則：
+    1. 以 community_settings.contract_kw 作為社區總可分配功率
+    2. 對 active_cp_ids 平均分配
+    3. 每台上限固定 SINGLE_CP_MAX_POWER_KW
+    4. 若平均分配後低於最低可充門檻，回傳 None
+       （最低可充門檻仍沿用 min_current_a 轉換而來）
+    ------------------------------------------------
+    回傳：
+    - float：每台應分配功率（kW）
+    - None：代表低於最低可充門檻，不建議啟動 / 不下發
+    """
 
-def _live_voltage_v(cp_id: str, fallback_v: float) -> float:
+    cfg = get_community_settings()
+
+    contract_kw = float(cfg.get("contract_kw") or 0)
+    if contract_kw <= 0:
+        return None
+
+    if not active_cp_ids:
+        return round(float(SINGLE_CP_MAX_POWER_KW), 3)
+
+    fallback_v = float(cfg.get("voltage_v") or 220)
+    min_a = float(cfg.get("min_current_a") or 16)
+
+    # 最低可充門檻：沿用既有 min_current_a，但轉成功率判斷
+    min_power_kw_list = []
+    for cp_id in active_cp_ids:
+        v = _live_voltage_v(cp_id, fallback_v)
+        min_power_kw_list.append((v * min_a) / 1000.0)
+
+    if not min_power_kw_list:
+        return None
+
+    required_min_kw = max(min_power_kw_list)
+
+    avg_kw = contract_kw / max(1, len(active_cp_ids))
+    allocated_kw = min(float(avg_kw), float(SINGLE_CP_MAX_POWER_KW))
+
+    if allocated_kw < required_min_kw:
+        return None
+
+    return round(float(allocated_kw), 3)
+
+
+def convert_power_kw_to_current_a(power_kw: float, cp_id: str | None = None):
     """
-    從 live_status_cache 取即時電壓，取不到就回退到 community_settings.voltage_v
+    將功率(kW)換算成電流(A)
+    - 優先使用該 cp_id 的即時電壓
+    - 若取不到，回退到 community_settings.voltage_v
+    - 最後再套 DEVICE_HARD_LIMIT
     """
+    cfg = get_community_settings()
+    fallback_v = float(cfg.get("voltage_v") or 220)
+
     try:
-        v = live_status_cache.get(cp_id, {}).get("voltage")
-        v = float(v)
-        if v > 50:   # 過濾 0 / 異常值
-            return v
+        power_kw = float(power_kw)
     except Exception:
-        pass
-    return float(fallback_v)
+        return None
+
+    if power_kw <= 0:
+        return 0.0
+
+    try:
+        if cp_id:
+            voltage_v = _live_voltage_v(cp_id, fallback_v)
+        else:
+            voltage_v = fallback_v
+
+        if voltage_v <= 0:
+            return None
+
+        current_a = (power_kw * 1000.0) / voltage_v
+        current_a = min(float(current_a), float(DEVICE_HARD_LIMIT))
+        return round(current_a, 2)
+
+    except Exception:
+        return None
 
 
 def calculate_allowed_current_by_cp_ids(active_cp_ids: list[str]):
     """
-    ✅ 以 ΣV 封頂契約功率（公平：每台同電流）
-    allowed_A = (contract_kw*1000) / sum(voltage_i)
+    舊版相容函式（第一階段暫時保留）
+    ------------------------------------------------
+    舊邏輯：以 ΣV 封頂契約功率，計算每台共同 allowed_A
+    新邏輯已改由：
+        calculate_allocated_power_kw_by_cp_ids()
+        convert_power_kw_to_current_a()
+    ------------------------------------------------
+    目前保留此函式，避免其他舊段落尚未替換前直接壞掉。
     """
     cfg = get_community_settings()
 
@@ -1045,10 +1141,12 @@ def get_active_charging_count():
 
 async def rebalance_all_charging_points(reason: str):
     """
-    ✅ 修正版（ΣV 封頂，不會因電壓漂移超約）
-    - 先用 DB 找出所有 active 交易，建立 cp_id -> (tx_id, connector_id) 對照
-    - 用 active_cp_ids + live_status_cache 的 voltage 做 ΣV 封頂，算 allowed_a
-    - 只對 active_cp_ids 下發限流
+    第一階段：管理邏輯改成功率，實際下發仍為電流
+    ------------------------------------------------
+    1. 先找出所有 active 交易
+    2. 依 active_cp_ids 平均分配功率
+    3. 每樁上限固定 SINGLE_CP_MAX_POWER_KW
+    4. 下發前依各樁即時電壓換算成電流
     """
 
     try:
@@ -1075,20 +1173,21 @@ async def rebalance_all_charging_points(reason: str):
             if cp_id not in active_cp_ids:
                 active_cp_ids.append(cp_id)
 
-        # ✅ 只算「仍連線」的 active CP（避免把斷線樁的電壓也算進來）
+        # 只算仍連線的 active CP
         active_cp_ids = [cid for cid in active_cp_ids if cid in connected_charge_points]
 
-        allowed_a = calculate_allowed_current_by_cp_ids(active_cp_ids)
+        allocated_kw = calculate_allocated_power_kw_by_cp_ids(active_cp_ids)
 
         logging.warning(
             f"[SMART][REBALANCE] reason={reason} | "
-            f"active_cp_ids={active_cp_ids} | allowed_a={allowed_a}"
+            f"active_cp_ids={active_cp_ids} | allocated_kw={allocated_kw} | "
+            f"single_cp_max_kw={SINGLE_CP_MAX_POWER_KW}"
         )
 
-        if allowed_a is None:
+        if allocated_kw is None:
             return
 
-        allowed_a = float(allowed_a)
+        allocated_kw = float(allocated_kw)
 
         for cp_id in active_cp_ids:
             cp = connected_charge_points.get(cp_id)
@@ -1099,18 +1198,26 @@ async def rebalance_all_charging_points(reason: str):
                 continue
 
             tx_id, connector_id = tx_map.get(cp_id, (None, 1))
+            limit_a = convert_power_kw_to_current_a(allocated_kw, cp_id)
+
+            if limit_a is None or limit_a <= 0:
+                logging.warning(
+                    f"[SMART][SKIP] cp_id={cp_id} | allocated_kw={allocated_kw} | limit_a={limit_a}"
+                )
+                continue
 
             try:
                 await send_current_limit_profile(
                     cp=cp,
                     connector_id=int(connector_id or 1),
-                    limit_a=allowed_a,
+                    limit_a=float(limit_a),
                     tx_id=tx_id,
                 )
 
                 logging.warning(
                     f"[SMART][FORCE_APPLY] "
-                    f"cp_id={cp_id} | connector_id={connector_id} | tx_id={tx_id} | limit={allowed_a}A"
+                    f"cp_id={cp_id} | connector_id={connector_id} | tx_id={tx_id} | "
+                    f"allocated_kw={allocated_kw} | limit={limit_a}A"
                 )
 
             except Exception as e:
@@ -1122,7 +1229,6 @@ async def rebalance_all_charging_points(reason: str):
         logging.exception(
             f"[SMART][REBALANCE][FATAL] err={e}"
         )
-
 
 
 
@@ -2160,7 +2266,7 @@ class ChargePoint(OcppChargePoint):
                 )
 
             # ==================================================
-            # [3.5] 🏘️ Smart Charging：最後一台車輛擋下判斷（建立交易前）
+            # [3.5] 🏘️ Smart Charging：最後一台車輛擋下判斷（第一階段：功率分配模式）
             # ==================================================
             try:
                 # 目前正在充電的台數（尚未含這一台）
@@ -2169,8 +2275,13 @@ class ChargePoint(OcppChargePoint):
                 # 嘗試「加上這一台」
                 trial_count = active_now + 1
 
-                allowed_a = calculate_allowed_current(
-                    active_charging_count=trial_count
+                # 模擬加入後的分配結果
+                trial_cp_ids = [f"TRIAL_CP_{i+1}" for i in range(trial_count)]
+                allocated_kw = calculate_allocated_power_kw_by_cp_ids(trial_cp_ids)
+                preview_current_a = (
+                    convert_power_kw_to_current_a(allocated_kw, self.id)
+                    if allocated_kw is not None
+                    else None
                 )
 
                 logging.warning(
@@ -2178,15 +2289,17 @@ class ChargePoint(OcppChargePoint):
                     f"cp_id={self.id} | "
                     f"active_now={active_now} | "
                     f"trial_count={trial_count} | "
-                    f"allowed_a={allowed_a}"
+                    f"allocated_kw={allocated_kw} | "
+                    f"preview_current_a={preview_current_a} | "
+                    f"single_cp_max_kw={SINGLE_CP_MAX_POWER_KW}"
                 )
 
-                # ❌ 若回傳 None，代表最後一台不可充電（低於最低電流）
-                if allowed_a is None:
+                # 若回傳 None，代表最後一台不可充電（低於最低功率門檻）
+                if allocated_kw is None:
                     logging.error(
                         f"[SMART][START_TX][BLOCKED] "
                         f"cp_id={self.id} | "
-                        f"reason=avg_current_below_min | "
+                        f"reason=avg_power_below_min_threshold | "
                         f"trial_count={trial_count}"
                     )
                     return call_result.StartTransactionPayload(
@@ -2199,7 +2312,6 @@ class ChargePoint(OcppChargePoint):
                 logging.exception(
                     f"[SMART][START_TX][ERROR] cp_id={self.id} | err={e}"
                 )
-
             # =================================================
             # [4] 建立交易（⚠️ 只做 DB，不做 await）
             # =================================================
@@ -2693,10 +2805,11 @@ class ChargePoint(OcppChargePoint):
 
 
             # =====================================================
-            # 🔥 強制電流壓制（實測值 > 理論值）— 改用 ΣV 封頂
+            # 🔥 強制電流壓制（實測值 > 功率分配換算後理論值）
+            # 第一階段：先算 allocated_kw，再換算 theory_a
             # =====================================================
             try:
-                # 取出所有 active 交易的 cp_id 清單（與 B/C 同邏輯）
+                # 取出所有 active 交易的 cp_id 清單
                 with sqlite3.connect(DB_FILE, check_same_thread=False, timeout=15) as conn:
                     cur = conn.cursor()
                     cur.execute(
@@ -2715,10 +2828,15 @@ class ChargePoint(OcppChargePoint):
                     if cpid not in active_cp_ids:
                         active_cp_ids.append(cpid)
 
-                # 只算仍連線的（避免斷線樁 voltage=0 影響 ΣV）
+                # 只算仍連線的（避免斷線樁 voltage=0 影響分配判斷）
                 active_cp_ids = [cid for cid in active_cp_ids if cid in connected_charge_points]
 
-                theory_a = calculate_allowed_current_by_cp_ids(active_cp_ids)
+                allocated_kw = calculate_allocated_power_kw_by_cp_ids(active_cp_ids)
+                theory_a = (
+                    convert_power_kw_to_current_a(allocated_kw, cp_id)
+                    if allocated_kw is not None
+                    else None
+                )
 
                 if theory_a is not None and batch_current is not None:
                     theory_a = float(theory_a)
@@ -2727,7 +2845,7 @@ class ChargePoint(OcppChargePoint):
                         logging.error(
                             f"[FORCE-CLAMP] cp_id={cp_id} | "
                             f"measured={float(batch_current):.2f}A > theory={theory_a:.2f}A | "
-                            f"active_cp_ids={active_cp_ids} | RE-SEND LIMIT"
+                            f"allocated_kw={allocated_kw} | active_cp_ids={active_cp_ids} | RE-SEND LIMIT"
                         )
 
                         await send_current_limit_profile(
@@ -3711,6 +3829,7 @@ def get_live_status(charge_point_id: str):
     live = live_status_cache.get(cp_id)
 
     if live is None:
+        preview_current_a = convert_power_kw_to_current_a(SINGLE_CP_MAX_POWER_KW, cp_id)
         return {
             "timestamp": None,
             "power": 0,
@@ -3721,6 +3840,10 @@ def get_live_status(charge_point_id: str):
             "estimated_amount": 0,
             "price_per_kwh": 0,
             "derived": False,
+            "managed_by": "power",
+            "single_cp_max_power_kw": float(SINGLE_CP_MAX_POWER_KW),
+            "allocated_power_kw": None,
+            "preview_current_a": preview_current_a,
         }
 
     # ✅ 用後端收到資料的時間做 TTL 判斷（最穩，避免樁端 timestamp 不準造成立刻 stale）
@@ -3734,16 +3857,28 @@ def get_live_status(charge_point_id: str):
                 "power": 0,
                 "voltage": 0,
                 "current": 0,
-                # ✅ 保留最後一次的金額與電量
                 "energy": live.get("energy", 0),
                 "estimated_energy": live.get("estimated_energy", 0),
                 "estimated_amount": live.get("estimated_amount", 0),
                 "price_per_kwh": live.get("price_per_kwh", 0),
                 "derived": True,
                 "stale": True,
+                "managed_by": "power",
+                "single_cp_max_power_kw": float(SINGLE_CP_MAX_POWER_KW),
+                "allocated_power_kw": live.get("allocated_power_kw"),
+                "preview_current_a": live.get("preview_current_a"),
             }
             live_status_cache[cp_id] = stale
             return stale
+
+    allocated_power_kw = live.get("allocated_power_kw")
+    if allocated_power_kw is None:
+        # 若還沒明確寫入 live cache，就先以 7kW 上限做展示預估
+        allocated_power_kw = float(SINGLE_CP_MAX_POWER_KW)
+
+    preview_current_a = live.get("preview_current_a")
+    if preview_current_a is None:
+        preview_current_a = convert_power_kw_to_current_a(allocated_power_kw, cp_id)
 
     return {
         "timestamp": live.get("timestamp"),
@@ -3755,25 +3890,36 @@ def get_live_status(charge_point_id: str):
         "estimated_amount": live.get("estimated_amount", 0),
         "price_per_kwh": live.get("price_per_kwh", 0),
         "derived": live.get("derived", False),
+        "managed_by": "power",
+        "single_cp_max_power_kw": float(SINGLE_CP_MAX_POWER_KW),
+        "allocated_power_kw": allocated_power_kw,
+        "preview_current_a": preview_current_a,
     }
-
 
 from ocpp.v16 import call as ocpp_call
 
 
 @app.get("/api/charge-points/{charge_point_id}/current-limit")
 def get_current_limit(charge_point_id: str):
+    """
+    第一階段相容 API
+    ------------------------------------------------
+    前端舊畫面還可能會打這支 API，
+    但邏輯已改為：
+    - 管理上限固定 SINGLE_CP_MAX_POWER_KW
+    - 回傳 currentLimitA 僅作為「由 7kW 換算出的參考電流」
+    """
     cp_id = _normalize_cp_id(charge_point_id)
-    with get_conn() as c:
-        cur = c.cursor()
-        cur.execute(
-            "SELECT max_current_a FROM charge_points WHERE charge_point_id = ?",
-            (cp_id,),
-        )
-        row = cur.fetchone()
-    val = row[0] if row and row[0] is not None else 16
-    return {"chargePointId": cp_id, "maxCurrentA": float(val)}
 
+    preview_current_a = convert_power_kw_to_current_a(SINGLE_CP_MAX_POWER_KW, cp_id)
+
+    return {
+        "chargePointId": cp_id,
+        "maxCurrentA": float(preview_current_a or 0),
+        "managedBy": "power",
+        "singleCpMaxPowerKw": float(SINGLE_CP_MAX_POWER_KW),
+        "note": "phase1_power_managed_preview_current",
+    }
 
 def _build_cs_charging_profiles(limit_a: float, purpose: str = "ChargePointMaxProfile"):
     # OCPP 1.6 SetChargingProfile → csChargingProfiles
@@ -5859,10 +6005,21 @@ def debug_current_limit_state(cp_id: str | None = Query(default=None)):
     server_time = datetime.now(timezone.utc).isoformat()
 
     def _sanitize_state_item(_cp_id: str, st: dict):
-        # st 來自 current_limit_state[cp_id]，避免缺 key 造成前端噴錯
+        requested_limit_a = st.get("requested_limit_a")
+        requested_power_kw = None
+        try:
+            if requested_limit_a is not None:
+                voltage_v = _live_voltage_v(_cp_id, get_community_settings().get("voltage_v", 220))
+                requested_power_kw = round((float(requested_limit_a) * float(voltage_v)) / 1000.0, 3)
+        except Exception:
+            requested_power_kw = None
+
         return {
             "cp_id": _cp_id,
-            "requested_limit_a": st.get("requested_limit_a"),
+            "managed_by": "power",
+            "single_cp_max_power_kw": float(SINGLE_CP_MAX_POWER_KW),
+            "requested_limit_a": requested_limit_a,
+            "requested_power_kw": requested_power_kw,
             "requested_at": st.get("requested_at"),
             "applied": st.get("applied", False),
             "last_try_at": st.get("last_try_at"),
@@ -5900,12 +6057,12 @@ def api_get_community_settings():
     try:
         cfg = get_community_settings()
 
-        # ✅ 目前正在充電台數
         active_count = get_active_charging_count()
 
         total_current_a = 0.0
         max_cars_by_min = 0
-        allowed_a = None
+        allocated_power_kw = None
+        preview_current_a = None
         blocked_reason = ""
 
         if cfg["enabled"] and cfg["contract_kw"] > 0:
@@ -5913,27 +6070,41 @@ def api_get_community_settings():
             max_cars_by_min = int(total_current_a // cfg["min_current_a"])
 
             try:
-                allowed_a = calculate_allowed_current(
-                    active_charging_count=active_count
+                active_cp_ids = [f"ACTIVE_CP_{i+1}" for i in range(active_count)] if active_count > 0 else []
+                allocated_power_kw = calculate_allocated_power_kw_by_cp_ids(active_cp_ids)
+
+                # 這裡沒有指定真實 cp_id，因此用 community 電壓作 preview
+                preview_current_a = (
+                    convert_power_kw_to_current_a(allocated_power_kw, None)
+                    if allocated_power_kw is not None
+                    else None
                 )
-                if active_count > 0 and allowed_a is None:
-                    blocked_reason = "avg_current_below_min"
+
+                if active_count > 0 and allocated_power_kw is None:
+                    blocked_reason = "avg_power_below_min_threshold"
+
             except Exception as e:
                 logging.exception(f"[COMMUNITY_SETTINGS][CALC_ERR] {e}")
-                allowed_a = None
-                blocked_reason = "calculate_allowed_current_error"
+                allocated_power_kw = None
+                preview_current_a = None
+                blocked_reason = "calculate_allocated_power_error"
 
         return {
             **cfg,
+            "managed_by": "power",
+            "single_cp_max_power_kw": float(SINGLE_CP_MAX_POWER_KW),
             "active_charging_count": int(active_count),
-            "allowed_current_a": allowed_a,
+            "allocated_power_kw": allocated_power_kw,
+            "preview_current_a": preview_current_a,
             "blocked_reason": blocked_reason,
             "total_current_a": round(total_current_a, 2),
             "max_cars_by_min": int(max_cars_by_min),
+            # 舊欄位先保留為相容，避免前端還沒改完就壞掉
+            "allowed_current_a": preview_current_a,
         }
 
     except Exception as e:
-        logging.exception(f"[COMMUNITY_SETTINGS][GET_ERR] {e}")
+        logging.exception(f"[COMMUNITY_SETTINGS][ERR] {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
