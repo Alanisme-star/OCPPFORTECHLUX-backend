@@ -790,6 +790,7 @@ async def _accept_or_reject_ws(websocket: WebSocket, raw_cp_id: str):
     return cp_id
 
 
+
 @app.websocket("/{charge_point_id:path}")
 async def websocket_endpoint(websocket: WebSocket, charge_point_id: str):
     print(
@@ -987,6 +988,32 @@ def get_community_settings():
         "min_current_a": float(row[4] or 16),
         "max_current_a": float(row[5] or 32),
     }
+
+
+def _live_voltage_v(cp_id: str, fallback_v: float = 220.0) -> float:
+    """
+    取得某充電樁目前即時電壓
+    優先從 live_status_cache 讀取，取不到就回退到 fallback_v
+    """
+    try:
+        cp_norm = _normalize_cp_id(cp_id)
+        live = live_status_cache.get(cp_norm, {}) or {}
+
+        v = live.get("voltage")
+
+        if v is None:
+            return float(fallback_v)
+
+        v = float(v)
+        if v <= 0:
+            return float(fallback_v)
+
+        return v
+
+    except Exception:
+        return float(fallback_v)
+
+
 
 def calculate_allocated_power_kw_by_cp_ids(active_cp_ids: list[str]):
     """
