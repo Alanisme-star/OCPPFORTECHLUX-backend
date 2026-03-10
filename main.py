@@ -185,6 +185,9 @@ async def send_current_limit_profile(
             if cpid not in active_cp_ids:
                 active_cp_ids.append(cpid)
 
+        # ✅ 與 rebalance / community-settings 統一口徑：只算目前仍在線的樁
+        active_cp_ids = [cid for cid in active_cp_ids if cid in connected_charge_points]
+
         allocated_kw = calculate_allocated_power_kw_by_cp_ids(active_cp_ids)
         theory_a = (
             convert_power_kw_to_current_a(allocated_kw, cp_id)
@@ -1120,30 +1123,53 @@ def calculate_allowed_current_by_cp_ids(active_cp_ids: list[str]):
     allowed_a = min(float(allowed_a), float(per_cp_max_a), float(DEVICE_HARD_LIMIT))
     return round(allowed_a, 2)
 
+def get_effective_active_cp_ids():
+    """
+    取得目前「真正有效參與 Smart Charging」的 CP 清單
+
+    規則：
+    1. transactions 內仍為 active（stop_timestamp IS NULL, start_timestamp IS NOT NULL）
+    2. 充電樁目前仍在線（connected_charge_points）
+    3. 去除重複 cp_id，保留唯一值
+    """
+    try:
+        with sqlite3.connect(DB_FILE, check_same_thread=False, timeout=15) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT charge_point_id
+                FROM transactions
+                WHERE stop_timestamp IS NULL
+                  AND start_timestamp IS NOT NULL
+                """
+            )
+            rows = cur.fetchall()
+
+        active_cp_ids = []
+        for (cp_id,) in rows:
+            cp_id = _normalize_cp_id(str(cp_id))
+            if cp_id not in active_cp_ids:
+                active_cp_ids.append(cp_id)
+
+        # 僅保留目前仍在線的樁
+        active_cp_ids = [cp_id for cp_id in active_cp_ids if cp_id in connected_charge_points]
+
+        return active_cp_ids
+
+    except Exception as e:
+        logging.exception(f"[SMART][ACTIVE_CP_IDS][ERR] err={e}")
+        return []
 
 def get_active_charging_count():
     """
-    取得目前「正在充電中的車輛數」
+    取得目前「真正有效參與 Smart Charging」的車輛數
 
     判定依據：
-    - stop_timestamp IS NULL
-    - start_timestamp IS NOT NULL
+    1. transactions 內仍為 active
+    2. 該 CP 目前仍在線（connected_charge_points）
     """
-
-    with sqlite3.connect(DB_FILE, check_same_thread=False, timeout=15) as conn:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT COUNT(*)
-            FROM transactions
-            WHERE stop_timestamp IS NULL
-              AND start_timestamp IS NOT NULL
-        """
-        )
-        row = cur.fetchone()
-
     try:
-        return int(row[0] or 0)
+        return len(get_effective_active_cp_ids())
     except Exception:
         return 0
 
@@ -6066,7 +6092,9 @@ def api_get_community_settings():
     try:
         cfg = get_community_settings()
 
-        active_count = get_active_charging_count()
+        # ✅ 改用真實有效 active CP 清單
+        active_cp_ids = get_effective_active_cp_ids()
+        active_count = len(active_cp_ids)
 
         total_current_a = 0.0
         max_cars_by_min = 0
@@ -6079,10 +6107,11 @@ def api_get_community_settings():
             max_cars_by_min = int(total_current_a // cfg["min_current_a"])
 
             try:
-                active_cp_ids = [f"ACTIVE_CP_{i+1}" for i in range(active_count)] if active_count > 0 else []
+                # ✅ 改用真實 active cp_id 清單，不再用假的 ACTIVE_CP_1...
                 allocated_power_kw = calculate_allocated_power_kw_by_cp_ids(active_cp_ids)
 
-                # 這裡沒有指定真實 cp_id，因此用 community 電壓作 preview
+                # ✅ 社區總覽維持用 community 電壓做 preview
+                #    這代表它是「社區平均預估值」，不是單樁即時值
                 preview_current_a = (
                     convert_power_kw_to_current_a(allocated_power_kw, None)
                     if allocated_power_kw is not None
@@ -6090,28 +6119,28 @@ def api_get_community_settings():
                 )
 
                 if active_count > 0 and allocated_power_kw is None:
-                    blocked_reason = "avg_power_below_min_threshold"
+                    blocked_reason = "contract_kw_invalid"
 
             except Exception as e:
-                logging.exception(f"[COMMUNITY_SETTINGS][CALC_ERR] {e}")
-                allocated_power_kw = None
-                preview_current_a = None
-                blocked_reason = "calculate_allocated_power_error"
+                logging.exception(f"[COMMUNITY_SETTINGS][ALLOC_ERR] {e}")
 
         return {
-            **cfg,
+            "enabled": bool(cfg["enabled"]),
+            "contract_kw": float(cfg["contract_kw"]),
+            "voltage_v": float(cfg["voltage_v"]),
+            "phases": int(cfg["phases"]),
+            "min_current_a": float(cfg["min_current_a"]),
+            "max_current_a": float(cfg["max_current_a"]),
             "managed_by": "power",
             "single_cp_max_power_kw": float(SINGLE_CP_MAX_POWER_KW),
             "active_charging_count": int(active_count),
+            "active_cp_ids": active_cp_ids,   # ✅ 新增，方便前端或 debug 確認
+            "total_current_a": round(float(total_current_a), 2),
+            "max_cars_by_min": int(max_cars_by_min),
             "allocated_power_kw": allocated_power_kw,
             "preview_current_a": preview_current_a,
             "blocked_reason": blocked_reason,
-            "total_current_a": round(total_current_a, 2),
-            "max_cars_by_min": int(max_cars_by_min),
-            # 舊欄位先保留為相容，避免前端還沒改完就壞掉
-            "allowed_current_a": preview_current_a,
         }
-
     except Exception as e:
         logging.exception(f"[COMMUNITY_SETTINGS][ERR] {e}")
         raise HTTPException(status_code=500, detail=str(e))
