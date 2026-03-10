@@ -661,7 +661,7 @@ def debug_start_transaction_check(
                 "cp_id": cp_norm,
                 "idTag": id_tag,
                 "decision": "Blocked",
-                "reason": "avg_power_below_min_threshold",
+                "reason": "contract_kw_invalid",
                 "balance": balance,
                 "active_now": active_now,
                 "trial_count": trial_count,
@@ -1017,18 +1017,17 @@ def _live_voltage_v(cp_id: str, fallback_v: float = 220.0) -> float:
 
 def calculate_allocated_power_kw_by_cp_ids(active_cp_ids: list[str]):
     """
-    第一階段：改用功率作為管理主體
+    社區功率平均分配（不再限制最低充電電流門檻）
     ------------------------------------------------
     規則：
     1. 以 community_settings.contract_kw 作為社區總可分配功率
     2. 對 active_cp_ids 平均分配
     3. 每台上限固定 SINGLE_CP_MAX_POWER_KW
-    4. 若平均分配後低於最低可充門檻，回傳 None
-       （最低可充門檻仍沿用 min_current_a 轉換而來）
+    4. 不再因為低於 min_current_a 而阻擋啟動或停止下發
     ------------------------------------------------
     回傳：
     - float：每台應分配功率（kW）
-    - None：代表低於最低可充門檻，不建議啟動 / 不下發
+    - None：僅代表 contract_kw 無效
     """
 
     cfg = get_community_settings()
@@ -1040,24 +1039,10 @@ def calculate_allocated_power_kw_by_cp_ids(active_cp_ids: list[str]):
     if not active_cp_ids:
         return round(float(SINGLE_CP_MAX_POWER_KW), 3)
 
-    fallback_v = float(cfg.get("voltage_v") or 220)
-    min_a = float(cfg.get("min_current_a") or 16)
-
-    # 最低可充門檻：沿用既有 min_current_a，但轉成功率判斷
-    min_power_kw_list = []
-    for cp_id in active_cp_ids:
-        v = _live_voltage_v(cp_id, fallback_v)
-        min_power_kw_list.append((v * min_a) / 1000.0)
-
-    if not min_power_kw_list:
-        return None
-
-    required_min_kw = max(min_power_kw_list)
-
     avg_kw = contract_kw / max(1, len(active_cp_ids))
     allocated_kw = min(float(avg_kw), float(SINGLE_CP_MAX_POWER_KW))
 
-    if allocated_kw < required_min_kw:
+    if allocated_kw <= 0:
         return None
 
     return round(float(allocated_kw), 3)
@@ -1097,17 +1082,15 @@ def convert_power_kw_to_current_a(power_kw: float, cp_id: str | None = None):
     except Exception:
         return None
 
-
 def calculate_allowed_current_by_cp_ids(active_cp_ids: list[str]):
     """
-    舊版相容函式（第一階段暫時保留）
+    舊版相容函式（保留）
     ------------------------------------------------
-    舊邏輯：以 ΣV 封頂契約功率，計算每台共同 allowed_A
-    新邏輯已改由：
-        calculate_allocated_power_kw_by_cp_ids()
-        convert_power_kw_to_current_a()
+    舊邏輯曾使用 min_current_a 作為最低門檻，
+    目前已改為：不再因低於最低電流而阻擋。
     ------------------------------------------------
-    目前保留此函式，避免其他舊段落尚未替換前直接壞掉。
+    這裡僅依契約容量 / 電壓總和換算共同 allowed_A，
+    再套每樁上限與硬體上限。
     """
     cfg = get_community_settings()
 
@@ -1115,7 +1098,6 @@ def calculate_allowed_current_by_cp_ids(active_cp_ids: list[str]):
     if contract_kw <= 0:
         return None
 
-    min_a = float(cfg.get("min_current_a") or 16)
     per_cp_max_a = float(cfg.get("max_current_a") or DEVICE_HARD_LIMIT)
 
     if not active_cp_ids:
@@ -1132,7 +1114,7 @@ def calculate_allowed_current_by_cp_ids(active_cp_ids: list[str]):
     total_w = contract_kw * 1000.0
     allowed_a = total_w / sum_v
 
-    if allowed_a < min_a:
+    if allowed_a <= 0:
         return None
 
     allowed_a = min(float(allowed_a), float(per_cp_max_a), float(DEVICE_HARD_LIMIT))
