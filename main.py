@@ -30,6 +30,16 @@ current_limit_state = {}
 #   }
 # }
 
+# 每支充電樁各自一把 lock，避免同一台 CP 的 OCPP call 併發衝突
+cp_call_locks = {}
+
+
+def get_cp_call_lock(cp_id: str):
+    lock = cp_call_locks.get(cp_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        cp_call_locks[cp_id] = lock
+    return lock
 
 import sys
 
@@ -274,23 +284,21 @@ async def send_current_limit_profile(
         f"type(call_fn)={type(cp.call)}"
     )
 
+
     # =====================================================
-    # [3] 嘗試送出（DISPATCH，不等待回應）
+    # [3] 嘗試送出（同一支 CP 必須序列化）
     # =====================================================
-    logging.error(
-        f"[LIMIT][SEND][TRY] " f"| cp_id={cp_id} | tx_id={tx_id} | limit={limit_a}A"
-    )
+    lock = get_cp_call_lock(cp_id)
 
     try:
-        # =================================================
-        # [4] 送出 SetChargingProfile，並等待樁端回應
-        # =================================================
-        logging.error(
-            f"[LIMIT][SEND][TRY] " f"| cp_id={cp_id} | tx_id={tx_id} | limit={limit_a}A"
-        )
+        async with lock:
+            logging.error(
+                f"[LIMIT][SEND][TRY] "
+                f"| cp_id={cp_id} | tx_id={tx_id} | limit={limit_a}A"
+            )
 
-        # ✅ 等待樁端回應（加 timeout，避免卡死）
-        resp = await asyncio.wait_for(cp.call(payload), timeout=60.0)
+            # ✅ 等待樁端回應（加 timeout，避免卡死）
+            resp = await asyncio.wait_for(cp.call(payload), timeout=60.0)
 
         # OCPP 1.6 標準回傳通常有 status
         status = getattr(resp, "status", None)
@@ -303,7 +311,10 @@ async def send_current_limit_profile(
             or status_low.endswith("_accepted")
         )
 
-        logging.error(f"[LIMIT][SEND][RESP-RAW] cp_id={cp_id} | resp={repr(resp)} | type={type(resp)}")
+        logging.error(
+            f"[LIMIT][SEND][RESP-RAW] "
+            f"cp_id={cp_id} | resp={repr(resp)} | type={type(resp)}"
+        )
 
         now_iso = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
         st = current_limit_state.setdefault(cp_id, {})
@@ -312,7 +323,11 @@ async def send_current_limit_profile(
                 "requested_limit_a": float(limit_a),
                 "requested_at": now_iso,
                 "applied": ok,
+                "last_try_at": now_iso,
+                "last_ok_at": now_iso if ok else None,
+                "last_err_at": None if ok else now_iso,
                 "last_tx_id": tx_id,
+                "last_connector_id": connector_id,
                 "last_error": None if ok else f"status={status_str}",
             }
         )
@@ -321,6 +336,7 @@ async def send_current_limit_profile(
             f"[LIMIT][SEND][RESP] "
             f"| cp_id={cp_id} | tx_id={tx_id} | status={status_str} | applied={ok}"
         )
+        return ok
 
     except asyncio.TimeoutError:
         now_iso = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
@@ -330,8 +346,12 @@ async def send_current_limit_profile(
                 "requested_limit_a": float(limit_a),
                 "requested_at": now_iso,
                 "applied": False,
+                "last_try_at": now_iso,
+                "last_ok_at": None,
+                "last_err_at": now_iso,
                 "last_tx_id": tx_id,
-                "last_error": "timeout>10s",
+                "last_connector_id": connector_id,
+                "last_error": "timeout>60s",
             }
         )
 
@@ -339,6 +359,7 @@ async def send_current_limit_profile(
             f"[LIMIT][SEND][TIMEOUT] "
             f"| cp_id={cp_id} | tx_id={tx_id} | limit={limit_a}A"
         )
+        return False
 
     except Exception as e:
         now_iso = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
@@ -348,56 +369,21 @@ async def send_current_limit_profile(
                 "requested_limit_a": float(limit_a),
                 "requested_at": now_iso,
                 "applied": False,
+                "last_try_at": now_iso,
+                "last_ok_at": None,
+                "last_err_at": now_iso,
                 "last_tx_id": tx_id,
+                "last_connector_id": connector_id,
                 "last_error": repr(e),
             }
         )
 
         logging.exception(
-            f"[LIMIT][SEND][ERR] " f"| cp_id={cp_id} | tx_id={tx_id} | err={e}"
+            f"[LIMIT][SEND][ERR] "
+            f"| cp_id={cp_id} | tx_id={tx_id} | error={e}"
         )
+        return False
 
-        # ====== ✅ 記錄後端「已送出限流指令」狀態 ======
-        now_iso = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
-        st = current_limit_state.setdefault(cp_id, {})
-        st.update(
-            {
-                "requested_limit_a": float(limit_a),
-                "requested_at": now_iso,
-                "applied": False,  # ⚠️ 尚未確認樁端套用
-                "last_try_at": now_iso,
-                "last_ok_at": None,
-                "last_tx_id": int(tx_id) if tx_id else None,
-                "last_connector_id": int(connector_id) if connector_id else None,
-                "last_error": None,
-            }
-        )
-        # ========================================================
-
-        return
-
-    except Exception as e:
-        # =================================================
-        # [5] 失敗（ERR）
-        # =================================================
-        logging.exception(
-            f"[LIMIT][SEND][ERR] " f"| cp_id={cp_id} | tx_id={tx_id} | err={e}"
-        )
-
-        # ====== ❌ 記錄限流失敗原因 ======
-        now_iso = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
-        st = current_limit_state.setdefault(cp_id, {})
-        st.update(
-            {
-                "applied": False,
-                "last_try_at": now_iso,
-                "last_err_at": now_iso,
-                "last_error": str(e),
-            }
-        )
-        # ======================================
-
-        raise
 
 
 # === 時區設定: 台北 ===
