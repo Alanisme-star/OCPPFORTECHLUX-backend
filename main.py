@@ -936,6 +936,17 @@ async def websocket_endpoint(websocket: WebSocket, charge_point_id: str):
         except Exception as e:
             logger.exception(f"[LIVE][WS_DISCONNECT][ERR] cp_id={cp_norm} | err={e}")
 
+        # ==================================================
+        # 7) WebSocket 中斷後，重新對剩餘 active 充電樁做 Rebalance
+        # ==================================================
+        try:
+            await rebalance_all_charging_points(reason="ws_disconnect")
+            logger.warning(f"[SMART][WS_DISCONNECT][REBALANCE_OK] cp_id={cp_norm}")
+        except Exception as e:
+            logger.exception(
+                f"[SMART][WS_DISCONNECT][REBALANCE_ERR] cp_id={cp_norm} | err={e}"
+            )
+
 
 # 初始化狀態儲存
 # charging_point_status = {}
