@@ -11,6 +11,13 @@ connected_charge_points = {}
 live_status_cache = {}
 
 # ===============================
+# 🔌 WebSocket 斷線寬限（實體樁 / 弱網環境保護）
+# ===============================
+WS_DISCONNECT_GRACE_SECONDS = int(os.getenv("WS_DISCONNECT_GRACE_SECONDS", "60"))
+pending_ws_disconnect_tasks = {}
+ws_disconnect_grace = {}
+
+# ===============================
 # 🔌 SmartCharging / 限流狀態（後端真實控制狀態）
 # ===============================
 current_limit_state = {}
@@ -56,6 +63,56 @@ def is_cp_connection_alive(cp_id: str, cp_obj=None) -> bool:
         return False
 
     return True
+
+
+def is_cp_in_ws_disconnect_grace(cp_id: str) -> bool:
+    info = ws_disconnect_grace.get(cp_id)
+    if not info:
+        return False
+
+    try:
+        expire_at = float(info.get("expire_at", 0))
+    except Exception:
+        expire_at = 0
+
+    if expire_at <= time.time():
+        ws_disconnect_grace.pop(cp_id, None)
+        return False
+
+    return True
+
+
+def is_cp_effectively_available_for_allocation(cp_id: str) -> bool:
+    return cp_id in connected_charge_points or is_cp_in_ws_disconnect_grace(cp_id)
+
+
+def cancel_ws_disconnect_cleanup(cp_id: str):
+    task = pending_ws_disconnect_tasks.pop(cp_id, None)
+    if task:
+        task.cancel()
+
+    if ws_disconnect_grace.pop(cp_id, None) is not None:
+        logger.warning(f"[WS_RECONNECT][GRACE_CANCEL] cp_id={cp_id}")
+
+
+async def finalize_ws_disconnect_cleanup(cp_norm: str):
+    try:
+        await asyncio.sleep(WS_DISCONNECT_GRACE_SECONDS)
+
+        if cp_norm in connected_charge_points:
+            logger.warning(
+                f"[WS_DISCONNECT][GRACE_SKIP] cp_id={cp_norm} | reason=reconnected_in_time"
+            )
+            return
+
+        # Grace 到期後，才真正 auto-stop / unavailable / reset / rebalance
+        ...
+    except asyncio.CancelledError:
+        logger.warning(f"[WS_DISCONNECT][GRACE_CANCELLED] cp_id={cp_norm}")
+        raise
+    finally:
+        pending_ws_disconnect_tasks.pop(cp_norm, None)
+        ws_disconnect_grace.pop(cp_norm, None)
 
 import sys
 
@@ -949,8 +1006,9 @@ async def websocket_endpoint(websocket: WebSocket, charge_point_id: str):
 
         # 2) 啟動 OCPP handler
         cp = ChargePoint(cp_id, FastAPIWebSocketAdapter(websocket))
-        cp.supports_smart_charging = True  # 模擬器/開發環境建議直接 True
+        cp.supports_smart_charging = True
         connected_charge_points[cp_id] = cp
+        cancel_ws_disconnect_cleanup(cp_id)
         await cp.start()
 
     except WebSocketDisconnect:
@@ -967,9 +1025,72 @@ async def websocket_endpoint(websocket: WebSocket, charge_point_id: str):
         cp_norm = _normalize_cp_id(charge_point_id)
 
         # ==================================================
-        # 3) 移除 WebSocket 連線
+        # 3) 移除 WebSocket 連線（但先進入 grace，不立刻 auto-stop）
         # ==================================================
         connected_charge_points.pop(cp_norm, None)
+
+        try:
+            now = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
+            expire_at = time.time() + float(WS_DISCONNECT_GRACE_SECONDS)
+
+            ws_disconnect_grace[cp_norm] = {
+                "started_at": time.time(),
+                "expire_at": expire_at,
+                "started_at_iso": now,
+            }
+
+            with sqlite3.connect(DB_FILE, check_same_thread=False) as conn:
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    INSERT INTO status_logs
+                    (charge_point_id, connector_id, status, timestamp)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (cp_norm, 0, "Unavailable", now),
+                )
+                conn.commit()
+
+            charging_point_status[cp_norm] = {
+                "connector_id": 0,
+                "status": "Unavailable",
+                "timestamp": now,
+                "error_code": "ConnectionLost",
+                "derived": True,
+                "grace_seconds": WS_DISCONNECT_GRACE_SECONDS,
+            }
+
+            prev = live_status_cache.get(cp_norm, {})
+            live_status_cache[cp_norm] = {
+                **prev,
+                "status": "Unavailable",
+                "derived": True,
+                "ws_grace_until": expire_at,
+                "updated_at": time.time(),
+            }
+
+            logger.warning(
+                f"[WS_DISCONNECT][GRACE_START] cp_id={cp_norm} | grace_seconds={WS_DISCONNECT_GRACE_SECONDS}"
+            )
+
+            old_task = pending_ws_disconnect_tasks.pop(cp_norm, None)
+            if old_task:
+                old_task.cancel()
+
+            pending_ws_disconnect_tasks[cp_norm] = asyncio.create_task(
+                finalize_ws_disconnect_cleanup(cp_norm)
+            )
+
+        except Exception as e:
+            logger.exception(f"[WS_DISCONNECT][GRACE_START][ERR] cp_id={cp_norm} | err={e}")
+
+        try:
+            await rebalance_all_charging_points(reason="ws_disconnect_grace")
+            logger.warning(f"[SMART][WS_DISCONNECT][GRACE_REBALANCE_OK] cp_id={cp_norm}")
+        except Exception as e:
+            logger.exception(
+                f"[SMART][WS_DISCONNECT][REBALANCE_ERR] cp_id={cp_norm} | err={e}"
+            )
 
         # ==================================================
         # 4) WebSocket 中斷時，自動結束未完成交易（DB）
@@ -1306,7 +1427,7 @@ def get_effective_active_cp_ids():
                 active_cp_ids.append(cp_id)
 
         # 僅保留目前仍在線的樁
-        active_cp_ids = [cp_id for cp_id in active_cp_ids if cp_id in connected_charge_points]
+        active_cp_ids = [cp_id for cp_id in active_cp_ids if is_cp_effectively_available_for_allocation(cp_id)]
 
         return active_cp_ids
 
@@ -1363,7 +1484,7 @@ async def rebalance_all_charging_points(reason: str):
                 active_cp_ids.append(cp_id)
 
         # 只算仍連線的 active CP
-        active_cp_ids = [cid for cid in active_cp_ids if cid in connected_charge_points]
+        active_cp_ids = [cid for cid in active_cp_ids if is_cp_effectively_available_for_allocation(cid)]
 
         allocated_kw = calculate_allocated_power_kw_by_cp_ids(active_cp_ids)
 
