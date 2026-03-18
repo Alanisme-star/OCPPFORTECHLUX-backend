@@ -1197,16 +1197,18 @@ def calculate_allocated_power_kw_by_cp_ids(active_cp_ids: list[str]):
 
     return round(float(allocated_kw), 3)
 
-
 def convert_power_kw_to_current_a(power_kw: float, cp_id: str | None = None):
     """
     將功率(kW)換算成電流(A)
-    - 優先使用該 cp_id 的即時電壓
-    - 若取不到，回退到 community_settings.voltage_v
-    - 最後再套 DEVICE_HARD_LIMIT
+
+    【社區功率控制正式規則】
+    - 一律使用 community_settings.voltage_v 作為固定控制基準電壓
+    - 不再使用單樁即時電壓參與控制換算
+    - 這樣可避免因現場電壓浮動，導致 limit_a 跟著抖動
+    - cp_id 參數保留僅為相容既有呼叫，不再參與換算
     """
     cfg = get_community_settings()
-    fallback_v = float(cfg.get("voltage_v") or 220)
+    control_voltage_v = float(cfg.get("voltage_v") or 220)
 
     try:
         power_kw = float(power_kw)
@@ -1217,30 +1219,27 @@ def convert_power_kw_to_current_a(power_kw: float, cp_id: str | None = None):
         return 0.0
 
     try:
-        if cp_id:
-            voltage_v = _live_voltage_v(cp_id, fallback_v)
-        else:
-            voltage_v = fallback_v
-
-        if voltage_v <= 0:
+        if control_voltage_v <= 0:
             return None
 
-        current_a = (power_kw * 1000.0) / voltage_v
+        current_a = (power_kw * 1000.0) / control_voltage_v
         current_a = min(float(current_a), float(DEVICE_HARD_LIMIT))
         return round(current_a, 2)
 
     except Exception:
         return None
 
+
+
+
 def calculate_allowed_current_by_cp_ids(active_cp_ids: list[str]):
     """
     舊版相容函式（保留）
-    ------------------------------------------------
-    舊邏輯曾使用 min_current_a 作為最低門檻，
-    目前已改為：不再因低於最低電流而阻擋。
-    ------------------------------------------------
-    這裡僅依契約容量 / 電壓總和換算共同 allowed_A，
-    再套每樁上限與硬體上限。
+
+    【統一控制邏輯】
+    - 一律使用 community_settings.voltage_v 作為固定控制基準電壓
+    - 不再使用各樁即時電壓總和計算 allowed_A
+    - 回傳值代表：若所有 active CP 平均分攤契約容量時，每樁理論可下發的電流
     """
     cfg = get_community_settings()
 
@@ -1249,26 +1248,28 @@ def calculate_allowed_current_by_cp_ids(active_cp_ids: list[str]):
         return None
 
     per_cp_max_a = float(cfg.get("max_current_a") or DEVICE_HARD_LIMIT)
+    control_voltage_v = float(cfg.get("voltage_v") or 220)
+
+    if control_voltage_v <= 0:
+        return None
 
     if not active_cp_ids:
-        return DEVICE_HARD_LIMIT
+        return min(float(per_cp_max_a), float(DEVICE_HARD_LIMIT))
 
-    fallback_v = float(cfg.get("voltage_v") or 220)
+    cp_count = max(1, len(active_cp_ids))
+    allocated_kw = contract_kw / cp_count
 
-    voltages = [_live_voltage_v(cp_id, fallback_v) for cp_id in active_cp_ids]
-    sum_v = sum(voltages)
+    current_a = (allocated_kw * 1000.0) / control_voltage_v
 
-    if sum_v <= 0:
+    if current_a <= 0:
         return None
 
-    total_w = contract_kw * 1000.0
-    allowed_a = total_w / sum_v
+    current_a = min(float(current_a), float(per_cp_max_a), float(DEVICE_HARD_LIMIT))
+    return round(current_a, 2)
 
-    if allowed_a <= 0:
-        return None
 
-    allowed_a = min(float(allowed_a), float(per_cp_max_a), float(DEVICE_HARD_LIMIT))
-    return round(allowed_a, 2)
+
+
 
 def get_effective_active_cp_ids():
     """
@@ -6245,8 +6246,8 @@ def debug_current_limit_state(cp_id: str | None = Query(default=None)):
         requested_power_kw = None
         try:
             if requested_limit_a is not None:
-                voltage_v = _live_voltage_v(_cp_id, get_community_settings().get("voltage_v", 220))
-                requested_power_kw = round((float(requested_limit_a) * float(voltage_v)) / 1000.0, 3)
+                control_voltage_v = float(get_community_settings().get("voltage_v", 220) or 220)
+                requested_power_kw = round((float(requested_limit_a) * control_voltage_v) / 1000.0, 3)
         except Exception:
             requested_power_kw = None
 
