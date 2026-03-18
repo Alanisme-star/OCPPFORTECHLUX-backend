@@ -13,7 +13,16 @@ live_status_cache = {}
 # ===============================
 # 🔌 WebSocket 斷線寬限（實體樁 / 弱網環境保護）
 # ===============================
-WS_DISCONNECT_GRACE_SECONDS = int(os.getenv("WS_DISCONNECT_GRACE_SECONDS", "60"))
+def _get_ws_disconnect_grace_seconds() -> int:
+    raw = os.getenv("WS_DISCONNECT_GRACE_SECONDS", "60")
+    try:
+        value = int(str(raw).strip())
+        return max(0, value)
+    except Exception:
+        return 60
+
+
+WS_DISCONNECT_GRACE_SECONDS = _get_ws_disconnect_grace_seconds()
 pending_ws_disconnect_tasks = {}
 ws_disconnect_grace = {}
 
