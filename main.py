@@ -41,6 +41,22 @@ def get_cp_call_lock(cp_id: str):
         cp_call_locks[cp_id] = lock
     return lock
 
+
+def is_cp_connection_alive(cp_id: str, cp_obj=None) -> bool:
+    """
+    檢查這支 CP 是否仍為目前有效連線
+    - cp_id 必須仍存在於 connected_charge_points
+    - 若提供 cp_obj，還必須是同一個物件，避免舊物件 race condition
+    """
+    current_cp = connected_charge_points.get(cp_id)
+    if current_cp is None:
+        return False
+
+    if cp_obj is not None and current_cp is not cp_obj:
+        return False
+
+    return True
+
 import sys
 
 sys.path.insert(0, "./")
@@ -287,20 +303,91 @@ async def send_current_limit_profile(
 
     # =====================================================
     # [3] 嘗試送出（同一支 CP 必須序列化）
+    #     送出前 / 送出中 都要再次確認仍為有效連線
     # =====================================================
     lock = get_cp_call_lock(cp_id)
 
+    # 先做一次快速檢查：若已不在線，直接跳過
+    if not is_cp_connection_alive(cp_id, cp):
+        now_iso = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
+        st = current_limit_state.setdefault(cp_id, {})
+        st.update(
+            {
+                "requested_limit_a": float(limit_a),
+                "requested_at": now_iso,
+                "applied": False,
+                "last_try_at": now_iso,
+                "last_ok_at": None,
+                "last_err_at": now_iso,
+                "last_tx_id": tx_id,
+                "last_connector_id": connector_id,
+                "last_error": "cp_disconnected_before_send",
+            }
+        )
+
+        logging.warning(
+            f"[LIMIT][SKIP][DISCONNECTED] "
+            f"| cp_id={cp_id} | tx_id={tx_id} | limit={limit_a}A"
+        )
+        return False
+
     try:
         async with lock:
+            # 進 lock 後再檢查一次，避免排隊期間該樁已斷線
+            if not is_cp_connection_alive(cp_id, cp):
+                now_iso = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
+                st = current_limit_state.setdefault(cp_id, {})
+                st.update(
+                    {
+                        "requested_limit_a": float(limit_a),
+                        "requested_at": now_iso,
+                        "applied": False,
+                        "last_try_at": now_iso,
+                        "last_ok_at": None,
+                        "last_err_at": now_iso,
+                        "last_tx_id": tx_id,
+                        "last_connector_id": connector_id,
+                        "last_error": "cp_disconnected_before_locked_send",
+                    }
+                )
+
+                logging.warning(
+                    f"[LIMIT][SKIP][DISCONNECTED_AFTER_LOCK] "
+                    f"| cp_id={cp_id} | tx_id={tx_id} | limit={limit_a}A"
+                )
+                return False
+
             logging.error(
                 f"[LIMIT][SEND][TRY] "
                 f"| cp_id={cp_id} | tx_id={tx_id} | limit={limit_a}A"
             )
 
-            # ✅ 等待樁端回應（加 timeout，避免卡死）
             resp = await asyncio.wait_for(cp.call(payload), timeout=60.0)
 
-        # OCPP 1.6 標準回傳通常有 status
+        # 回應回來時，再確認一次這個 cp 仍是目前有效連線
+        if not is_cp_connection_alive(cp_id, cp):
+            now_iso = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
+            st = current_limit_state.setdefault(cp_id, {})
+            st.update(
+                {
+                    "requested_limit_a": float(limit_a),
+                    "requested_at": now_iso,
+                    "applied": False,
+                    "last_try_at": now_iso,
+                    "last_ok_at": None,
+                    "last_err_at": now_iso,
+                    "last_tx_id": tx_id,
+                    "last_connector_id": connector_id,
+                    "last_error": "cp_disconnected_after_send",
+                }
+            )
+
+            logging.warning(
+                f"[LIMIT][SKIP][DISCONNECTED_AFTER_SEND] "
+                f"| cp_id={cp_id} | tx_id={tx_id}"
+            )
+            return False
+
         status = getattr(resp, "status", None)
         status_str = str(status) if status is not None else "UNKNOWN"
 
@@ -358,6 +445,61 @@ async def send_current_limit_profile(
         logging.error(
             f"[LIMIT][SEND][TIMEOUT] "
             f"| cp_id={cp_id} | tx_id={tx_id} | limit={limit_a}A"
+        )
+        return False
+
+    except (WebSocketDisconnect, ConnectionClosedOK) as e:
+        now_iso = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
+        st = current_limit_state.setdefault(cp_id, {})
+        st.update(
+            {
+                "requested_limit_a": float(limit_a),
+                "requested_at": now_iso,
+                "applied": False,
+                "last_try_at": now_iso,
+                "last_ok_at": None,
+                "last_err_at": now_iso,
+                "last_tx_id": tx_id,
+                "last_connector_id": connector_id,
+                "last_error": f"ws_disconnected:{repr(e)}",
+            }
+        )
+
+        logging.warning(
+            f"[LIMIT][SEND][WS_CLOSED] "
+            f"| cp_id={cp_id} | tx_id={tx_id} | err={e}"
+        )
+        return False
+
+    except RuntimeError as e:
+        now_iso = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
+        st = current_limit_state.setdefault(cp_id, {})
+        err_text = str(e)
+
+        st.update(
+            {
+                "requested_limit_a": float(limit_a),
+                "requested_at": now_iso,
+                "applied": False,
+                "last_try_at": now_iso,
+                "last_ok_at": None,
+                "last_err_at": now_iso,
+                "last_tx_id": tx_id,
+                "last_connector_id": connector_id,
+                "last_error": err_text,
+            }
+        )
+
+        if "websocket.send" in err_text or "websocket.close" in err_text:
+            logging.warning(
+                f"[LIMIT][SEND][SKIP_RUNTIME_CLOSED] "
+                f"| cp_id={cp_id} | tx_id={tx_id} | err={err_text}"
+            )
+            return False
+
+        logging.exception(
+            f"[LIMIT][SEND][RUNTIME_ERR] "
+            f"| cp_id={cp_id} | tx_id={tx_id} | error={e}"
         )
         return False
 
@@ -435,7 +577,15 @@ class FastAPIWebSocketAdapter:
         return msg
 
     async def send(self, data):
-        await self.websocket.send_text(data)
+        try:
+            await self.websocket.send_text(data)
+        except (WebSocketDisconnect, ConnectionClosedOK):
+            raise
+        except RuntimeError as e:
+            # WebSocket 已 close / 已 completed 時，視為連線已失效
+            if "websocket.send" in str(e) or "websocket.close" in str(e):
+                raise WebSocketDisconnect(code=1006)
+            raise
 
     # ocpp 會取 subprotocol 屬性
     @property
@@ -1221,12 +1371,19 @@ async def rebalance_all_charging_points(reason: str):
 
         allocated_kw = float(allocated_kw)
 
-        for cp_id in active_cp_ids:
+        for cp_id in list(active_cp_ids):
             cp = connected_charge_points.get(cp_id)
             if not cp:
+                logging.warning(f"[SMART][SKIP][OFFLINE] cp_id={cp_id} | reason=no_connected_cp")
+                continue
+
+            # 再次確認這支 cp 仍是目前有效連線
+            if not is_cp_connection_alive(cp_id, cp):
+                logging.warning(f"[SMART][SKIP][STALE_CP] cp_id={cp_id}")
                 continue
 
             if getattr(cp, "supports_smart_charging", True) is False:
+                logging.warning(f"[SMART][SKIP][NO_SC] cp_id={cp_id}")
                 continue
 
             tx_id, connector_id = tx_map.get(cp_id, (None, 1))
@@ -1239,7 +1396,7 @@ async def rebalance_all_charging_points(reason: str):
                 continue
 
             try:
-                await send_current_limit_profile(
+                ok = await send_current_limit_profile(
                     cp=cp,
                     connector_id=int(connector_id or 1),
                     limit_a=float(limit_a),
@@ -1249,7 +1406,7 @@ async def rebalance_all_charging_points(reason: str):
                 logging.warning(
                     f"[SMART][FORCE_APPLY] "
                     f"cp_id={cp_id} | connector_id={connector_id} | tx_id={tx_id} | "
-                    f"allocated_kw={allocated_kw} | limit={limit_a}A"
+                    f"allocated_kw={allocated_kw} | limit={limit_a}A | ok={ok}"
                 )
 
             except Exception as e:
