@@ -151,10 +151,10 @@ async def send_current_limit_profile(
     # =====================================================
     # [1] 進入點（確認一定有進來）
     # =====================================================
-    logging.error(
-        f"[LIMIT][ENTER] send_current_limit_profile "
-        f"| cp_id={cp_id} | connector_id={connector_id} "
-        f"| tx_id={tx_id} | limit={limit_a}A"
+    logging.warning(
+        f"[LIMIT][ENTER] "
+        f"cp_id={cp_id} | connector_id={connector_id} | tx_id={tx_id} | "
+        f"requested_raw_limit_a={limit_a}A | device_hard_limit={DEVICE_HARD_LIMIT}A"
     )
 
 
@@ -224,9 +224,17 @@ async def send_current_limit_profile(
         if theory_a is not None:
             theory_a = float(theory_a)
 
+            logging.warning(
+                f"[LIMIT][THEORY] "
+                f"cp_id={cp_id} | tx_id={tx_id} | connector_id={connector_id} | "
+                f"active_cp_ids={active_cp_ids} | allocated_kw={allocated_kw} | "
+                f"raw_limit_a={raw_limit_a}A | theory_a={theory_a}A"
+            )
+
             if limit_a > theory_a:
                 logging.warning(
-                    f"[LIMIT][CLAMP] cp_id={cp_id} | "
+                    f"[LIMIT][CLAMP] "
+                    f"cp_id={cp_id} | tx_id={tx_id} | "
                     f"raw={raw_limit_a}A -> clamp={theory_a}A | "
                     f"allocated_kw={allocated_kw} | active_cp_ids={active_cp_ids}"
                 )
@@ -292,12 +300,10 @@ async def send_current_limit_profile(
     # =====================================================
     # [2.5] 🔍 DEBUG：確認 payload / call 型態（Step A）
     # =====================================================
-    logging.error(
-        f"[LIMIT][DEBUG] "
-        f"payload={payload} | "
-        f"type(payload)={type(payload)} | "
-        f"call_fn={cp.call} | "
-        f"type(call_fn)={type(cp.call)}"
+    logging.warning(
+        f"[LIMIT][PAYLOAD] "
+        f"cp_id={cp_id} | tx_id={tx_id} | connector_id={connector_id} | "
+        f"purpose={purpose} | final_limit_a={limit_a}A | payload={payload}"
     )
 
 
@@ -357,7 +363,7 @@ async def send_current_limit_profile(
                 )
                 return False
 
-            logging.error(
+            logging.warning(
                 f"[LIMIT][SEND][TRY] "
                 f"| cp_id={cp_id} | tx_id={tx_id} | limit={limit_a}A"
             )
@@ -398,7 +404,7 @@ async def send_current_limit_profile(
             or status_low.endswith("_accepted")
         )
 
-        logging.error(
+        logging.warning(
             f"[LIMIT][SEND][RESP-RAW] "
             f"cp_id={cp_id} | resp={repr(resp)} | type={type(resp)}"
         )
@@ -419,7 +425,7 @@ async def send_current_limit_profile(
             }
         )
 
-        logging.error(
+        logging.warning(
             f"[LIMIT][SEND][RESP] "
             f"| cp_id={cp_id} | tx_id={tx_id} | status={status_str} | applied={ok}"
         )
@@ -1397,6 +1403,11 @@ async def rebalance_all_charging_points(reason: str):
                 continue
 
             try:
+                logging.warning(
+                    f"[SMART][APPLY_PLAN] "
+                    f"reason={reason} | cp_id={cp_id} | tx_id={tx_id} | connector_id={connector_id} | "
+                    f"allocated_kw={allocated_kw} | planned_limit_a={limit_a}A"
+                )
                 ok = await send_current_limit_profile(
                     cp=cp,
                     connector_id=int(connector_id or 1),
@@ -3032,10 +3043,12 @@ class ChargePoint(OcppChargePoint):
                     theory_a = float(theory_a)
 
                     if float(batch_current) > theory_a + 0.5:  # 容忍 0.5A 誤差
-                        logging.error(
-                            f"[FORCE-CLAMP] cp_id={cp_id} | "
-                            f"measured={float(batch_current):.2f}A > theory={theory_a:.2f}A | "
-                            f"allocated_kw={allocated_kw} | active_cp_ids={active_cp_ids} | RE-SEND LIMIT"
+                        logging.warning(
+                            f"[FORCE-CLAMP] "
+                            f"cp_id={cp_id} | tx_id={transaction_id} | connector_id={connector_id} | "
+                            f"measured_current_a={float(batch_current):.2f} | theory_a={theory_a:.2f} | "
+                            f"measured_power_kw={batch_power_kw} | allocated_kw={allocated_kw} | "
+                            f"active_cp_ids={active_cp_ids} | action=re_send_limit"
                         )
 
                         await send_current_limit_profile(
