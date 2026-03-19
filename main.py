@@ -3306,6 +3306,23 @@ async def update_card_whitelist(card_id: str, data: dict = Body(...)):
     with get_conn() as conn:
         cur = conn.cursor()
 
+        # 卡片必須存在
+        cur.execute("SELECT 1 FROM cards WHERE card_id = ?", (card_id,))
+        if not cur.fetchone():
+            raise HTTPException(status_code=404, detail="card not found")
+
+        # 檢查所有 cp_id 都存在於 charge_points
+        for cp_id in allowed:
+            cur.execute(
+                "SELECT 1 FROM charge_points WHERE charge_point_id = ?",
+                (cp_id,),
+            )
+            if not cur.fetchone():
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"charge point not found: {cp_id}",
+                )
+
         # 清掉舊白名單
         cur.execute("DELETE FROM card_whitelist WHERE card_id = ?", (card_id,))
 
@@ -5585,18 +5602,23 @@ def get_cards():
 
 @app.get("/api/charge-points")
 async def list_charge_points():
-    cursor.execute(
-        "SELECT id, charge_point_id, name, status, created_at, max_current_a FROM charge_points"
-    )
-    rows = cursor.fetchall()
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id, charge_point_id, name, status, created_at, max_current_a
+            FROM charge_points
+            """
+        )
+        rows = cur.fetchall()
+
     return [
         {
             "id": r[0],
-            "chargePointId": r[1],  # 注意：這是駝峰命名，對應前端
+            "chargePointId": r[1],
             "name": r[2],
             "status": r[3],
             "createdAt": r[4],
-            # ⭐ 關鍵修正：把最大電流回傳給前端
             "maxCurrent": r[5],
         }
         for r in rows
@@ -5605,12 +5627,12 @@ async def list_charge_points():
 
 @app.post("/api/charge-points")
 async def add_charge_point(data: dict = Body(...)):
-    print("🔥 payload=", data)  # 新增，除錯用
-    cp_id = data.get("chargePointId") or data.get("charge_point_id")
-    name = data.get("name", "")
-    status = (data.get("status") or "enabled").lower()
+    print("🔥 payload=", data)
 
-    # ★ 修正：前端新增送的是 maxCurrent，仍保留相容 maxCurrentA / max_current_a
+    cp_id = (data.get("chargePointId") or data.get("charge_point_id") or "").strip()
+    name = (data.get("name") or "").strip()
+    status = str(data.get("status") or "enabled").lower().strip()
+
     max_current_a = (
         data.get("maxCurrent")
         or data.get("maxCurrentA")
@@ -5620,26 +5642,54 @@ async def add_charge_point(data: dict = Body(...)):
     try:
         max_current_a = float(max_current_a)
     except Exception:
-        max_current_a = 16
+        max_current_a = 16.0
 
     if not cp_id:
         raise HTTPException(status_code=400, detail="chargePointId is required")
+
     try:
-        cursor.execute(
-            "INSERT INTO charge_points (charge_point_id, name, status, max_current_a) VALUES (?, ?, ?, ?)",
-            (cp_id, name, status, max_current_a),
-        )
-        conn.commit()
-        print(f"✅ 新增白名單到資料庫: {cp_id}, {name}, {status}")  # 新增，除錯用
-        cursor.execute("SELECT * FROM charge_points")
-        print("所有白名單=", cursor.fetchall())  # 新增，除錯用
-        return {"message": "新增成功"}
+        with get_conn() as conn:
+            cur = conn.cursor()
+
+            cur.execute(
+                """
+                INSERT INTO charge_points (charge_point_id, name, status, max_current_a)
+                VALUES (?, ?, ?, ?)
+                """,
+                (cp_id, name, status, max_current_a),
+            )
+            conn.commit()
+
+            cur.execute(
+                """
+                SELECT id, charge_point_id, name, status, created_at, max_current_a
+                FROM charge_points
+                WHERE charge_point_id = ?
+                """,
+                (cp_id,),
+            )
+            row = cur.fetchone()
+
+        print(f"✅ 新增白名單到資料庫: {cp_id}, {name}, {status}")
+
+        return {
+            "message": "新增成功",
+            "item": {
+                "id": row[0],
+                "chargePointId": row[1],
+                "name": row[2],
+                "status": row[3],
+                "createdAt": row[4],
+                "maxCurrent": row[5],
+            },
+        }
+
     except sqlite3.IntegrityError as e:
         print("❌ IntegrityError:", e)
         raise HTTPException(status_code=409, detail="充電樁已存在")
     except Exception as e:
         print("❌ 其他新增錯誤:", e)
-        raise HTTPException(status_code=500, detail="內部錯誤")
+        raise HTTPException(status_code=500, detail=f"內部錯誤: {e}")
 
 
 @app.put("/api/charge-points/{cp_id}")
@@ -5691,10 +5741,12 @@ async def update_charge_point(cp_id: str = Path(...), data: dict = Body(...)):
 
 @app.delete("/api/charge-points/{cp_id}")
 async def delete_charge_point(cp_id: str = Path(...)):
-    cursor.execute("DELETE FROM charge_points WHERE charge_point_id = ?", (cp_id,))
-    conn.commit()
-    return {"message": "已刪除"}
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM charge_points WHERE charge_point_id = ?", (cp_id,))
+        conn.commit()
 
+    return {"message": "已刪除"}
 
 
 @app.put("/api/cards/{card_id}")
