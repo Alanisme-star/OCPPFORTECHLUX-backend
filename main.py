@@ -160,12 +160,12 @@ from reportlab.pdfgen import canvas
 # 🔌 WebSocket 斷線寬限（實體樁 / 弱網環境保護）
 # ===============================
 def _get_ws_disconnect_grace_seconds() -> int:
-    raw = os.getenv("WS_DISCONNECT_GRACE_SECONDS", "60")
+    raw = os.getenv("WS_DISCONNECT_GRACE_SECONDS", "120")
     try:
         value = int(str(raw).strip())
         return max(0, value)
     except Exception:
-        return 60
+        return 120
 
 
 WS_DISCONNECT_GRACE_SECONDS = _get_ws_disconnect_grace_seconds()
@@ -4547,26 +4547,54 @@ def save_default_pricing_rules(data: dict):
     return {"status": "ok"}
 
 
-# === 刪除卡片（完整刪除 id_tags + cards + card_whitelist） ===
+# === 刪除卡片（完整刪除：card_whitelist + card_owners + cards + id_tags） ===
 @app.delete("/api/cards/{id_tag}")
 async def delete_card(id_tag: str):
     try:
         with get_conn() as conn:
             cur = conn.cursor()
 
+            # 先檢查卡片是否存在（任一表存在都算）
+            cur.execute(
+                """
+                SELECT 1
+                FROM id_tags
+                WHERE id_tag = ?
+                UNION
+                SELECT 1
+                FROM cards
+                WHERE card_id = ?
+                UNION
+                SELECT 1
+                FROM card_owners
+                WHERE card_id = ?
+                LIMIT 1
+                """,
+                (id_tag, id_tag, id_tag),
+            )
+            exists = cur.fetchone()
+
+            if not exists:
+                raise HTTPException(status_code=404, detail="card not found")
+
             # 刪除白名單
             cur.execute("DELETE FROM card_whitelist WHERE card_id = ?", (id_tag,))
+
+            # 刪除住戶名稱
+            cur.execute("DELETE FROM card_owners WHERE card_id = ?", (id_tag,))
 
             # 刪除餘額卡片資料
             cur.execute("DELETE FROM cards WHERE card_id = ?", (id_tag,))
 
-            # 刪除 id_tags 主表（最重要）
+            # 刪除 id_tags 主表
             cur.execute("DELETE FROM id_tags WHERE id_tag = ?", (id_tag,))
 
             conn.commit()
 
         return {"message": f"Card {id_tag} deleted"}
 
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -5007,7 +5035,7 @@ async def list_id_tags():
 async def add_id_tag(data: dict = Body(...)):
     print("📥 收到新增卡片資料：", data)
 
-    id_tag = data.get("idTag")
+    id_tag = (data.get("idTag") or "").strip()
     status = data.get("status", "Accepted")
     valid_until = data.get("validUntil", "2099-12-31T23:59:59")
 
@@ -5016,7 +5044,6 @@ async def add_id_tag(data: dict = Body(...)):
         raise HTTPException(status_code=400, detail="idTag is required")
 
     try:
-        # ✅ 解析格式（允許無秒的 ISO 格式）
         valid_dt = parse_date(valid_until)
         valid_str = valid_dt.strftime("%Y-%m-%dT%H:%M:%S")
     except Exception as e:
@@ -5024,17 +5051,23 @@ async def add_id_tag(data: dict = Body(...)):
         raise HTTPException(status_code=400, detail="Invalid validUntil format")
 
     try:
-        cursor.execute(
-            "INSERT INTO id_tags (id_tag, status, valid_until) VALUES (?, ?, ?)",
-            (id_tag, status, valid_str),
-        )
-        conn.commit()
+        with get_conn() as conn:
+            cur = conn.cursor()
+
+            cur.execute(
+                "INSERT INTO id_tags (id_tag, status, valid_until) VALUES (?, ?, ?)",
+                (id_tag, status, valid_str),
+            )
+
+            cur.execute(
+                "INSERT OR IGNORE INTO cards (card_id, balance) VALUES (?, ?)",
+                (id_tag, 0),
+            )
+
+            conn.commit()
+
         print(f"✅ 已成功新增卡片：{id_tag}, {status}, {valid_str}")
-        # ⬇️ 新增這一行：如果卡片不存在於 cards，則自動新增餘額帳戶（初始餘額0元）
-        cursor.execute(
-            "INSERT OR IGNORE INTO cards (card_id, balance) VALUES (?, ?)", (id_tag, 0)
-        )
-        conn.commit()
+        return {"message": "Added successfully"}
 
     except sqlite3.IntegrityError as e:
         print(f"❌ 資料庫重複錯誤：{e}")
@@ -5042,8 +5075,6 @@ async def add_id_tag(data: dict = Body(...)):
     except Exception as e:
         print(f"❌ 未知新增錯誤：{e}")
         raise HTTPException(status_code=500, detail="Internal server error")
-
-    return {"message": "Added successfully"}
 
 
 @app.put("/api/id_tags/{id_tag}")
@@ -5068,13 +5099,19 @@ async def update_id_tag(id_tag: str = Path(...), data: dict = Body(...)):
 
 @app.delete("/api/id_tags/{id_tag}")
 async def delete_id_tag(id_tag: str = Path(...)):
-    cursor.execute("SELECT 1 FROM id_tags WHERE id_tag = ?", (id_tag,))
-    if not cursor.fetchone():
-        raise HTTPException(status_code=404, detail="id_tag not found")
+    with get_conn() as conn:
+        cur = conn.cursor()
 
-    cursor.execute("DELETE FROM id_tags WHERE id_tag = ?", (id_tag,))
-    cursor.execute("DELETE FROM cards WHERE card_id = ?", (id_tag,))
-    conn.commit()
+        cur.execute("SELECT 1 FROM id_tags WHERE id_tag = ?", (id_tag,))
+        if not cur.fetchone():
+            raise HTTPException(status_code=404, detail="id_tag not found")
+
+        cur.execute("DELETE FROM card_whitelist WHERE card_id = ?", (id_tag,))
+        cur.execute("DELETE FROM card_owners WHERE card_id = ?", (id_tag,))
+        cur.execute("DELETE FROM cards WHERE card_id = ?", (id_tag,))
+        cur.execute("DELETE FROM id_tags WHERE id_tag = ?", (id_tag,))
+        conn.commit()
+
     return {"message": "Deleted successfully"}
 
 
@@ -5659,23 +5696,23 @@ async def delete_charge_point(cp_id: str = Path(...)):
     return {"message": "已刪除"}
 
 
-@app.delete("/api/cards/{card_id}")
-async def delete_card(card_id: str):
-    cursor.execute("DELETE FROM cards WHERE card_id = ?", (card_id,))
-    conn.commit()
-    return {"message": f"Card {card_id} deleted"}
-
 
 @app.put("/api/cards/{card_id}")
 async def update_card(card_id: str, payload: dict):
     new_balance = payload.get("balance")
     if new_balance is None:
         raise HTTPException(status_code=400, detail="Missing balance")
-    cursor.execute(
-        "UPDATE cards SET balance = ? WHERE card_id = ?", (new_balance, card_id)
-    )
-    conn.commit()
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE cards SET balance = ? WHERE card_id = ?",
+            (new_balance, card_id),
+        )
+        conn.commit()
+
     return {"message": f"Card {card_id} updated", "new_balance": new_balance}
+
 
 
 @app.post("/api/cards/{card_id}/topup")
