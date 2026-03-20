@@ -209,14 +209,16 @@ async def finalize_ws_disconnect_cleanup(cp_norm: str, expected_cp=None):
             logger.exception(f"[LIVE][WS_DISCONNECT][ERR] cp_id={cp_norm} | err={e}")
 
         # ==================================================
-        # D) Grace 到期後，再對剩餘 active 充電樁做正式 Rebalance
+        # D) Grace 到期後，不直接重算，改成登記一次全域 rebalance
         # ==================================================
         try:
-            await rebalance_all_charging_points(reason="ws_disconnect")
-            logger.warning(f"[SMART][WS_DISCONNECT][REBALANCE_OK] cp_id={cp_norm}")
+            request_rebalance(reason="ws_disconnect")
+            logger.warning(
+                f"[SMART][WS_DISCONNECT][REBALANCE_REQUESTED] cp_id={cp_norm}"
+            )
         except Exception as e:
             logger.exception(
-                f"[SMART][WS_DISCONNECT][REBALANCE_ERR] cp_id={cp_norm} | err={e}"
+                f"[SMART][WS_DISCONNECT][REBALANCE_REQUEST_ERR] cp_id={cp_norm} | err={e}"
             )
 
     except asyncio.CancelledError:
@@ -290,6 +292,95 @@ def _get_ws_disconnect_grace_seconds() -> int:
 WS_DISCONNECT_GRACE_SECONDS = _get_ws_disconnect_grace_seconds()
 pending_ws_disconnect_tasks = {}
 ws_disconnect_grace = {}
+
+# ===============================
+# 🔁 全域 Rebalance 去抖 / 合併 / 節流
+# ===============================
+REBALANCE_DEBOUNCE_SECONDS = float(os.getenv("REBALANCE_DEBOUNCE_SECONDS", "2.0"))
+
+rebalance_lock = asyncio.Lock()
+pending_rebalance_task = None
+rebalance_requested = False
+rebalance_last_reason = None
+rebalance_last_requested_at = 0.0
+
+
+def request_rebalance(reason: str):
+    """
+    只負責「登記」需要 rebalance，不直接立即重算。
+    多個事件在短時間內會共用同一個 pending task。
+    """
+    global pending_rebalance_task
+    global rebalance_requested
+    global rebalance_last_reason
+    global rebalance_last_requested_at
+
+    rebalance_requested = True
+    rebalance_last_reason = reason
+    rebalance_last_requested_at = time.time()
+
+    if pending_rebalance_task is None or pending_rebalance_task.done():
+        pending_rebalance_task = asyncio.create_task(_debounced_rebalance_runner())
+        logger.warning(
+            f"[SMART][REBALANCE][SCHEDULED] "
+            f"reason={reason} | debounce={REBALANCE_DEBOUNCE_SECONDS}s"
+        )
+    else:
+        logger.warning(
+            f"[SMART][REBALANCE][COALESCED] "
+            f"reason={reason} | debounce={REBALANCE_DEBOUNCE_SECONDS}s"
+        )
+
+
+async def _debounced_rebalance_runner():
+    """
+    將短時間內的多個 rebalance 請求合併。
+    若 rebalance 執行期間又有新事件進來，結束後再補跑一輪。
+    """
+    global pending_rebalance_task
+    global rebalance_requested
+    global rebalance_last_reason
+    global rebalance_last_requested_at
+
+    try:
+        while True:
+            # 等到最後一次 request 後，安靜滿 debounce 秒才真正執行
+            while True:
+                wait_s = REBALANCE_DEBOUNCE_SECONDS - (
+                    time.time() - rebalance_last_requested_at
+                )
+                if wait_s <= 0:
+                    break
+                await asyncio.sleep(min(wait_s, 0.2))
+
+            async with rebalance_lock:
+                if not rebalance_requested:
+                    break
+
+                run_reason = rebalance_last_reason or "debounced"
+                rebalance_requested = False
+
+                logger.warning(
+                    f"[SMART][REBALANCE][RUN] "
+                    f"reason={run_reason} | debounce={REBALANCE_DEBOUNCE_SECONDS}s"
+                )
+
+                try:
+                    await rebalance_all_charging_points(reason=run_reason)
+                    logger.warning(
+                        f"[SMART][REBALANCE][RUN_OK] reason={run_reason}"
+                    )
+                except Exception as e:
+                    logger.exception(
+                        f"[SMART][REBALANCE][RUN_ERR] reason={run_reason} | err={e}"
+                    )
+
+            # 若執行期間又有人 request_rebalance()，會把 rebalance_requested 改回 True
+            if not rebalance_requested:
+                break
+
+    finally:
+        pending_rebalance_task = None
 
 
 
@@ -1209,15 +1300,15 @@ async def websocket_endpoint(websocket: WebSocket, charge_point_id: str):
                 finalize_ws_disconnect_cleanup(cp_norm, expected_cp=current_cp)
             )
 
-            # ✅ grace 期間先做一次重平衡，但保留此樁在 allocation 候選
+            # ✅ grace 期間不直接重算，改成「登記一次全域 rebalance」
             try:
-                await rebalance_all_charging_points(reason="ws_disconnect_grace")
+                request_rebalance(reason="ws_disconnect_grace")
                 logger.warning(
-                    f"[SMART][WS_DISCONNECT][GRACE_REBALANCE_OK] cp_id={cp_norm}"
+                    f"[SMART][WS_DISCONNECT][GRACE_REBALANCE_REQUESTED] cp_id={cp_norm}"
                 )
             except Exception as rebalance_err:
                 logger.exception(
-                    f"[SMART][WS_DISCONNECT][GRACE_REBALANCE_ERR] "
+                    f"[SMART][WS_DISCONNECT][GRACE_REBALANCE_REQUEST_ERR] "
                     f"cp_id={cp_norm} | err={rebalance_err}"
                 )
 
@@ -1228,13 +1319,10 @@ async def websocket_endpoint(websocket: WebSocket, charge_point_id: str):
 
         # ✅ 到這裡就結束
         # grace 期間只做：
-        # 1. 移除目前 ws 連線物件
+        # 1. 保留目前 ws 連線物件進入 grace
         # 2. 建立 ws_disconnect_grace
-        # 3. 啟動 finalize_ws_disconnect_cleanup(cp_norm)
+        # 3. 啟動 finalize_ws_disconnect_cleanup(cp_norm, expected_cp=current_cp)
         # 4. 做一次 grace re-balance
-        #
-        # 真正的 auto-stop / Available / live reset / final rebalance
-        # 一律延到 finalize_ws_disconnect_cleanup() grace 到期後才執行
 
 # 初始化狀態儲存
 # charging_point_status = {}
@@ -1483,6 +1571,8 @@ async def rebalance_all_charging_points(reason: str):
     3. 每樁上限固定 SINGLE_CP_MAX_POWER_KW
     4. 下發前依各樁即時電壓換算成電流
     """
+
+    logger.warning(f"[SMART][REBALANCE][ENTER] reason={reason}")
 
     try:
         with sqlite3.connect(DB_FILE, check_same_thread=False, timeout=15) as conn:
