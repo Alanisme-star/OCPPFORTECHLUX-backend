@@ -90,16 +90,22 @@ def cancel_ws_disconnect_cleanup(cp_id: str):
         logger.warning(f"[WS_RECONNECT][GRACE_CANCEL] cp_id={cp_id}")
 
 
-async def finalize_ws_disconnect_cleanup(cp_norm: str):
+async def finalize_ws_disconnect_cleanup(cp_norm: str, expected_cp=None):
     try:
         await asyncio.sleep(WS_DISCONNECT_GRACE_SECONDS)
 
-        # grace 期間若已重連，直接跳過正式清理
-        if cp_norm in connected_charge_points:
+        current_cp = connected_charge_points.get(cp_norm)
+
+        # grace 期間若已被「新連線物件」取代，才算真正重連成功
+        if current_cp is not None and current_cp is not expected_cp:
             logger.warning(
                 f"[WS_DISCONNECT][GRACE_SKIP] cp_id={cp_norm} | reason=reconnected_in_time"
             )
             return
+
+        # 若 grace 到期後，dict 裡仍是舊物件，這時才正式移除
+        if current_cp is expected_cp:
+            connected_charge_points.pop(cp_norm, None)
 
         # ==================================================
         # A) Grace 到期後，自動結束未完成交易（DB）
@@ -1156,10 +1162,10 @@ async def websocket_endpoint(websocket: WebSocket, charge_point_id: str):
         cp_norm = _normalize_cp_id(charge_point_id)
 
         # ==================================================
-        # 3) WebSocket 斷線：先移除當前連線物件，但只進入 grace
-        #    不立刻 auto-stop / 不立刻 force Available / 不立刻 reset live
+        # 3) WebSocket 斷線：先保留這次 endpoint 對應的舊連線物件進入 grace
+        #    不立刻 pop，不立刻 auto-stop / force Available / reset live
         # ==================================================
-        connected_charge_points.pop(cp_norm, None)
+        current_cp = cp if "cp" in locals() else None
 
         try:
             now = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
@@ -1200,7 +1206,7 @@ async def websocket_endpoint(websocket: WebSocket, charge_point_id: str):
                 old_task.cancel()
 
             pending_ws_disconnect_tasks[cp_norm] = asyncio.create_task(
-                finalize_ws_disconnect_cleanup(cp_norm)
+                finalize_ws_disconnect_cleanup(cp_norm, expected_cp=current_cp)
             )
 
             # ✅ grace 期間先做一次重平衡，但保留此樁在 allocation 候選
