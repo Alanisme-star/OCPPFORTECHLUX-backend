@@ -94,20 +94,133 @@ async def finalize_ws_disconnect_cleanup(cp_norm: str):
     try:
         await asyncio.sleep(WS_DISCONNECT_GRACE_SECONDS)
 
+        # grace 期間若已重連，直接跳過正式清理
         if cp_norm in connected_charge_points:
             logger.warning(
                 f"[WS_DISCONNECT][GRACE_SKIP] cp_id={cp_norm} | reason=reconnected_in_time"
             )
             return
 
-        # Grace 到期後，才真正 auto-stop / unavailable / reset / rebalance
-        ...
+        # ==================================================
+        # A) Grace 到期後，自動結束未完成交易（DB）
+        # ==================================================
+        try:
+            with sqlite3.connect(DB_FILE, check_same_thread=False, timeout=15) as conn:
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    SELECT transaction_id
+                    FROM transactions
+                    WHERE charge_point_id = ?
+                      AND stop_timestamp IS NULL
+                    """,
+                    (cp_norm,),
+                )
+                rows = cur.fetchall()
+
+            if rows:
+                now = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
+
+                with sqlite3.connect(DB_FILE, check_same_thread=False, timeout=15) as conn:
+                    cur = conn.cursor()
+                    for (tx_id,) in rows:
+                        cur.execute(
+                            """
+                            UPDATE transactions
+                            SET stop_timestamp = ?, reason = ?
+                            WHERE transaction_id = ?
+                            """,
+                            (now, "ConnectionLost", tx_id),
+                        )
+
+                        logger.warning(
+                            f"[AUTO-STOP][WS_DISCONNECT] "
+                            f"cp_id={cp_norm} tx_id={tx_id} reason=ConnectionLost"
+                        )
+
+                    conn.commit()
+
+        except Exception as e:
+            logger.exception(
+                f"[AUTO-STOP][WS_DISCONNECT][ERR] cp_id={cp_norm} | err={e}"
+            )
+
+        # ==================================================
+        # B) Grace 到期後，正式寫入 Available 狀態
+        # ==================================================
+        try:
+            now = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
+
+            with sqlite3.connect(DB_FILE, check_same_thread=False, timeout=15) as conn:
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    INSERT INTO status_logs
+                    (charge_point_id, connector_id, status, timestamp)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (cp_norm, 0, "Available", now),
+                )
+                conn.commit()
+
+            charging_point_status[cp_norm] = {
+                "connector_id": 0,
+                "status": "Available",
+                "timestamp": now,
+                "error_code": "NoError",
+                "derived": True,
+            }
+
+            logger.warning(f"[STATUS][WS_DISCONNECT][FORCE_AVAILABLE] cp_id={cp_norm}")
+
+        except Exception as e:
+            logger.exception(f"[STATUS][WS_DISCONNECT][ERR] cp_id={cp_norm} | err={e}")
+
+        # ==================================================
+        # C) Grace 到期後，正式重設 live_status_cache
+        # ==================================================
+        try:
+            prev = live_status_cache.get(cp_norm, {})
+
+            live_status_cache[cp_norm] = {
+                "status": "Available",
+                "power": 0,
+                "voltage": 0,
+                "current": 0,
+                "energy": prev.get("energy", 0),
+                "estimated_energy": 0,
+                "estimated_amount": 0,
+                "derived": True,
+                "updated_at": time.time(),
+            }
+
+            logger.warning(
+                f"[LIVE][WS_DISCONNECT][RESET] "
+                f"cp_id={cp_norm} | force status=Available"
+            )
+
+        except Exception as e:
+            logger.exception(f"[LIVE][WS_DISCONNECT][ERR] cp_id={cp_norm} | err={e}")
+
+        # ==================================================
+        # D) Grace 到期後，再對剩餘 active 充電樁做正式 Rebalance
+        # ==================================================
+        try:
+            await rebalance_all_charging_points(reason="ws_disconnect")
+            logger.warning(f"[SMART][WS_DISCONNECT][REBALANCE_OK] cp_id={cp_norm}")
+        except Exception as e:
+            logger.exception(
+                f"[SMART][WS_DISCONNECT][REBALANCE_ERR] cp_id={cp_norm} | err={e}"
+            )
+
     except asyncio.CancelledError:
         logger.warning(f"[WS_DISCONNECT][GRACE_CANCELLED] cp_id={cp_norm}")
         raise
+
     finally:
         pending_ws_disconnect_tasks.pop(cp_norm, None)
         ws_disconnect_grace.pop(cp_norm, None)
+
 
 import sys
 
@@ -282,8 +395,12 @@ async def send_current_limit_profile(
             if cpid not in active_cp_ids:
                 active_cp_ids.append(cpid)
 
-        # ✅ 與 rebalance / community-settings 統一口徑：只算目前仍在線的樁
-        active_cp_ids = [cid for cid in active_cp_ids if cid in connected_charge_points]
+        # ✅ 與 rebalance 邏輯統一：
+        #    已連線 or grace 中的樁，都要納入功率分配計算
+        active_cp_ids = [
+            cid for cid in active_cp_ids
+            if is_cp_effectively_available_for_allocation(cid)
+        ]
 
         allocated_kw = calculate_allocated_power_kw_by_cp_ids(active_cp_ids)
         theory_a = (
@@ -1039,7 +1156,8 @@ async def websocket_endpoint(websocket: WebSocket, charge_point_id: str):
         cp_norm = _normalize_cp_id(charge_point_id)
 
         # ==================================================
-        # 3) 移除 WebSocket 連線（但先進入 grace，不立刻 auto-stop）
+        # 3) WebSocket 斷線：先移除當前連線物件，但只進入 grace
+        #    不立刻 auto-stop / 不立刻 force Available / 不立刻 reset live
         # ==================================================
         connected_charge_points.pop(cp_norm, None)
 
@@ -1053,31 +1171,21 @@ async def websocket_endpoint(websocket: WebSocket, charge_point_id: str):
                 "started_at_iso": now,
             }
 
-            with sqlite3.connect(DB_FILE, check_same_thread=False) as conn:
-                cur = conn.cursor()
-                cur.execute(
-                    """
-                    INSERT INTO status_logs
-                    (charge_point_id, connector_id, status, timestamp)
-                    VALUES (?, ?, ?, ?)
-                    """,
-                    (cp_norm, 0, "Unavailable", now),
-                )
-                conn.commit()
-
+            # ✅ 這裡只標記 grace 視窗，不直接洗成 Unavailable
+            prev_status = charging_point_status.get(cp_norm, {})
             charging_point_status[cp_norm] = {
-                "connector_id": 0,
-                "status": "Unavailable",
+                **prev_status,
                 "timestamp": now,
                 "error_code": "ConnectionLost",
                 "derived": True,
                 "grace_seconds": WS_DISCONNECT_GRACE_SECONDS,
+                "ws_grace_until": expire_at,
             }
 
-            prev = live_status_cache.get(cp_norm, {})
+            # ✅ live cache 保留原本狀態，只補 grace 資訊
+            prev_live = live_status_cache.get(cp_norm, {})
             live_status_cache[cp_norm] = {
-                **prev,
-                "status": "Unavailable",
+                **prev_live,
                 "derived": True,
                 "ws_grace_until": expire_at,
                 "updated_at": time.time(),
@@ -1095,135 +1203,32 @@ async def websocket_endpoint(websocket: WebSocket, charge_point_id: str):
                 finalize_ws_disconnect_cleanup(cp_norm)
             )
 
-        except Exception as e:
-            logger.exception(f"[WS_DISCONNECT][GRACE_START][ERR] cp_id={cp_norm} | err={e}")
-
-        try:
-            await rebalance_all_charging_points(reason="ws_disconnect_grace")
-            logger.warning(f"[SMART][WS_DISCONNECT][GRACE_REBALANCE_OK] cp_id={cp_norm}")
-        except Exception as e:
-            logger.exception(
-                f"[SMART][WS_DISCONNECT][REBALANCE_ERR] cp_id={cp_norm} | err={e}"
-            )
-
-        # ==================================================
-        # 4) WebSocket 中斷時，自動結束未完成交易（DB）
-        # ==================================================
-        try:
-            with sqlite3.connect(DB_FILE, check_same_thread=False) as conn:
-                cur = conn.cursor()
-                cur.execute(
-                    """
-                    SELECT transaction_id
-                    FROM transactions
-                    WHERE charge_point_id = ?
-                      AND stop_timestamp IS NULL
-                """,
-                    (cp_norm,),
+            # ✅ grace 期間先做一次重平衡，但保留此樁在 allocation 候選
+            try:
+                await rebalance_all_charging_points(reason="ws_disconnect_grace")
+                logger.warning(
+                    f"[SMART][WS_DISCONNECT][GRACE_REBALANCE_OK] cp_id={cp_norm}"
                 )
-                rows = cur.fetchall()
-
-            if rows:
-                now = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
-
-                with sqlite3.connect(DB_FILE, check_same_thread=False) as conn:
-                    cur = conn.cursor()
-                    for (tx_id,) in rows:
-                        cur.execute(
-                            """
-                            UPDATE transactions
-                            SET stop_timestamp = ?, reason = ?
-                            WHERE transaction_id = ?
-                        """,
-                            (now, "ConnectionLost", tx_id),
-                        )
-
-                        logger.warning(
-                            f"[AUTO-STOP][WS_DISCONNECT] "
-                            f"cp_id={cp_norm} tx_id={tx_id} reason=ConnectionLost"
-                        )
-
-                    conn.commit()
-
-        except Exception as e:
-            logger.exception(
-                f"[AUTO-STOP][WS_DISCONNECT][ERR] cp_id={cp_norm} | err={e}"
-            )
-
-        # ==================================================
-        # 5) 🔴【關鍵修正】強制同步狀態來源
-        #    - status_logs
-        #    - charging_point_status
-        # ==================================================
-        try:
-            now = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
-
-            # --- 寫入 status_logs（等效 StatusNotification）---
-            with sqlite3.connect(DB_FILE, check_same_thread=False) as conn:
-                cur = conn.cursor()
-                cur.execute(
-                    """
-                    INSERT INTO status_logs
-                    (charge_point_id, connector_id, status, timestamp)
-                    VALUES (?, ?, ?, ?)
-                """,
-                    (cp_norm, 0, "Available", now),
+            except Exception as rebalance_err:
+                logger.exception(
+                    f"[SMART][WS_DISCONNECT][GRACE_REBALANCE_ERR] "
+                    f"cp_id={cp_norm} | err={rebalance_err}"
                 )
-                conn.commit()
 
-            # --- 同步 HTTP 狀態快取 ---
-            charging_point_status[cp_norm] = {
-                "connector_id": 0,
-                "status": "Available",
-                "timestamp": now,
-                "error_code": "NoError",
-                "derived": True,  # ← 標記為後端強制寫入
-            }
-
-            logger.warning(f"[STATUS][WS_DISCONNECT][FORCE_AVAILABLE] cp_id={cp_norm}")
-
-        except Exception as e:
-            logger.exception(f"[STATUS][WS_DISCONNECT][ERR] cp_id={cp_norm} | err={e}")
-
-        # ==================================================
-        # 6) 清除 / 覆寫 live_status_cache
-        #    避免前端誤判仍在 Charging
-        # ==================================================
-        try:
-            prev = live_status_cache.get(cp_norm, {})
-
-            live_status_cache[cp_norm] = {
-                "status": "Available",
-                "power": 0,
-                "voltage": 0,
-                "current": 0,
-                # 能量可保留（不影響）
-                "energy": prev.get("energy", 0),
-                "estimated_energy": 0,
-                "estimated_amount": 0,
-                "derived": True,
-                "updated_at": time.time(),
-            }
-
-            logger.warning(
-                f"[LIVE][WS_DISCONNECT][RESET] "
-                f"cp_id={cp_norm} | force status=Available"
-            )
-
-        except Exception as e:
-            logger.exception(f"[LIVE][WS_DISCONNECT][ERR] cp_id={cp_norm} | err={e}")
-
-        # ==================================================
-        # 7) WebSocket 中斷後，重新對剩餘 active 充電樁做 Rebalance
-        # ==================================================
-        try:
-            await rebalance_all_charging_points(reason="ws_disconnect")
-            logger.warning(f"[SMART][WS_DISCONNECT][REBALANCE_OK] cp_id={cp_norm}")
         except Exception as e:
             logger.exception(
-                f"[SMART][WS_DISCONNECT][REBALANCE_ERR] cp_id={cp_norm} | err={e}"
+                f"[WS_DISCONNECT][GRACE_START][ERR] cp_id={cp_norm} | err={e}"
             )
 
+        # ✅ 到這裡就結束
+        # grace 期間只做：
+        # 1. 移除目前 ws 連線物件
+        # 2. 建立 ws_disconnect_grace
+        # 3. 啟動 finalize_ws_disconnect_cleanup(cp_norm)
+        # 4. 做一次 grace re-balance
+        #
+        # 真正的 auto-stop / Available / live reset / final rebalance
+        # 一律延到 finalize_ws_disconnect_cleanup() grace 到期後才執行
 
 # 初始化狀態儲存
 # charging_point_status = {}
@@ -3164,8 +3169,12 @@ class ChargePoint(OcppChargePoint):
                     if cpid not in active_cp_ids:
                         active_cp_ids.append(cpid)
 
-                # 只算仍連線的（避免斷線樁 voltage=0 影響分配判斷）
-                active_cp_ids = [cid for cid in active_cp_ids if cid in connected_charge_points]
+                # ✅ 與 rebalance / send_current_limit_profile 統一口徑：
+                #    已連線 or grace 中的樁，都要納入功率分配計算
+                active_cp_ids = [
+                    cid for cid in active_cp_ids
+                    if is_cp_effectively_available_for_allocation(cid)
+                ]
 
                 allocated_kw = calculate_allocated_power_kw_by_cp_ids(active_cp_ids)
                 theory_a = (
