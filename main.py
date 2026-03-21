@@ -4416,17 +4416,30 @@ def get_live_status(charge_point_id: str):
         if age_sec > LIVE_TTL:
             ts = live.get("timestamp")
 
-            allocated_power_kw = live.get("allocated_power_kw")
-            preview_current_a = live.get("preview_current_a")
+            # ✅ stale 狀態下也不要優先沿用 cache 舊 allocation
+            allocated_power_kw = None
+            preview_current_a = None
 
+            try:
+                active_cp_ids = get_effective_active_cp_ids()
+                if cp_id in active_cp_ids:
+                    allocated_power_kw = calculate_allocated_power_kw_by_cp_ids(active_cp_ids)
+                    preview_current_a = (
+                        convert_power_kw_to_current_a(allocated_power_kw, cp_id)
+                        if allocated_power_kw is not None
+                        else None
+                    )
+            except Exception as e:
+                logging.exception(f"[LIVE_STATUS][STALE_ALLOC_ERR] cp={cp_id} err={e}")
+                allocated_power_kw = None
+                preview_current_a = None
+
+            # ✅ 若目前不在 active 清單，才退回 cache
             if allocated_power_kw is None:
-                try:
-                    active_cp_ids = get_effective_active_cp_ids()
-                    if cp_id in active_cp_ids:
-                        allocated_power_kw = calculate_allocated_power_kw_by_cp_ids(active_cp_ids)
-                except Exception as e:
-                    logging.exception(f"[LIVE_STATUS][STALE_ALLOC_ERR] cp={cp_id} err={e}")
-                    allocated_power_kw = None
+                allocated_power_kw = live.get("allocated_power_kw")
+
+            if preview_current_a is None:
+                preview_current_a = live.get("preview_current_a")
 
             if preview_current_a is None:
                 preview_current_a = (
@@ -4454,32 +4467,39 @@ def get_live_status(charge_point_id: str):
             live_status_cache[cp_id] = stale
             return stale
 
-    allocated_power_kw = live.get("allocated_power_kw")
+    # ✅ 一般正常回傳時，也不要優先沿用 cache 舊 allocation
+    #    只要目前這支樁仍在有效 active 清單中，就每次即時計算真正分配值
+    allocated_power_kw = None
+    preview_current_a = None
 
-    # ✅ 若 live cache 尚未寫入本樁分配值，改用「目前有效 active CP 數」重新即時計算
+    try:
+        active_cp_ids = get_effective_active_cp_ids()
+
+        if cp_id in active_cp_ids:
+            allocated_power_kw = calculate_allocated_power_kw_by_cp_ids(active_cp_ids)
+            preview_current_a = (
+                convert_power_kw_to_current_a(allocated_power_kw, cp_id)
+                if allocated_power_kw is not None
+                else None
+            )
+    except Exception as e:
+        logging.exception(f"[LIVE_STATUS][ALLOC_REALTIME_ERR] cp={cp_id} err={e}")
+        allocated_power_kw = None
+        preview_current_a = None
+
+    # ✅ 若目前不在 active 清單中，才退回 cache
     if allocated_power_kw is None:
-        try:
-            active_cp_ids = get_effective_active_cp_ids()
+        allocated_power_kw = live.get("allocated_power_kw")
 
-            # 若目前這支樁就在 active 清單中，直接依真實 active 清單試算
-            if cp_id in active_cp_ids:
-                allocated_power_kw = calculate_allocated_power_kw_by_cp_ids(active_cp_ids)
-            else:
-                allocated_power_kw = None
-        except Exception as e:
-            logging.exception(f"[LIVE_STATUS][ALLOC_FALLBACK_ERR] cp={cp_id} err={e}")
-            allocated_power_kw = None
+    if preview_current_a is None:
+        preview_current_a = live.get("preview_current_a")
 
-    preview_current_a = live.get("preview_current_a")
-
-    # ✅ preview 要跟著本次真正的 allocated_power_kw 走
     if preview_current_a is None:
         preview_current_a = (
             convert_power_kw_to_current_a(allocated_power_kw, cp_id)
             if allocated_power_kw is not None
             else None
         )
-
     return {
         "timestamp": live.get("timestamp"),
         "power": live.get("power", 0),
