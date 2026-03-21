@@ -108,8 +108,12 @@ async def finalize_ws_disconnect_cleanup(cp_norm: str, expected_cp=None):
             connected_charge_points.pop(cp_norm, None)
 
         # ==================================================
-        # A) Grace 到期後，自動結束未完成交易（DB）
+        # A) Grace 到期後，只檢查是否仍有 active transaction
+        #    ❌ 不再自動 UPDATE stop_timestamp
         # ==================================================
+        has_active_tx = False
+        latest_tx_id = None
+
         try:
             with sqlite3.connect(DB_FILE, check_same_thread=False, timeout=15) as conn:
                 cur = conn.cursor()
@@ -119,106 +123,118 @@ async def finalize_ws_disconnect_cleanup(cp_norm: str, expected_cp=None):
                     FROM transactions
                     WHERE charge_point_id = ?
                       AND stop_timestamp IS NULL
+                    ORDER BY start_timestamp DESC, transaction_id DESC
+                    LIMIT 1
                     """,
                     (cp_norm,),
                 )
-                rows = cur.fetchall()
+                row = cur.fetchone()
 
-            if rows:
-                now = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
-
-                with sqlite3.connect(DB_FILE, check_same_thread=False, timeout=15) as conn:
-                    cur = conn.cursor()
-                    for (tx_id,) in rows:
-                        cur.execute(
-                            """
-                            UPDATE transactions
-                            SET stop_timestamp = ?, reason = ?
-                            WHERE transaction_id = ?
-                            """,
-                            (now, "ConnectionLost", tx_id),
-                        )
-
-                        logger.warning(
-                            f"[AUTO-STOP][WS_DISCONNECT] "
-                            f"cp_id={cp_norm} tx_id={tx_id} reason=ConnectionLost"
-                        )
-
-                    conn.commit()
+            if row:
+                has_active_tx = True
+                latest_tx_id = int(row[0])
 
         except Exception as e:
             logger.exception(
-                f"[AUTO-STOP][WS_DISCONNECT][ERR] cp_id={cp_norm} | err={e}"
+                f"[WS_DISCONNECT][ACTIVE_TX_CHECK_ERR] cp_id={cp_norm} | err={e}"
             )
 
-        # ==================================================
-        # B) Grace 到期後，正式寫入 Available 狀態
-        # ==================================================
-        try:
-            now = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
+        now = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
 
-            with sqlite3.connect(DB_FILE, check_same_thread=False, timeout=15) as conn:
-                cur = conn.cursor()
-                cur.execute(
-                    """
-                    INSERT INTO status_logs
-                    (charge_point_id, connector_id, status, timestamp)
-                    VALUES (?, ?, ?, ?)
-                    """,
-                    (cp_norm, 0, "Available", now),
-                )
-                conn.commit()
+        # ==================================================
+        # B) 若 grace 到期時仍有 active transaction
+        #    → 維持 last known status / Charging，不可寫 Available
+        # ==================================================
+        if has_active_tx:
+            prev_status = charging_point_status.get(cp_norm, {}) or {}
+            keep_status = prev_status.get("status") or "Charging"
+
+            if keep_status in ("Available", "Unknown", "未知"):
+                keep_status = "Charging"
 
             charging_point_status[cp_norm] = {
-                "connector_id": 0,
-                "status": "Available",
+                **prev_status,
+                "connector_id": int(prev_status.get("connector_id") or 1),
+                "status": keep_status,
                 "timestamp": now,
-                "error_code": "NoError",
+                "error_code": "ConnectionLost",
                 "derived": True,
+                "ws_grace_expired": True,
+                "transaction_id": latest_tx_id,
             }
 
-            logger.warning(f"[STATUS][WS_DISCONNECT][FORCE_AVAILABLE] cp_id={cp_norm}")
-
-        except Exception as e:
-            logger.exception(f"[STATUS][WS_DISCONNECT][ERR] cp_id={cp_norm} | err={e}")
-
-        # ==================================================
-        # C) Grace 到期後，正式重設 live_status_cache
-        # ==================================================
-        try:
-            prev = live_status_cache.get(cp_norm, {})
-
+            prev_live = live_status_cache.get(cp_norm, {}) or {}
             live_status_cache[cp_norm] = {
-                "status": "Available",
-                "power": 0,
-                "voltage": 0,
-                "current": 0,
-                "energy": prev.get("energy", 0),
-                "estimated_energy": 0,
-                "estimated_amount": 0,
+                **prev_live,
+                "status": prev_live.get("status") or keep_status,
                 "derived": True,
+                "ws_grace_expired": True,
                 "updated_at": time.time(),
             }
 
             logger.warning(
-                f"[LIVE][WS_DISCONNECT][RESET] "
-                f"cp_id={cp_norm} | force status=Available"
+                f"[WS_DISCONNECT][KEEP_LAST_STATUS] "
+                f"cp_id={cp_norm} | tx_id={latest_tx_id} | status={keep_status}"
             )
 
-        except Exception as e:
-            logger.exception(f"[LIVE][WS_DISCONNECT][ERR] cp_id={cp_norm} | err={e}")
+        # ==================================================
+        # C) 若已明確無交易，才允許回 Available
+        # ==================================================
+        else:
+            try:
+                with sqlite3.connect(DB_FILE, check_same_thread=False, timeout=15) as conn:
+                    cur = conn.cursor()
+                    cur.execute(
+                        """
+                        INSERT INTO status_logs
+                        (charge_point_id, connector_id, status, timestamp)
+                        VALUES (?, ?, ?, ?)
+                        """,
+                        (cp_norm, 0, "Available", now),
+                    )
+                    conn.commit()
+
+                charging_point_status[cp_norm] = {
+                    "connector_id": 0,
+                    "status": "Available",
+                    "timestamp": now,
+                    "error_code": "NoError",
+                    "derived": True,
+                }
+
+                prev_live = live_status_cache.get(cp_norm, {}) or {}
+                live_status_cache[cp_norm] = {
+                    **prev_live,
+                    "status": "Available",
+                    "power": 0,
+                    "voltage": 0,
+                    "current": 0,
+                    "estimated_energy": 0,
+                    "estimated_amount": 0,
+                    "derived": True,
+                    "updated_at": time.time(),
+                }
+
+                logger.warning(
+                    f"[WS_DISCONNECT][NO_ACTIVE_TX][SET_AVAILABLE] cp_id={cp_norm}"
+                )
+
+            except Exception as e:
+                logger.exception(
+                    f"[WS_DISCONNECT][NO_ACTIVE_TX][SET_AVAILABLE_ERR] cp_id={cp_norm} | err={e}"
+                )
 
         # ==================================================
-        # D) Grace 到期後，不直接重算，改成登記一次全域 rebalance
+        # D) Grace 到期後，登記一次全域 rebalance
         # ==================================================
         try:
-            request_rebalance(reason="ws_disconnect")
+            request_rebalance(reason="ws_disconnect_finalize")
             logger.warning(
-                f"[SMART][WS_DISCONNECT][REBALANCE_REQUESTED] cp_id={cp_norm}"
+                f"[SMART][WS_DISCONNECT][FINAL_REBALANCE_REQUESTED] cp_id={cp_norm}"
             )
         except Exception as e:
             logger.exception(
-                f"[SMART][WS_DISCONNECT][REBALANCE_REQUEST_ERR] cp_id={cp_norm} | err={e}"
+                f"[SMART][WS_DISCONNECT][FINAL_REBALANCE_REQUEST_ERR] cp_id={cp_norm} | err={e}"
             )
 
     except asyncio.CancelledError:
@@ -228,6 +244,7 @@ async def finalize_ws_disconnect_cleanup(cp_norm: str, expected_cp=None):
     finally:
         pending_ws_disconnect_tasks.pop(cp_norm, None)
         ws_disconnect_grace.pop(cp_norm, None)
+
 
 
 import sys
@@ -1270,8 +1287,32 @@ async def websocket_endpoint(websocket: WebSocket, charge_point_id: str):
 
             # ✅ 這裡只標記 grace 視窗，不直接洗成 Unavailable
             prev_status = charging_point_status.get(cp_norm, {})
+
+            effective_status = prev_status.get("status")
+            try:
+                with sqlite3.connect(DB_FILE, check_same_thread=False, timeout=15) as conn:
+                    cur = conn.cursor()
+                    cur.execute(
+                        """
+                        SELECT transaction_id
+                        FROM transactions
+                        WHERE charge_point_id = ?
+                          AND stop_timestamp IS NULL
+                        ORDER BY start_timestamp DESC
+                        LIMIT 1
+                        """,
+                        (cp_norm,),
+                    )
+                    active_row = cur.fetchone()
+
+                if active_row and effective_status in (None, "Available", "Unknown", "未知"):
+                    effective_status = "Charging"
+            except Exception:
+                pass
+
             charging_point_status[cp_norm] = {
                 **prev_status,
+                "status": effective_status or prev_status.get("status") or "Unknown",
                 "timestamp": now,
                 "error_code": "ConnectionLost",
                 "derived": True,
@@ -3029,11 +3070,12 @@ class ChargePoint(OcppChargePoint):
 
         finally:
             # ==================================================
-            # 更新 live_status（清除即時計算，避免誤導）
+            # 更新 live_status（真正 StopTransaction 完成後才回 Available）
             # ==================================================
             prev = live_status_cache.get(cp_id, {})
 
             live_status_cache[cp_id] = {
+                "status": "Available",
                 "power": 0,
                 "voltage": 0,
                 "current": 0,
@@ -3041,9 +3083,60 @@ class ChargePoint(OcppChargePoint):
                 "estimated_energy": 0,
                 "estimated_amount": 0,
                 "price_per_kwh": prev.get("price_per_kwh", 0),
-                "timestamp": datetime.utcnow().replace(tzinfo=timezone.utc).isoformat(),
+                "timestamp": stop_ts,
                 "derived": True,
+                "updated_at": time.time(),
             }
+
+            try:
+                with sqlite3.connect(DB_FILE, check_same_thread=False, timeout=15) as conn2:
+                    cur2 = conn2.cursor()
+
+                    # 確認此 CP 是否還有其他未結束交易
+                    cur2.execute(
+                        """
+                        SELECT 1
+                        FROM transactions
+                        WHERE charge_point_id = ?
+                          AND stop_timestamp IS NULL
+                        LIMIT 1
+                        """,
+                        (cp_id,),
+                    )
+                    has_other_active_tx = cur2.fetchone() is not None
+
+                    # 只有真正沒有 active tx，才正式回 Available
+                    if not has_other_active_tx:
+                        cur2.execute(
+                            """
+                            INSERT INTO status_logs
+                            (charge_point_id, connector_id, status, timestamp)
+                            VALUES (?, ?, ?, ?)
+                            """,
+                            (cp_id, 0, "Available", stop_ts),
+                        )
+                        conn2.commit()
+
+                        charging_point_status[cp_id] = {
+                            "connector_id": 0,
+                            "status": "Available",
+                            "timestamp": stop_ts,
+                            "error_code": "NoError",
+                            "derived": True,
+                        }
+
+                        logger.warning(
+                            f"[STOP][SET_AVAILABLE] cp_id={cp_id} | tx_id={transaction_id}"
+                        )
+                    else:
+                        logger.warning(
+                            f"[STOP][KEEP_NON_AVAILABLE] cp_id={cp_id} | tx_id={transaction_id} | reason=other_active_tx_exists"
+                        )
+
+            except Exception as e:
+                logger.exception(
+                    f"[STOP][SET_AVAILABLE_ERR] cp_id={cp_id} | tx_id={transaction_id} | err={e}"
+                )
 
             # ==================================================
             # 解鎖 stop API 等待 future
