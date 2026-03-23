@@ -1154,6 +1154,14 @@ import time
 
 LIVE_TTL = 15  # 秒：視情況調整
 
+DEBUG_TARGET_CP_ID = "TW*MSI*E000100"
+
+
+def _is_debug_target_cp(cp_id: str | None) -> bool:
+    try:
+        return _normalize_cp_id(cp_id or "") == DEBUG_TARGET_CP_ID
+    except Exception:
+        return False
 
 def _to_kw(value, unit):
     try:
@@ -1179,9 +1187,31 @@ def _energy_to_kwh(value, unit):
 
 def _upsert_live(cp_id: str, **kv):
     cur = live_status_cache.get(cp_id, {})
-    cur.update(kv)
+    before = dict(cur)
+
+    applied_patch = {}
+    skipped_keys = []
+
+    for k, v in kv.items():
+        if v is not None:
+            cur[k] = v
+            applied_patch[k] = v
+        else:
+            skipped_keys.append(k)
+
     cur["updated_at"] = time.time()
     live_status_cache[cp_id] = cur
+
+    if _is_debug_target_cp(cp_id):
+        logging.warning(
+            f"[DEBUG][LIVE_UPSERT] "
+            f"cp_id={cp_id} | "
+            f"before_ts={before.get('timestamp')} | after_ts={cur.get('timestamp')} | "
+            f"before_power={before.get('power')} | after_power={cur.get('power')} | "
+            f"before_voltage={before.get('voltage')} | after_voltage={cur.get('voltage')} | "
+            f"before_current={before.get('current')} | after_current={cur.get('current')} | "
+            f"applied_patch={applied_patch} | skipped_keys={skipped_keys}"
+        )
 
 
 # ======================
@@ -3202,11 +3232,12 @@ class ChargePoint(OcppChargePoint):
             if not isinstance(meter_value_list, list):
                 meter_value_list = [meter_value_list]
 
-            # === 本批次即時量測（先收齊）===
+            # === 本批次即時量測（只取「最新 timestamp 那一組」）===
             batch_voltage = None
             batch_current = None
             batch_power_kw = None
             last_ts = None
+            latest_live_ts = None
 
             insert_count = 0
 
@@ -3230,6 +3261,15 @@ class ChargePoint(OcppChargePoint):
                     )
                     if not isinstance(sampled_list, list):
                         sampled_list = [sampled_list]
+
+                    # ✅ 只讓「最新 timestamp」那筆 meterValue 參與即時功率/電流/電壓顯示
+                    if ts:
+                        if latest_live_ts is None or str(ts) >= str(latest_live_ts):
+                            if latest_live_ts is None or str(ts) > str(latest_live_ts):
+                                batch_voltage = None
+                                batch_current = None
+                                batch_power_kw = None
+                            latest_live_ts = ts
 
                     for sv in sampled_list:
                         if not isinstance(sv, dict):
@@ -3269,14 +3309,18 @@ class ChargePoint(OcppChargePoint):
                         )
                         insert_count += 1
 
-                        # === 收集即時量測 ===
-                        if meas == "Voltage" or str(meas).startswith("Voltage."):
-                            batch_voltage = val
-                        elif str(meas).startswith("Current.Import"):
-                            batch_current = val
-                        elif meas == "Power.Active.Import":
-                            batch_power_kw = _to_kw(val, unit)
+                        # ✅ 只收集最新 timestamp 那一組的即時量測
+                        if latest_live_ts is not None and ts is not None and str(ts) != str(latest_live_ts):
+                            continue
 
+                        meas_s = str(meas or "")
+
+                        if meas_s == "Voltage" or meas_s.startswith("Voltage."):
+                            batch_voltage = val
+                        elif meas_s.startswith("Current.Import"):
+                            batch_current = val
+                        elif meas_s.startswith("Power.Active.Import"):
+                            batch_power_kw = _to_kw(val, unit)
                         # === 能量 / 金額（原邏輯保留）===
                         if "Energy.Active.Import" in meas:
                             try:
@@ -3295,14 +3339,21 @@ class ChargePoint(OcppChargePoint):
                                     else _price_for_timestamp(ts)
                                 )
 
-                                _upsert_live(
-                                    cp_id,
-                                    energy=round(used_kwh, 6),
-                                    estimated_energy=round(used_kwh, 6),
-                                    estimated_amount=round(total, 2),
-                                    price_per_kwh=price,
-                                    timestamp=ts,
-                                )
+                                live_patch = {}
+
+                                if batch_voltage is not None:
+                                    live_patch["voltage"] = batch_voltage
+
+                                if batch_current is not None:
+                                    live_patch["current"] = batch_current
+
+                                if batch_power_kw is not None:
+                                    live_patch["power"] = batch_power_kw
+
+                                if last_ts is not None:
+                                    live_patch["timestamp"] = last_ts
+
+                                _upsert_live(cp_id, **live_patch)
 
                                 await _auto_stop_if_balance_insufficient(
                                     cp_id=cp_id,
@@ -3315,12 +3366,26 @@ class ChargePoint(OcppChargePoint):
                 _c.commit()
 
             # === 推算功率（若樁沒送 Power）===
+            power_derived_from_vi = False
+
             if batch_power_kw is None:
                 if isinstance(batch_voltage, (int, float)) and isinstance(
                     batch_current, (int, float)
                 ):
                     batch_power_kw = round((batch_voltage * batch_current) / 1000.0, 3)
+                    power_derived_from_vi = True
 
+            if _is_debug_target_cp(cp_id):
+                logging.warning(
+                    f"[DEBUG][MV][FINAL] "
+                    f"cp_id={cp_id} | tx_id={transaction_id} | connector_id={connector_id} | "
+                    f"last_ts={last_ts} | "
+                    f"final_voltage={batch_voltage} | "
+                    f"final_current={batch_current} | "
+                    f"final_power_kw={batch_power_kw} | "
+                    f"power_derived_from_vi={power_derived_from_vi} | "
+                    f"meter_rows={insert_count}"
+                )
 
             # =====================================================
             # ✅ 先更新即時狀態（讓 ΣV 計算拿得到最新 voltage）
@@ -4384,6 +4449,7 @@ def get_live_status(charge_point_id: str):
     if live is None:
         allocated_power_kw = None
         preview_current_a = None
+        active_cp_ids = []
 
         try:
             active_cp_ids = get_effective_active_cp_ids()
@@ -4392,6 +4458,15 @@ def get_live_status(charge_point_id: str):
                 preview_current_a = convert_power_kw_to_current_a(allocated_power_kw, cp_id)
         except Exception as e:
             logging.exception(f"[LIVE_STATUS][INIT_FALLBACK_ERR] cp={cp_id} err={e}")
+
+        if _is_debug_target_cp(cp_id):
+            logging.warning(
+                f"[DEBUG][LIVE_API][INIT_NONE] "
+                f"cp_id={cp_id} | "
+                f"active_cp_ids={active_cp_ids} | "
+                f"allocated_power_kw={allocated_power_kw} | "
+                f"preview_current_a={preview_current_a}"
+            )
 
         return {
             "timestamp": None,
@@ -4500,7 +4575,7 @@ def get_live_status(charge_point_id: str):
             if allocated_power_kw is not None
             else None
         )
-    return {
+    result = {
         "timestamp": live.get("timestamp"),
         "power": live.get("power", 0),
         "voltage": live.get("voltage", 0),
@@ -4515,6 +4590,23 @@ def get_live_status(charge_point_id: str):
         "allocated_power_kw": allocated_power_kw,
         "preview_current_a": preview_current_a,
     }
+
+    if _is_debug_target_cp(cp_id):
+        logging.warning(
+            f"[DEBUG][LIVE_API][RETURN] "
+            f"cp_id={cp_id} | "
+            f"timestamp={result.get('timestamp')} | "
+            f"power={result.get('power')} | "
+            f"voltage={result.get('voltage')} | "
+            f"current={result.get('current')} | "
+            f"allocated_power_kw={result.get('allocated_power_kw')} | "
+            f"preview_current_a={result.get('preview_current_a')} | "
+            f"derived={result.get('derived')} | "
+            f"live_cache_timestamp={live.get('timestamp')} | "
+            f"live_updated_at={live.get('updated_at')}"
+        )
+
+    return result
 
 from ocpp.v16 import call as ocpp_call
 
