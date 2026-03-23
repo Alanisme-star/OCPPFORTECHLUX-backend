@@ -3236,6 +3236,9 @@ class ChargePoint(OcppChargePoint):
             batch_voltage = None
             batch_current = None
             batch_power_kw = None
+            batch_voltage_rank = 999
+            batch_current_rank = 999
+            batch_power_rank = 999
             last_ts = None
             latest_live_ts = None
 
@@ -3269,6 +3272,9 @@ class ChargePoint(OcppChargePoint):
                                 batch_voltage = None
                                 batch_current = None
                                 batch_power_kw = None
+                                batch_voltage_rank = 999
+                                batch_current_rank = 999
+                                batch_power_rank = 999
                             latest_live_ts = ts
 
                     for sv in sampled_list:
@@ -3314,13 +3320,35 @@ class ChargePoint(OcppChargePoint):
                             continue
 
                         meas_s = str(meas or "")
+                        phase_s = str(phase or "").strip()
+
+                        def _phase_rank(p: str) -> int:
+                            # 越小越優先：None/空白 最優先，其次 L1，其餘先不採用
+                            if p == "":
+                                return 0
+                            if p.upper() == "L1":
+                                return 1
+                            return 99
+
+                        phase_rank = _phase_rank(phase_s)
 
                         if meas_s == "Voltage" or meas_s.startswith("Voltage."):
-                            batch_voltage = val
+                            prev_rank = locals().get("batch_voltage_rank", 999)
+                            if phase_rank < prev_rank:
+                                batch_voltage = val
+                                batch_voltage_rank = phase_rank
+
                         elif meas_s.startswith("Current.Import"):
-                            batch_current = val
+                            prev_rank = locals().get("batch_current_rank", 999)
+                            if phase_rank < prev_rank:
+                                batch_current = val
+                                batch_current_rank = phase_rank
+
                         elif meas_s.startswith("Power.Active.Import"):
-                            batch_power_kw = _to_kw(val, unit)
+                            prev_rank = locals().get("batch_power_rank", 999)
+                            if phase_rank < prev_rank:
+                                batch_power_kw = _to_kw(val, unit)
+                                batch_power_rank = phase_rank
                         # === 能量 / 金額（原邏輯保留）===
                         if "Energy.Active.Import" in meas:
                             try:
