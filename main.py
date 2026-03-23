@@ -4210,12 +4210,29 @@ def get_last_tx_summary_by_cp(charge_point_id: str):
         # unpack 六個欄位
         tx_id, id_tag, start_ts, stop_ts, meter_start, meter_stop = row
 
-        # 查 payments 總額
+        # 先抓 payments 總額（若交易已正式結帳可直接使用）
         cur.execute(
             "SELECT total_amount FROM payments WHERE transaction_id = ?", (tx_id,)
         )
         pay = cur.fetchone()
-        total_amount = float(pay[0]) if pay else 0.0
+        payment_total_amount = float(pay[0]) if pay else 0.0
+
+        # 交易進行中：優先用即時分段電價重算目前累計金額
+        try:
+            breakdown = _calculate_multi_period_cost_detailed(tx_id)
+            live_total_amount = float(breakdown.get("total") or 0.0)
+            pricing_segments = breakdown.get("segments") or []
+        except Exception as e:
+            logging.exception(
+                f"[CURRENT_TX_SUMMARY][PRICE_BREAKDOWN_ERR] "
+                f"cp_id={cp_id} | tx_id={tx_id} | err={e}"
+            )
+            live_total_amount = 0.0
+            pricing_segments = []
+
+        # 進行中頁面要顯示「目前累計費用」
+        # 若 payments 已有正式值可保留，但通常 stop 前會是 0
+        total_amount = live_total_amount if live_total_amount > 0 else payment_total_amount
 
         # 計算最終電量（kWh）
         final_energy = None
@@ -4233,9 +4250,13 @@ def get_last_tx_summary_by_cp(charge_point_id: str):
             "id_tag": id_tag,
             "start_timestamp": start_ts,
             "stop_timestamp": stop_ts,
-            "total_amount": total_amount,
+            "total_amount": round(float(total_amount), 2),
+            "estimated_amount": round(float(live_total_amount), 2),
+            "payment_total_amount": round(float(payment_total_amount), 2),
             "final_energy_kwh": final_energy,
-            "final_cost": total_amount,  # final_cost 與 total_amount 相同
+            "final_cost": round(float(total_amount), 2),
+            "pricing_breakdown_total": round(float(live_total_amount), 2),
+            "pricing_segments": pricing_segments,
         }
 
 
@@ -4322,12 +4343,28 @@ def get_current_tx_summary_by_cp(charge_point_id: str):
 
         tx_id, id_tag, start_ts, stop_ts, meter_start, meter_stop = row
 
-        # 查 payments 總額
+        # 先抓 payments 總額（若交易已正式結帳可直接使用）
         cur.execute(
             "SELECT total_amount FROM payments WHERE transaction_id = ?", (tx_id,)
         )
         pay = cur.fetchone()
-        total_amount = float(pay[0]) if pay else 0.0
+        payment_total_amount = float(pay[0]) if pay else 0.0
+
+        # 交易進行中：優先用即時分段電價重算目前累計金額
+        try:
+            breakdown = _calculate_multi_period_cost_detailed(tx_id)
+            live_total_amount = float(breakdown.get("total") or 0.0)
+            pricing_segments = breakdown.get("segments") or []
+        except Exception as e:
+            logging.exception(
+                f"[CURRENT_TX_SUMMARY][PRICE_BREAKDOWN_ERR] "
+                f"cp_id={cp_id} | tx_id={tx_id} | err={e}"
+            )
+            live_total_amount = 0.0
+            pricing_segments = []
+
+        # 進行中頁面要顯示「目前累計費用」
+        total_amount = live_total_amount if live_total_amount > 0 else payment_total_amount
 
         # 計算最終電量（進行中可能還在增加）
         final_energy = None
@@ -4339,17 +4376,30 @@ def get_current_tx_summary_by_cp(charge_point_id: str):
             except Exception:
                 final_energy = None
 
+        if _is_debug_target_cp(cp_id):
+            logging.warning(
+                f"[DEBUG][CURRENT_TX_SUMMARY] "
+                f"cp_id={cp_id} | tx_id={tx_id} | "
+                f"payment_total_amount={payment_total_amount} | "
+                f"live_total_amount={live_total_amount} | "
+                f"returned_total_amount={total_amount} | "
+                f"segments_count={len(pricing_segments)}"
+            )
+
         return {
             "found": True,
             "transaction_id": tx_id,
             "id_tag": id_tag,
             "start_timestamp": start_ts,
             "stop_timestamp": stop_ts,
-            "total_amount": total_amount,
+            "total_amount": round(float(total_amount), 2),
+            "estimated_amount": round(float(live_total_amount), 2),
+            "payment_total_amount": round(float(payment_total_amount), 2),
             "final_energy_kwh": final_energy,
-            "final_cost": total_amount,
+            "final_cost": round(float(total_amount), 2),
+            "pricing_breakdown_total": round(float(live_total_amount), 2),
+            "pricing_segments": pricing_segments,
         }
-
 
 @app.get("/api/charge-points/{charge_point_id}/last-finished-transaction/summary")
 def get_last_finished_tx_summary_by_cp(charge_point_id: str):
@@ -4478,6 +4528,7 @@ def get_live_status(charge_point_id: str):
             "estimated_amount": 0,
             "price_per_kwh": 0,
             "derived": False,
+            "stale": True,
             "managed_by": "power",
             "single_cp_max_power_kw": float(SINGLE_CP_MAX_POWER_KW),
             "allocated_power_kw": allocated_power_kw,
@@ -4525,9 +4576,9 @@ def get_live_status(charge_point_id: str):
 
             stale = {
                 "timestamp": ts,
-                "power": 0,
-                "voltage": 0,
-                "current": 0,
+                "power": live.get("power", 0),
+                "voltage": live.get("voltage", 0),
+                "current": live.get("current", 0),
                 "energy": live.get("energy", 0),
                 "estimated_energy": live.get("estimated_energy", 0),
                 "estimated_amount": live.get("estimated_amount", 0),
@@ -4539,7 +4590,21 @@ def get_live_status(charge_point_id: str):
                 "allocated_power_kw": allocated_power_kw,
                 "preview_current_a": preview_current_a,
             }
-            live_status_cache[cp_id] = stale
+
+            if _is_debug_target_cp(cp_id):
+                logging.warning(
+                    f"[DEBUG][LIVE_API][STALE_RETURN] "
+                    f"cp_id={cp_id} | "
+                    f"timestamp={stale.get('timestamp')} | "
+                    f"power={stale.get('power')} | "
+                    f"voltage={stale.get('voltage')} | "
+                    f"current={stale.get('current')} | "
+                    f"allocated_power_kw={stale.get('allocated_power_kw')} | "
+                    f"preview_current_a={stale.get('preview_current_a')} | "
+                    f"live_cache_timestamp={live.get('timestamp')} | "
+                    f"live_updated_at={live.get('updated_at')}"
+                )
+
             return stale
 
     # ✅ 一般正常回傳時，也不要優先沿用 cache 舊 allocation
@@ -4575,6 +4640,7 @@ def get_live_status(charge_point_id: str):
             if allocated_power_kw is not None
             else None
         )
+
     result = {
         "timestamp": live.get("timestamp"),
         "power": live.get("power", 0),
@@ -4585,6 +4651,7 @@ def get_live_status(charge_point_id: str):
         "estimated_amount": live.get("estimated_amount", 0),
         "price_per_kwh": live.get("price_per_kwh", 0),
         "derived": live.get("derived", False),
+        "stale": False,
         "managed_by": "power",
         "single_cp_max_power_kw": float(SINGLE_CP_MAX_POWER_KW),
         "allocated_power_kw": allocated_power_kw,
