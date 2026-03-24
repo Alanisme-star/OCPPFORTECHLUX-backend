@@ -143,19 +143,16 @@ async def finalize_ws_disconnect_cleanup(cp_norm: str, expected_cp=None):
 
         # ==================================================
         # B) 若 grace 到期時仍有 active transaction
-        #    → 維持 last known status / Charging，不可寫 Available
+        #    → 不再維持 Charging 畫面，改標記為 Unavailable / ConnectionLost
+        #    → 但先不自動 stop transaction，避免高風險改動
         # ==================================================
         if has_active_tx:
             prev_status = charging_point_status.get(cp_norm, {}) or {}
-            keep_status = prev_status.get("status") or "Charging"
-
-            if keep_status in ("Available", "Unknown", "未知"):
-                keep_status = "Charging"
 
             charging_point_status[cp_norm] = {
                 **prev_status,
                 "connector_id": int(prev_status.get("connector_id") or 1),
-                "status": keep_status,
+                "status": "Unavailable",
                 "timestamp": now,
                 "error_code": "ConnectionLost",
                 "derived": True,
@@ -166,15 +163,20 @@ async def finalize_ws_disconnect_cleanup(cp_norm: str, expected_cp=None):
             prev_live = live_status_cache.get(cp_norm, {}) or {}
             live_status_cache[cp_norm] = {
                 **prev_live,
-                "status": prev_live.get("status") or keep_status,
+                "status": "Unavailable",
+                "power": 0,
+                "voltage": 0,
+                "current": 0,
+                "estimated_energy": prev_live.get("estimated_energy", 0),
+                "estimated_amount": prev_live.get("estimated_amount", 0),
                 "derived": True,
                 "ws_grace_expired": True,
                 "updated_at": time.time(),
             }
 
             logger.warning(
-                f"[WS_DISCONNECT][KEEP_LAST_STATUS] "
-                f"cp_id={cp_norm} | tx_id={latest_tx_id} | status={keep_status}"
+                f"[WS_DISCONNECT][MARK_UNAVAILABLE_AFTER_GRACE] "
+                f"cp_id={cp_norm} | tx_id={latest_tx_id} | status=Unavailable"
             )
 
         # ==================================================
@@ -5067,7 +5069,19 @@ def get_card_balance(id_tag: str):
 def get_charge_point_status(charge_point_id: str):
     cp = _normalize_cp_id(charge_point_id)
 
-    # ✅ 1) 優先用 DB 判斷：只要有未結束交易，就視為 Charging（避免被 WS 斷線強制 Available 影響）
+    cached_status = charging_point_status.get(cp) or {}
+
+    # ✅ 若已經是 grace 到期後的 ws 斷線狀態，就不要再被 DB active tx 強制洗回 Charging
+    if (
+        cached_status.get("ws_grace_expired") is True
+        and cp not in connected_charge_points
+        and not is_cp_in_ws_disconnect_grace(cp)
+    ):
+        if cached_status.get("status") == "未知":
+            return {**cached_status, "status": "Unknown"}
+        return cached_status
+
+    # ✅ 1) 優先用 DB 判斷：只要有未結束交易，就視為 Charging
     try:
         with sqlite3.connect(DB_FILE, check_same_thread=False) as conn:
             cur = conn.cursor()
