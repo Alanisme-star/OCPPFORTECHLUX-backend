@@ -3225,9 +3225,17 @@ class ChargePoint(OcppChargePoint):
                 kwargs, "transactionId", "transaction_id", "TransactionId", default=""
             )
 
+            meter_values_t0 = time.time()
+
+            if _is_debug_target_cp(cp_id):
+                logging.warning(
+                    f"[DEBUG][MV][ENTER] "
+                    f"cp_id={cp_id} | transaction_id={transaction_id} | "
+                    f"connector_id={connector_id}"
+                )
+
             meter_value_list = (
-                pick(kwargs, "meterValue", "meter_value", "MeterValue", default=[])
-                or []
+                pick(kwargs, "meterValue", "meter_value", default=[]) or []
             )
             if not isinstance(meter_value_list, list):
                 meter_value_list = [meter_value_list]
@@ -3477,11 +3485,19 @@ class ChargePoint(OcppChargePoint):
                             f"active_cp_ids={active_cp_ids} | action=re_send_limit"
                         )
 
-                        await send_current_limit_profile(
-                            cp=self,
-                            connector_id=int(connector_id or 1),
-                            limit_a=theory_a,
-                            tx_id=int(transaction_id) if str(transaction_id).isdigit() else None,
+                        asyncio.create_task(
+                            send_current_limit_profile(
+                                cp=connected_charge_points[cp_id],
+                                connector_id=int(connector_id or 1),
+                                limit_a=theory_a,
+                                tx_id=int(transaction_id) if str(transaction_id).isdigit() else None,
+                            )
+                        )
+
+                        logging.warning(
+                            f"[FORCE-CLAMP][ASYNC_DISPATCH] "
+                            f"cp_id={cp_id} | connector_id={connector_id} | "
+                            f"transaction_id={transaction_id} | theory_a={theory_a}"
                         )
 
             except Exception as e:
@@ -3497,10 +3513,25 @@ class ChargePoint(OcppChargePoint):
                 f"| meter_rows={insert_count}"
             )
 
+            if _is_debug_target_cp(cp_id):
+                logging.warning(
+                    f"[DEBUG][MV][EXIT] "
+                    f"cp_id={cp_id} | transaction_id={transaction_id} | "
+                    f"elapsed_ms={(time.time() - meter_values_t0) * 1000:.1f}"
+                )
+
             return call_result.MeterValuesPayload()
 
         except Exception as e:
             logging.exception(f"❌ 處理 MeterValues 例外：{e}")
+
+            if 'cp_id' in locals() and _is_debug_target_cp(cp_id):
+                logging.warning(
+                    f"[DEBUG][MV][EXIT_ERR] "
+                    f"cp_id={cp_id} | transaction_id={transaction_id} | "
+                    f"elapsed_ms={(time.time() - meter_values_t0) * 1000:.1f}"
+                )
+
             return call_result.MeterValuesPayload()
 
     @on(Action.RemoteStopTransaction)
