@@ -300,12 +300,12 @@ from reportlab.pdfgen import canvas
 # 🔌 WebSocket 斷線寬限（實體樁 / 弱網環境保護）
 # ===============================
 def _get_ws_disconnect_grace_seconds() -> int:
-    raw = os.getenv("WS_DISCONNECT_GRACE_SECONDS", "180")
+    raw = os.getenv("WS_DISCONNECT_GRACE_SECONDS", "60")
     try:
         value = int(str(raw).strip())
         return max(0, value)
     except Exception:
-        return 180
+        return 60
 
 
 WS_DISCONNECT_GRACE_SECONDS = _get_ws_disconnect_grace_seconds()
