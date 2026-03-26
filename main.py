@@ -5351,28 +5351,109 @@ async def get_transactions(
 
 
 def compute_transaction_cost(transaction_id: int):
-    cursor = conn.cursor()
-    cursor.execute(
-        """
-        SELECT total_amount
-        FROM payments
-        WHERE transaction_id = ?
-    """,
-        (transaction_id,),
-    )
-    row = cursor.fetchone()
-    if row:
-        return {"transaction_id": transaction_id, "total_amount": row[0]}
-    else:
-        raise HTTPException(status_code=404, detail="Transaction not found")
+    with get_conn() as conn:
+        cur = conn.cursor()
+
+        # 1. 先查交易主資料，確認 transaction 存在
+        cur.execute(
+            """
+            SELECT transaction_id, charge_point_id, connector_id, id_tag,
+                   meter_start, start_timestamp, meter_stop, stop_timestamp, reason
+            FROM transactions
+            WHERE transaction_id = ?
+            """,
+            (transaction_id,),
+        )
+        tx = cur.fetchone()
+
+        if not tx:
+            raise HTTPException(status_code=404, detail="Transaction not found")
+
+        (
+            tx_id,
+            charge_point_id,
+            connector_id,
+            id_tag,
+            meter_start,
+            start_timestamp,
+            meter_stop,
+            stop_timestamp,
+            reason,
+        ) = tx
+
+        # 2. 查 payments 總金額（若已有正式帳單）
+        cur.execute(
+            """
+            SELECT total_amount
+            FROM payments
+            WHERE transaction_id = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (transaction_id,),
+        )
+        pay_row = cur.fetchone()
+        payment_total = float(pay_row[0]) if pay_row and pay_row[0] is not None else None
+
+        # 3. 用既有 helper 算分段明細
+        breakdown = _calculate_multi_period_cost_detailed(transaction_id)
+        breakdown_total = float(breakdown.get("total") or 0.0)
+        segments = breakdown.get("segments") or []
+
+        # 4. 這裡就是「只做欄位轉名」的地方
+        details = [
+            {
+                "from": seg.get("start"),
+                "to": seg.get("end"),
+                "kWh": round(float(seg.get("kwh") or 0.0), 6),
+                "price": float(seg.get("price") or 0.0),
+                "cost": round(float(seg.get("subtotal") or 0.0), 2),
+            }
+            for seg in segments
+        ]
+
+        # 5. cost 優先用 payments，沒有才退回 breakdown total
+        final_cost = round(
+            float(payment_total if payment_total is not None else breakdown_total), 2
+        )
+
+        # 6. 查卡片剩餘儲值金額
+        cur.execute(
+            """
+            SELECT balance
+            FROM cards
+            WHERE card_id = ?
+            """,
+            (id_tag,),
+        )
+        card_row = cur.fetchone()
+        remaining_balance = (
+            round(float(card_row[0]), 2)
+            if card_row and card_row[0] is not None
+            else None
+        )
+
+        return {
+            "transactionId": tx_id,
+            "chargePointId": charge_point_id,
+            "connectorId": connector_id,
+            "idTag": id_tag,
+            "startTimestamp": start_timestamp,
+            "stopTimestamp": stop_timestamp,
+            "cost": final_cost,
+            "details": details,
+            "remainingBalance": remaining_balance,
+        }
 
 
 @app.get("/api/transactions/{transaction_id}/cost")
 async def calculate_transaction_cost(transaction_id: int):
     try:
         return compute_transaction_cost(transaction_id)
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=404, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/api/transactions/{transaction_id}")
@@ -5386,16 +5467,25 @@ async def get_transaction_detail(transaction_id: int):
     if not row:
         raise HTTPException(status_code=404, detail="Transaction not found")
 
+    energy_kwh = None
+    if row[4] is not None and row[6] is not None:
+        try:
+            energy_kwh = round(max(0.0, (float(row[6]) - float(row[4])) / 1000.0), 6)
+        except Exception:
+            energy_kwh = None
+
     result = {
         "transactionId": row[0],
         "chargePointId": row[1],
         "connectorId": row[2],
         "idTag": row[3],
+        "cardNumber": row[3],
         "meterStart": row[4],
         "startTimestamp": row[5],
         "meterStop": row[6],
         "stopTimestamp": row[7],
         "reason": row[8],
+        "energyKwh": energy_kwh,
         "meterValues": [],
     }
 
