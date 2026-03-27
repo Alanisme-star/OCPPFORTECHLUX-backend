@@ -2730,6 +2730,17 @@ class ChargePoint(OcppChargePoint):
             # =================================================
             now_utc = datetime.utcnow().isoformat()
 
+            if _is_debug_target_cp(self.id):
+                logging.warning(
+                    f"[DEBUG][START_TX][TIME_INPUT] "
+                    f"cp_id={self.id} | "
+                    f"connector_id={connector_id} | "
+                    f"id_tag={id_tag} | "
+                    f"ocpp_timestamp={timestamp} | "
+                    f"server_now_utc={now_utc} | "
+                    f"meter_start={meter_start}"
+                )
+
             with sqlite3.connect(DB_FILE) as conn:
                 cursor = conn.cursor()
                 cursor.execute(
@@ -2847,6 +2858,15 @@ class ChargePoint(OcppChargePoint):
                 )
                 tx_id = cursor.lastrowid
                 conn.commit()
+
+            if _is_debug_target_cp(self.id):
+                logging.warning(
+                    f"[DEBUG][START_TX][DB_WRITE] "
+                    f"cp_id={self.id} | "
+                    f"tx_id={tx_id} | "
+                    f"written_start_timestamp={now_utc} | "
+                    f"ocpp_timestamp={timestamp}"
+                )
 
             logging.info(
                 f"🟢 StartTransaction Accepted | "
@@ -4441,6 +4461,8 @@ def get_current_tx_summary_by_cp(charge_point_id: str):
             logging.warning(
                 f"[DEBUG][CURRENT_TX_SUMMARY] "
                 f"cp_id={cp_id} | tx_id={tx_id} | "
+                f"start_ts={start_ts} | stop_ts={stop_ts} | "
+                f"meter_start={meter_start} | meter_stop={meter_stop} | "
                 f"payment_total_amount={payment_total_amount} | "
                 f"live_total_amount={live_total_amount} | "
                 f"returned_total_amount={total_amount} | "
