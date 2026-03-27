@@ -2542,16 +2542,39 @@ class ChargePoint(OcppChargePoint):
                 return call_result.StatusNotificationPayload()
 
             # === 紀錄狀態歷史 ===
+            start_ts_to_save = timestamp or now_utc
+
             with sqlite3.connect(DB_FILE) as conn:
                 cursor = conn.cursor()
                 cursor.execute(
                     """
-                    INSERT INTO status_logs (charge_point_id, connector_id, status, timestamp)
-                    VALUES (?, ?, ?, ?)
+                    INSERT INTO transactions (
+                        charge_point_id,
+                        connector_id,
+                        id_tag,
+                        meter_start,
+                        start_timestamp
+                    ) VALUES (?, ?, ?, ?, ?)
                     """,
-                    (cp_id, connector_id, status, timestamp),
+                    (
+                        self.id,
+                        connector_id,
+                        id_tag,
+                        int(meter_start),
+                        start_ts_to_save,
+                    ),
                 )
+                tx_id = cursor.lastrowid
                 conn.commit()
+
+            if _is_debug_target_cp(self.id):
+                logging.warning(
+                    f"[DEBUG][START_TX][DB_WRITE] "
+                    f"cp_id={self.id} | "
+                    f"tx_id={tx_id} | "
+                    f"written_start_timestamp={start_ts_to_save} | "
+                    f"ocpp_timestamp={timestamp}"
+                )
 
             # === 更新即時狀態 ===
             charging_point_status[cp_id] = {
