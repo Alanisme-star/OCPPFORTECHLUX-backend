@@ -2878,6 +2878,27 @@ class ChargePoint(OcppChargePoint):
             # =================================================
             # [4] 建立交易（⚠️ 只做 DB，不做 await）
             # =================================================
+            start_ts_to_save = now_utc
+
+            if timestamp:
+                try:
+                    parsed_start_ts = datetime.fromisoformat(
+                        str(timestamp).replace("Z", "+00:00")
+                    )
+                    if parsed_start_ts.tzinfo is None:
+                        parsed_start_ts = parsed_start_ts.replace(
+                            tzinfo=timezone.utc
+                        )
+                    start_ts_to_save = parsed_start_ts.astimezone(
+                        timezone.utc
+                    ).isoformat()
+                except Exception:
+                    start_ts_to_save = str(timestamp)
+            else:
+                start_ts_to_save = datetime.utcnow().replace(
+                    tzinfo=timezone.utc
+                ).isoformat()
+
             with sqlite3.connect(DB_FILE) as conn:
                 cursor = conn.cursor()
                 cursor.execute(
@@ -2895,7 +2916,7 @@ class ChargePoint(OcppChargePoint):
                         connector_id,
                         id_tag,
                         int(meter_start),
-                        now_utc,
+                        start_ts_to_save,
                     ),
                 )
                 tx_id = cursor.lastrowid
@@ -2906,7 +2927,7 @@ class ChargePoint(OcppChargePoint):
                     f"[DEBUG][START_TX][DB_WRITE] "
                     f"cp_id={self.id} | "
                     f"tx_id={tx_id} | "
-                    f"written_start_timestamp={now_utc} | "
+                    f"written_start_timestamp={start_ts_to_save} | "
                     f"ocpp_timestamp={timestamp}"
                 )
 
