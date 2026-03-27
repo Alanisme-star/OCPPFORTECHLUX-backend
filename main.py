@@ -2542,7 +2542,26 @@ class ChargePoint(OcppChargePoint):
                 return call_result.StatusNotificationPayload()
 
             # === 紀錄狀態歷史 ===
-            start_ts_to_save = timestamp or now_utc
+            start_ts_to_save = now_utc
+
+            if timestamp:
+                try:
+                    parsed_start_ts = datetime.fromisoformat(
+                        str(timestamp).replace("Z", "+00:00")
+                    )
+                    if parsed_start_ts.tzinfo is None:
+                        parsed_start_ts = parsed_start_ts.replace(
+                            tzinfo=timezone.utc
+                        )
+                    start_ts_to_save = parsed_start_ts.astimezone(
+                        timezone.utc
+                    ).isoformat()
+                except Exception:
+                    start_ts_to_save = str(timestamp)
+            else:
+                start_ts_to_save = datetime.utcnow().replace(
+                    tzinfo=timezone.utc
+                ).isoformat()
 
             with sqlite3.connect(DB_FILE) as conn:
                 cursor = conn.cursor()
