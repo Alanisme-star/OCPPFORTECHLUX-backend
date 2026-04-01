@@ -2831,6 +2831,16 @@ class ChargePoint(OcppChargePoint):
             status_db = row[0]
 
             if status_db != "Accepted":
+                logging.warning(
+                    f"🔴 StartTransaction Blocked：idTag={id_tag} | status_db={status_db}"
+                )
+                logging.warning(
+                    f"[DEBUG][START_TX][EXIT] "
+                    f"cp_id={self.id} | transaction_id=0 | result=Blocked | total_ms={_ms_since(tx_t0)}"
+                )
+                return call_result.StartTransactionPayload(
+                    transaction_id=0, id_tag_info={"status": "Blocked"}
+                )
 
             status_db = row[0]
 
