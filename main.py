@@ -916,6 +916,13 @@ def pick(d: dict, *names, default=None):
     return default
 
 
+def _ms_since(start_ts: float) -> int:
+    try:
+        return int((time.perf_counter() - start_ts) * 1000)
+    except Exception:
+        return -1
+
+
 # ✅ 不再需要 connected_devices
 # ✅ 直接依據 connected_charge_points 來判定目前「已連線」的樁
 
@@ -1272,14 +1279,21 @@ async def _accept_or_reject_ws(websocket: WebSocket, raw_cp_id: str):
 
 @app.websocket("/{charge_point_id:path}")
 async def websocket_endpoint(websocket: WebSocket, charge_point_id: str):
+    ws_t0 = time.perf_counter()
+
     print(
         f"🌐 WS attempt | raw_path={charge_point_id} | headers={dict(websocket.headers)}"
     )
+
     try:
         # 1) 驗證 + accept(subprotocol="ocpp1.6")，並回傳標準化 cp_id
         cp_id = await _accept_or_reject_ws(websocket, charge_point_id)
         if cp_id is None:
             return
+
+        logging.warning(
+            f"[DEBUG][WS][ACCEPTED] cp_id={cp_id} | alive_ms={_ms_since(ws_t0)}"
+        )
 
         # 2) 啟動 OCPP handler
         cp = ChargePoint(cp_id, FastAPIWebSocketAdapter(websocket))
@@ -1289,16 +1303,26 @@ async def websocket_endpoint(websocket: WebSocket, charge_point_id: str):
         await cp.start()
 
     except WebSocketDisconnect:
-        logger.warning(f"⚠️ Disconnected: {charge_point_id}")
+        logger.warning(
+            f"[DEBUG][WS][DISCONNECTED] cp_id={_normalize_cp_id(charge_point_id)} | "
+            f"alive_ms={_ms_since(ws_t0)}"
+        )
 
     except Exception as e:
-        logger.error(f"❌ WebSocket error for {charge_point_id}: {e}")
+        logger.error(
+            f"[DEBUG][WS][ERR] cp_id={_normalize_cp_id(charge_point_id)} | "
+            f"alive_ms={_ms_since(ws_t0)} | err={e}"
+        )
         try:
             await websocket.close()
         except Exception:
             pass
 
     finally:
+        logger.warning(
+            f"[DEBUG][WS][FINALLY] cp_id={_normalize_cp_id(charge_point_id)} | "
+            f"alive_ms={_ms_since(ws_t0)}"
+        )
         cp_norm = _normalize_cp_id(charge_point_id)
 
         # ==================================================
@@ -2651,7 +2675,7 @@ class ChargePoint(OcppChargePoint):
         now = datetime.utcnow().replace(tzinfo=timezone.utc)
 
         try:
-            logging.info(
+            logging.warning(
                 f"🔌 BootNotification | CP={self.id} | 模型={charge_point_model} | 廠商={charge_point_vendor}"
             )
 
@@ -2670,7 +2694,7 @@ class ChargePoint(OcppChargePoint):
                 # 🟡 正式環境：預設一律不支援（安全）
                 self.supports_smart_charging = False
 
-                logging.info(
+                logging.warning(
                     f"[CAPABILITY][DEFAULT] CP={self.id} | "
                     f"FORCE_SMART_CHARGING=0 | supports_smart_charging=False"
                 )
@@ -2697,24 +2721,52 @@ class ChargePoint(OcppChargePoint):
     @on(Action.Heartbeat)
     async def on_heartbeat(self):
         now = datetime.utcnow().replace(tzinfo=timezone.utc)
-        logging.info(f"❤️ Heartbeat | CP={self.id}")
+        logging.warning(f"❤️ Heartbeat | CP={self.id}")
         return call_result.HeartbeatPayload(current_time=now.isoformat())
 
     @on(Action.Authorize)
     async def on_authorize(self, id_tag, **kwargs):
-        with get_conn() as _c:
-            cur = _c.cursor()
-            cur.execute("SELECT status FROM id_tags WHERE id_tag = ?", (id_tag,))
-            row = cur.fetchone()
+        t0 = time.perf_counter()
+        cp_id = getattr(self, "id", "unknown")
+
+        logging.warning(
+            f"[DEBUG][AUTHORIZE][ENTER] cp_id={cp_id} | idTag={id_tag}"
+        )
+
+        try:
+            t_db = time.perf_counter()
+
+            with get_conn() as _c:
+                cur = _c.cursor()
+                cur.execute("SELECT status FROM id_tags WHERE id_tag = ?", (id_tag,))
+                row = cur.fetchone()
+
+            db_ms = _ms_since(t_db)
 
             if not row:
                 status = "Invalid"
+                status_db = None
             else:
                 status_db = row[0]
                 status = "Accepted" if status_db == "Accepted" else "Blocked"
 
-        logging.info(f"🆔 Authorize | idTag={id_tag} → {status}")
-        return call_result.AuthorizePayload(id_tag_info={"status": status})
+            total_ms = _ms_since(t0)
+
+            logging.warning(
+                f"[DEBUG][AUTHORIZE][EXIT] "
+                f"cp_id={cp_id} | idTag={id_tag} | status_db={status_db} | "
+                f"result={status} | db_ms={db_ms} | total_ms={total_ms}"
+            )
+
+            return call_result.AuthorizePayload(id_tag_info={"status": status})
+
+        except Exception as e:
+            total_ms = _ms_since(t0)
+            logging.exception(
+                f"[DEBUG][AUTHORIZE][ERR] "
+                f"cp_id={cp_id} | idTag={id_tag} | total_ms={total_ms} | err={e}"
+            )
+            return call_result.AuthorizePayload(id_tag_info={"status": "Invalid"})
 
     @on(Action.StartTransaction)
     async def on_start_transaction(
@@ -2728,6 +2780,8 @@ class ChargePoint(OcppChargePoint):
         """
 
         try:
+            tx_t0 = time.perf_counter()
+
             # =================================================
             # [0] SmartCharging 能力保證（debug / 防 cp instance 問題）
             # =================================================
@@ -2744,24 +2798,49 @@ class ChargePoint(OcppChargePoint):
                 f"supports_smart_charging={getattr(self, 'supports_smart_charging', 'MISSING')}"
             )
 
+            logging.warning(
+                f"[DEBUG][START_TX][INPUT] "
+                f"cp_id={self.id} | connector_id={connector_id} | idTag={id_tag} | "
+                f"meter_start={meter_start} | timestamp={timestamp}"
+            )
+
             # =================================================
             # [1] idTag 驗證
             # =================================================
+            t_step = time.perf_counter()
             with get_conn() as _c:
                 cur = _c.cursor()
                 cur.execute("SELECT status FROM id_tags WHERE id_tag = ?", (id_tag,))
                 row = cur.fetchone()
 
+            logging.warning(
+                f"[DEBUG][START_TX][STEP] "
+                f"cp_id={self.id} | step=id_tags_lookup | ms={_ms_since(t_step)}"
+            )
+
             if not row:
                 logging.warning(f"🔴 StartTransaction Invalid：idTag={id_tag} 不存在")
+                logging.warning(
+                    f"[DEBUG][START_TX][EXIT] "
+                    f"cp_id={self.id} | transaction_id=0 | result=Invalid | total_ms={_ms_since(tx_t0)}"
+                )
                 return call_result.StartTransactionPayload(
                     transaction_id=0, id_tag_info={"status": "Invalid"}
                 )
 
             status_db = row[0]
+
+            if status_db != "Accepted":
+
+            status_db = row[0]
+
             if status_db != "Accepted":
                 logging.warning(
                     f"🔴 StartTransaction Blocked：idTag={id_tag} | status_db={status_db}"
+                )
+                logging.warning(
+                    f"[DEBUG][START_TX][EXIT] "
+                    f"cp_id={self.id} | transaction_id=0 | result=Blocked | total_ms={_ms_since(tx_t0)}"
                 )
                 return call_result.StartTransactionPayload(
                     transaction_id=0, id_tag_info={"status": "Blocked"}
@@ -2783,7 +2862,8 @@ class ChargePoint(OcppChargePoint):
                     f"meter_start={meter_start}"
                 )
 
-            with sqlite3.connect(DB_FILE) as conn:
+            t_step = time.perf_counter()
+            with sqlite3.connect(DB_FILE, check_same_thread=False, timeout=15) as conn:
                 cursor = conn.cursor()
                 cursor.execute(
                     """
@@ -2801,20 +2881,36 @@ class ChargePoint(OcppChargePoint):
                         (res[0],),
                     )
                     conn.commit()
-                    logging.info(
-                        f"🟡 Reservation completed | cp={self.id} | idTag={id_tag}"
-                    )
 
+            logging.warning(
+                f"[DEBUG][START_TX][STEP] "
+                f"cp_id={self.id} | step=reservation_lookup | ms={_ms_since(t_step)} | hit={bool(res)}"
+            )
+
+            if res:
+                logging.warning(
+                    f"🟡 Reservation completed | cp={self.id} | idTag={id_tag}"
+                )
             # =================================================
             # [3] 餘額檢查
             # =================================================
-            with sqlite3.connect(DB_FILE) as conn:
+            t_step = time.perf_counter()
+            with sqlite3.connect(DB_FILE, check_same_thread=False, timeout=15) as conn:
                 cursor = conn.cursor()
                 cursor.execute("SELECT balance FROM cards WHERE card_id = ?", (id_tag,))
                 card = cursor.fetchone()
 
+            logging.warning(
+                f"[DEBUG][START_TX][STEP] "
+                f"cp_id={self.id} | step=card_balance_lookup | ms={_ms_since(t_step)}"
+            )
+
             if not card:
                 logging.warning(f"🔴 StartTransaction Invalid：card {id_tag} 不存在")
+                logging.warning(
+                    f"[DEBUG][START_TX][EXIT] "
+                    f"cp_id={self.id} | transaction_id=0 | result=Invalid | total_ms={_ms_since(tx_t0)}"
+                )
                 return call_result.StartTransactionPayload(
                     transaction_id=0, id_tag_info={"status": "Invalid"}
                 )
@@ -2824,10 +2920,13 @@ class ChargePoint(OcppChargePoint):
                 logging.warning(
                     f"🔴 StartTransaction Blocked：idTag={id_tag} | balance={balance}"
                 )
+                logging.warning(
+                    f"[DEBUG][START_TX][EXIT] "
+                    f"cp_id={self.id} | transaction_id=0 | result=Blocked | total_ms={_ms_since(tx_t0)}"
+                )
                 return call_result.StartTransactionPayload(
                     transaction_id=0, id_tag_info={"status": "Blocked"}
                 )
-
             # ==================================================
             # [3.5] 🏘️ Smart Charging：最後一台車輛擋下判斷（第一階段：功率分配模式）
             # ==================================================
@@ -2865,6 +2964,10 @@ class ChargePoint(OcppChargePoint):
                         f"reason=avg_power_below_min_threshold | "
                         f"trial_count={trial_count}"
                     )
+                    logging.warning(
+                        f"[DEBUG][START_TX][EXIT] "
+                        f"cp_id={self.id} | transaction_id=0 | result=Blocked | total_ms={_ms_since(tx_t0)}"
+                    )
                     return call_result.StartTransactionPayload(
                         transaction_id=0,
                         id_tag_info={"status": "Blocked"},
@@ -2899,7 +3002,8 @@ class ChargePoint(OcppChargePoint):
                     tzinfo=timezone.utc
                 ).isoformat()
 
-            with sqlite3.connect(DB_FILE) as conn:
+            t_step = time.perf_counter()
+            with sqlite3.connect(DB_FILE, check_same_thread=False, timeout=15) as conn:
                 cursor = conn.cursor()
                 cursor.execute(
                     """
@@ -2922,6 +3026,11 @@ class ChargePoint(OcppChargePoint):
                 tx_id = cursor.lastrowid
                 conn.commit()
 
+            logging.warning(
+                f"[DEBUG][START_TX][STEP] "
+                f"cp_id={self.id} | step=insert_transaction | ms={_ms_since(t_step)} | transaction_id={tx_id}"
+            )
+
             if _is_debug_target_cp(self.id):
                 logging.warning(
                     f"[DEBUG][START_TX][DB_WRITE] "
@@ -2931,7 +3040,7 @@ class ChargePoint(OcppChargePoint):
                     f"ocpp_timestamp={timestamp}"
                 )
 
-            logging.info(
+            logging.warning(
                 f"🟢 StartTransaction Accepted | "
                 f"cp={self.id} | connector={connector_id} | "
                 f"idTag={id_tag} | tx_id={tx_id} | balance={balance}"
@@ -2964,6 +3073,10 @@ class ChargePoint(OcppChargePoint):
             # =================================================
             # [5] ✅ 正常回覆（最重要）
             # =================================================
+            logging.warning(
+                f"[DEBUG][START_TX][EXIT] "
+                f"cp_id={self.id} | transaction_id={int(tx_id)} | result=Accepted | total_ms={_ms_since(tx_t0)}"
+            )
             return call_result.StartTransactionPayload(
                 transaction_id=int(tx_id),
                 id_tag_info={"status": "Accepted"},
@@ -2974,7 +3087,8 @@ class ChargePoint(OcppChargePoint):
             # [X] 防爆：任何例外都必須回 CALLRESULT
             # =================================================
             logging.exception(
-                f"💥 [START_TX][EXCEPTION] cp={getattr(self, 'id', '?')} | idTag={id_tag}"
+                f"[DEBUG][START_TX][ERR] "
+                f"cp_id={getattr(self, 'id', '?')} | idTag={id_tag} | total_ms={_ms_since(tx_t0)} | err={e}"
             )
             return call_result.StartTransactionPayload(
                 transaction_id=0,
@@ -2988,7 +3102,7 @@ class ChargePoint(OcppChargePoint):
         # ==================================================
         # DEBUG：原始 StopTransaction payload（低噪音）
         # ==================================================
-        logger.info(
+        logger.warning(
             "[STOP][RAW] cp_id=%s | keys=%s | kwargs=%s",
             cp_id,
             list(kwargs.keys()),
@@ -5255,10 +5369,16 @@ def get_transaction_summary(transaction_id: str):
         if not row:
             return {"found": False}
 
-        id_tag, total_amount = row[0], float(row[1] or 0.0)
-        cur.execute("SELECT balance FROM cards WHERE card_id = ?", (id_tag,))
-        c = cur.fetchone()
-        balance = float(c[0]) if c else 0.0
+        t_step = time.perf_counter()
+        with get_conn() as _c:
+            cur = _c.cursor()
+            cur.execute("SELECT balance FROM cards WHERE card_id = ?", (id_tag,))
+            card_row = cur.fetchone()
+
+        logging.warning(
+            f"[DEBUG][START_TX][STEP] "
+            f"cp_id={self.id} | step=card_balance_lookup | ms={_ms_since(t_step)}"
+        )
 
         return {
             "found": True,
