@@ -2399,6 +2399,14 @@ CREATE TABLE IF NOT EXISTS status_logs (
 """
 )
 
+# ★ 舊庫相容：若既有資料表沒有 error_code 欄位，自動補上
+cursor.execute("PRAGMA table_info(status_logs)")
+_cols = [r[1] for r in cursor.fetchall()]
+if "error_code" not in _cols:
+    cursor.execute("ALTER TABLE status_logs ADD COLUMN error_code TEXT")
+    logging.warning("[DB][MIGRATE] status_logs.error_code added")
+else:
+    logging.warning("[DB][MIGRATE] status_logs.error_code already exists")
 
 conn.commit()
 
@@ -2592,15 +2600,49 @@ class ChargePoint(OcppChargePoint):
             try:
                 with sqlite3.connect(DB_FILE, check_same_thread=False, timeout=15) as conn:
                     cursor = conn.cursor()
-                    cursor.execute(
-                        """
-                        INSERT INTO status_logs
-                        (charge_point_id, connector_id, status, timestamp, error_code)
-                        VALUES (?, ?, ?, ?, ?)
-                        """,
-                        (cp_id, connector_id, status, status_ts_utc, error_code),
-                    )
-                    conn.commit()
+
+                    try:
+                        cursor.execute(
+                            """
+                            INSERT INTO status_logs
+                            (charge_point_id, connector_id, status, timestamp, error_code)
+                            VALUES (?, ?, ?, ?, ?)
+                            """,
+                            (cp_id, connector_id, status, status_ts_utc, error_code),
+                        )
+                        conn.commit()
+
+                    except sqlite3.OperationalError as e:
+                        if "no column named error_code" in str(e):
+                            logging.warning(
+                                f"[STATUS][DB_LOG_FALLBACK] "
+                                f"cp_id={cp_id} | connector_id={connector_id} | err={e}"
+                            )
+                            cursor.execute(
+                                """
+                                INSERT INTO status_logs
+                                (charge_point_id, connector_id, status, timestamp)
+                                VALUES (?, ?, ?, ?)
+                                """,
+                                (cp_id, connector_id, status, status_ts_utc),
+                            )
+                            conn.commit()
+
+                            logging.warning(
+                                f"[STATUS][DB_LOG_FALLBACK_OK] "
+                                f"cp_id={cp_id} | connector_id={connector_id} | "
+                                f"status={status} | timestamp={status_ts_utc}"
+                            )
+
+                            logging.warning(
+                                f"[STATUS][DB_LOG_FALLBACK_OK] "
+                                f"cp_id={cp_id} | connector_id={connector_id} | "
+                                f"status={status} | timestamp={status_ts_utc}"
+                            )
+
+                        else:
+                            raise
+
             except Exception as e:
                 logging.exception(
                     f"[STATUS][DB_LOG_ERR] cp_id={cp_id} | connector_id={connector_id} | err={e}"
