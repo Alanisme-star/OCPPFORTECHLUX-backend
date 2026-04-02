@@ -82,24 +82,79 @@ def is_cp_effectively_available_for_allocation(cp_id: str) -> bool:
 
 
 def cancel_ws_disconnect_cleanup(cp_id: str):
+    cp_id = _normalize_cp_id(cp_id)
+
+    # ==================================================
+    # 1) 先把 seq +1，讓所有舊的 grace / finalize 立即失效
+    # ==================================================
+    prev_seq = int(ws_disconnect_seq.get(cp_id, 0) or 0)
+    new_seq = prev_seq + 1
+    ws_disconnect_seq[cp_id] = new_seq
+
+    # ==================================================
+    # 2) 取消舊的 finalize task
+    # ==================================================
     task = pending_ws_disconnect_tasks.pop(cp_id, None)
+    had_task = task is not None
+
     if task:
-        task.cancel()
+        try:
+            task.cancel()
+        except Exception as e:
+            logger.warning(
+                f"[WS_RECONNECT][GRACE_CANCEL_TASK_ERR] "
+                f"cp_id={cp_id} | seq={new_seq} | err={e}"
+            )
 
-    if ws_disconnect_grace.pop(cp_id, None) is not None:
-        logger.warning(f"[WS_RECONNECT][GRACE_CANCEL] cp_id={cp_id}")
+    # ==================================================
+    # 3) 清掉 grace 視窗
+    # ==================================================
+    had_grace = ws_disconnect_grace.pop(cp_id, None) is not None
+
+    if had_task or had_grace:
+        logger.warning(
+            f"[WS_RECONNECT][GRACE_CANCEL] "
+            f"cp_id={cp_id} | new_seq={new_seq} | "
+            f"had_task={had_task} | had_grace={had_grace}"
+        )
 
 
-async def finalize_ws_disconnect_cleanup(cp_norm: str, expected_cp=None):
+async def finalize_ws_disconnect_cleanup(
+    cp_norm: str,
+    expected_cp=None,
+    expected_seq: int | None = None,
+):
     try:
         await asyncio.sleep(WS_DISCONNECT_GRACE_SECONDS)
+
+        current_seq = int(ws_disconnect_seq.get(cp_norm, 0) or 0)
+
+        # ==================================================
+        # A) 若 seq 已不同，表示這輪 grace 已被取消或被新事件覆蓋
+        # ==================================================
+        if expected_seq is not None and current_seq != expected_seq:
+            logger.warning(
+                f"[WS_DISCONNECT][GRACE_SKIP][STALE_SEQ] "
+                f"cp_id={cp_norm} | expected_seq={expected_seq} | current_seq={current_seq}"
+            )
+            return
+
+        # ==================================================
+        # B) 若 grace 視窗已不存在，也不應再繼續 finalize
+        # ==================================================
+        if cp_norm not in ws_disconnect_grace:
+            logger.warning(
+                f"[WS_DISCONNECT][GRACE_SKIP][NO_GRACE] cp_id={cp_norm}"
+            )
+            return
 
         current_cp = connected_charge_points.get(cp_norm)
 
         # grace 期間若已被「新連線物件」取代，才算真正重連成功
         if current_cp is not None and current_cp is not expected_cp:
             logger.warning(
-                f"[WS_DISCONNECT][GRACE_SKIP] cp_id={cp_norm} | reason=reconnected_in_time"
+                f"[WS_DISCONNECT][GRACE_SKIP] "
+                f"cp_id={cp_norm} | reason=reconnected_in_time | expected_seq={expected_seq}"
             )
             return
 
@@ -311,6 +366,7 @@ def _get_ws_disconnect_grace_seconds() -> int:
 WS_DISCONNECT_GRACE_SECONDS = _get_ws_disconnect_grace_seconds()
 pending_ws_disconnect_tasks = {}
 ws_disconnect_grace = {}
+ws_disconnect_seq = {}
 
 # ===============================
 # 🔁 全域 Rebalance 去抖 / 合併 / 節流
@@ -322,6 +378,7 @@ pending_rebalance_task = None
 rebalance_requested = False
 rebalance_last_reason = None
 rebalance_last_requested_at = 0.0
+rebalance_request_seq = 0
 
 
 def request_rebalance(reason: str):
@@ -333,25 +390,31 @@ def request_rebalance(reason: str):
     global rebalance_requested
     global rebalance_last_reason
     global rebalance_last_requested_at
+    global rebalance_request_seq
 
     rebalance_requested = True
     rebalance_last_reason = reason
     rebalance_last_requested_at = time.time()
+    rebalance_request_seq += 1
+
+    seq = rebalance_request_seq
 
     if pending_rebalance_task is None or pending_rebalance_task.done():
-        pending_rebalance_task = asyncio.create_task(_debounced_rebalance_runner())
+        pending_rebalance_task = asyncio.create_task(
+            _debounced_rebalance_runner(expected_seq=seq)
+        )
         logger.warning(
             f"[SMART][REBALANCE][SCHEDULED] "
-            f"reason={reason} | debounce={REBALANCE_DEBOUNCE_SECONDS}s"
+            f"reason={reason} | seq={seq} | debounce={REBALANCE_DEBOUNCE_SECONDS}s"
         )
     else:
         logger.warning(
             f"[SMART][REBALANCE][COALESCED] "
-            f"reason={reason} | debounce={REBALANCE_DEBOUNCE_SECONDS}s"
+            f"reason={reason} | seq={seq} | debounce={REBALANCE_DEBOUNCE_SECONDS}s"
         )
 
 
-async def _debounced_rebalance_runner():
+async def _debounced_rebalance_runner(expected_seq: int):
     """
     將短時間內的多個 rebalance 請求合併。
     若 rebalance 執行期間又有新事件進來，結束後再補跑一輪。
@@ -360,10 +423,10 @@ async def _debounced_rebalance_runner():
     global rebalance_requested
     global rebalance_last_reason
     global rebalance_last_requested_at
+    global rebalance_request_seq
 
     try:
         while True:
-            # 等到最後一次 request 後，安靜滿 debounce 秒才真正執行
             while True:
                 wait_s = REBALANCE_DEBOUNCE_SECONDS - (
                     time.time() - rebalance_last_requested_at
@@ -377,30 +440,56 @@ async def _debounced_rebalance_runner():
                     break
 
                 run_reason = rebalance_last_reason or "debounced"
+                run_seq = rebalance_request_seq
+
+                # ==================================================
+                # 關鍵防呆：
+                # ws_disconnect_grace 已經不是最新 request 時，不准執行
+                # ==================================================
+                if (
+                    run_reason == "ws_disconnect_grace"
+                    and expected_seq != run_seq
+                ):
+                    logger.warning(
+                        f"[SMART][REBALANCE][SKIP_STALE_GRACE] "
+                        f"expected_seq={expected_seq} | current_seq={run_seq}"
+                    )
+                    break
+
+                # 若 grace 已被取消，也不應再執行這輪 ws_disconnect_grace
+                if run_reason == "ws_disconnect_grace" and not ws_disconnect_grace:
+                    rebalance_requested = False
+                    logger.warning(
+                        f"[SMART][REBALANCE][SKIP_CANCELLED_GRACE] "
+                        f"reason={run_reason} | expected_seq={expected_seq}"
+                    )
+                    break
+
                 rebalance_requested = False
 
                 logger.warning(
                     f"[SMART][REBALANCE][RUN] "
-                    f"reason={run_reason} | debounce={REBALANCE_DEBOUNCE_SECONDS}s"
+                    f"reason={run_reason} | seq={run_seq} | "
+                    f"debounce={REBALANCE_DEBOUNCE_SECONDS}s"
                 )
 
                 try:
                     await rebalance_all_charging_points(reason=run_reason)
                     logger.warning(
-                        f"[SMART][REBALANCE][RUN_OK] reason={run_reason}"
+                        f"[SMART][REBALANCE][RUN_OK] "
+                        f"reason={run_reason} | seq={run_seq}"
                     )
                 except Exception as e:
                     logger.exception(
-                        f"[SMART][REBALANCE][RUN_ERR] reason={run_reason} | err={e}"
+                        f"[SMART][REBALANCE][RUN_ERR] "
+                        f"reason={run_reason} | seq={run_seq} | err={e}"
                     )
 
-            # 若執行期間又有人 request_rebalance()，會把 rebalance_requested 改回 True
             if not rebalance_requested:
                 break
 
     finally:
         pending_rebalance_task = None
-
 
 
 # ===============================
@@ -1333,12 +1422,17 @@ async def websocket_endpoint(websocket: WebSocket, charge_point_id: str):
 
         try:
             now = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
-            expire_at = time.time() + float(WS_DISCONNECT_GRACE_SECONDS)
+            started_at = time.time()
+            expire_at = started_at + float(WS_DISCONNECT_GRACE_SECONDS)
+
+            disconnect_seq = int(ws_disconnect_seq.get(cp_norm, 0) or 0) + 1
+            ws_disconnect_seq[cp_norm] = disconnect_seq
 
             ws_disconnect_grace[cp_norm] = {
-                "started_at": time.time(),
+                "started_at": started_at,
                 "expire_at": expire_at,
                 "started_at_iso": now,
+                "seq": disconnect_seq,
             }
 
             # ✅ 這裡只標記 grace 視窗，不直接洗成 Unavailable
@@ -1394,7 +1488,11 @@ async def websocket_endpoint(websocket: WebSocket, charge_point_id: str):
                 old_task.cancel()
 
             pending_ws_disconnect_tasks[cp_norm] = asyncio.create_task(
-                finalize_ws_disconnect_cleanup(cp_norm, expected_cp=current_cp)
+                finalize_ws_disconnect_cleanup(
+                    cp_norm,
+                    expected_cp=current_cp,
+                    expected_seq=disconnect_seq,
+                )
             )
 
             # ✅ grace 期間不直接重算，改成「登記一次全域 rebalance」
@@ -2627,12 +2725,6 @@ class ChargePoint(OcppChargePoint):
                                 (cp_id, connector_id, status, status_ts_utc),
                             )
                             conn.commit()
-
-                            logging.warning(
-                                f"[STATUS][DB_LOG_FALLBACK_OK] "
-                                f"cp_id={cp_id} | connector_id={connector_id} | "
-                                f"status={status} | timestamp={status_ts_utc}"
-                            )
 
                             logging.warning(
                                 f"[STATUS][DB_LOG_FALLBACK_OK] "
@@ -4949,6 +5041,17 @@ def get_live_status(charge_point_id: str):
 
             if preview_current_a is None:
                 preview_current_a = live.get("preview_current_a")
+
+            # ==================================================
+            # 關鍵補強：
+            # stale 時若 cache 沒有 allocation，就至少回單槍管理上限
+            # 避免前端永遠看到 None / None
+            # ==================================================
+            if allocated_power_kw is None:
+                try:
+                    allocated_power_kw = float(SINGLE_CP_MAX_POWER_KW)
+                except Exception:
+                    allocated_power_kw = None
 
             if preview_current_a is None:
                 preview_current_a = (
