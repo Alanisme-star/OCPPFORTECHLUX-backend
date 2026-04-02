@@ -2935,14 +2935,6 @@ class ChargePoint(OcppChargePoint):
             # [3.5] 🏘️ Smart Charging：最後一台車輛擋下判斷（第一階段：功率分配模式）
             # ==================================================
             try:
-                # 目前正在充電的台數（尚未含這一台）
-                active_now = get_active_charging_count()
-
-                # 嘗試「加上這一台」
-                trial_count = active_now + 1
-
-                # 模擬加入後的分配結果
-            try:
                 effective_active_cp_ids_before = get_effective_active_cp_ids()
                 active_now = len(effective_active_cp_ids_before)
 
@@ -2982,28 +2974,6 @@ class ChargePoint(OcppChargePoint):
                     logging.warning(
                         f"[DEBUG][START_TX][EXIT] "
                         f"cp_id={cp_norm} | transaction_id=0 | result=Blocked | total_ms={_ms_since(tx_t0)}"
-                    )
-                    return call_result.StartTransactionPayload(
-                        transaction_id=0,
-                        id_tag_info={"status": "Blocked"},
-                    )
-
-            except Exception as e:
-                logging.exception(
-                    f"[SMART][START_TX][ERROR] cp_id={self.id} | err={e}"
-                )
-
-                # 若回傳 None，代表最後一台不可充電（低於最低功率門檻）
-                if allocated_kw is None:
-                    logging.error(
-                        f"[SMART][START_TX][BLOCKED] "
-                        f"cp_id={self.id} | "
-                        f"reason=avg_power_below_min_threshold | "
-                        f"trial_count={trial_count}"
-                    )
-                    logging.warning(
-                        f"[DEBUG][START_TX][EXIT] "
-                        f"cp_id={self.id} | transaction_id=0 | result=Blocked | total_ms={_ms_since(tx_t0)}"
                     )
                     return call_result.StartTransactionPayload(
                         transaction_id=0,
