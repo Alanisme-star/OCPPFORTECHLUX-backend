@@ -1606,15 +1606,13 @@ def calculate_allowed_current_by_cp_ids(active_cp_ids: list[str]):
 
 
 
-
-
 def get_effective_active_cp_ids():
     """
     取得目前「真正有效參與 Smart Charging」的 CP 清單
 
     規則：
     1. transactions 內仍為 active（stop_timestamp IS NULL, start_timestamp IS NOT NULL）
-    2. 充電樁目前仍在線（connected_charge_points）
+    2. 充電樁目前仍在線，或仍在 ws disconnect grace 中
     3. 去除重複 cp_id，保留唯一值
     """
     try:
@@ -1630,20 +1628,34 @@ def get_effective_active_cp_ids():
             )
             rows = cur.fetchall()
 
-        active_cp_ids = []
+        tx_cp_ids = []
         for (cp_id,) in rows:
             cp_id = _normalize_cp_id(str(cp_id))
-            if cp_id not in active_cp_ids:
-                active_cp_ids.append(cp_id)
+            if cp_id not in tx_cp_ids:
+                tx_cp_ids.append(cp_id)
 
-        # 僅保留目前仍在線的樁
-        active_cp_ids = [cp_id for cp_id in active_cp_ids if is_cp_effectively_available_for_allocation(cp_id)]
+        effective_cp_ids = [
+            cp_id
+            for cp_id in tx_cp_ids
+            if is_cp_effectively_available_for_allocation(cp_id)
+        ]
 
-        return active_cp_ids
+        if DEBUG_TARGET_CP_ID in tx_cp_ids or DEBUG_TARGET_CP_ID in effective_cp_ids:
+            logging.warning(
+                f"[DEBUG][ACTIVE_CP_IDS] "
+                f"tx_cp_ids={tx_cp_ids} | "
+                f"connected_cp_ids={list(connected_charge_points.keys())} | "
+                f"grace_cp_ids={list(ws_disconnect_grace.keys())} | "
+                f"effective_cp_ids={effective_cp_ids}"
+            )
+
+        return effective_cp_ids
 
     except Exception as e:
         logging.exception(f"[SMART][ACTIVE_CP_IDS][ERR] err={e}")
         return []
+
+
 
 def get_active_charging_count():
     """
@@ -2545,105 +2557,87 @@ class ChargePoint(OcppChargePoint):
         try:
             cp_id = getattr(self, "id", None)
 
-            logging.info(
-                f"🟢【DEBUG】收到 StatusNotification | cp_id={cp_id} | kwargs={kwargs} | "
-                f"connector_id={connector_id} | status={status} | error_code={error_code} | ts={timestamp}"
+            logging.warning(
+                f"[DEBUG][STATUS][ENTER] "
+                f"cp_id={cp_id} | connector_id={connector_id} | "
+                f"status={status} | error_code={error_code} | timestamp={timestamp} | kwargs={kwargs}"
             )
+
+            if cp_id is None:
+                logging.error("[STATUS][INVALID] cp_id is None")
+                return call_result.StatusNotificationPayload()
 
             try:
                 connector_id = int(connector_id) if connector_id is not None else 0
             except (ValueError, TypeError):
                 connector_id = 0
 
-            status = status or "Unknown"
-            error_code = error_code or "NoError"
-            timestamp = timestamp or datetime.utcnow().isoformat()
+            status = str(status or "Unknown")
+            error_code = str(error_code or "NoError")
 
-            if cp_id is None or status is None:
-                logging.error(
-                    f"❌ 欄位遺失 | cp_id={cp_id} | connector_id={connector_id} | status={status}"
-                )
-                return call_result.StatusNotificationPayload()
-
-            # === 紀錄狀態歷史 ===
-            start_ts_to_save = now_utc
-
+            # 統一 timestamp 為 UTC ISO8601
+            status_ts_utc = None
             if timestamp:
                 try:
-                    parsed_start_ts = datetime.fromisoformat(
-                        str(timestamp).replace("Z", "+00:00")
-                    )
-                    if parsed_start_ts.tzinfo is None:
-                        parsed_start_ts = parsed_start_ts.replace(
-                            tzinfo=timezone.utc
-                        )
-                    start_ts_to_save = parsed_start_ts.astimezone(
-                        timezone.utc
-                    ).isoformat()
+                    parsed_ts = datetime.fromisoformat(str(timestamp).replace("Z", "+00:00"))
+                    if parsed_ts.tzinfo is None:
+                        parsed_ts = parsed_ts.replace(tzinfo=timezone.utc)
+                    status_ts_utc = parsed_ts.astimezone(timezone.utc).isoformat()
                 except Exception:
-                    start_ts_to_save = str(timestamp)
+                    status_ts_utc = str(timestamp)
             else:
-                start_ts_to_save = datetime.utcnow().replace(
-                    tzinfo=timezone.utc
-                ).isoformat()
+                status_ts_utc = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
 
-            with sqlite3.connect(DB_FILE) as conn:
-                cursor = conn.cursor()
-                cursor.execute(
-                    """
-                    INSERT INTO transactions (
-                        charge_point_id,
-                        connector_id,
-                        id_tag,
-                        meter_start,
-                        start_timestamp
-                    ) VALUES (?, ?, ?, ?, ?)
-                    """,
-                    (
-                        self.id,
-                        connector_id,
-                        id_tag,
-                        int(meter_start),
-                        start_ts_to_save,
-                    ),
-                )
-                tx_id = cursor.lastrowid
-                conn.commit()
-
-            if _is_debug_target_cp(self.id):
-                logging.warning(
-                    f"[DEBUG][START_TX][DB_WRITE] "
-                    f"cp_id={self.id} | "
-                    f"tx_id={tx_id} | "
-                    f"written_start_timestamp={start_ts_to_save} | "
-                    f"ocpp_timestamp={timestamp}"
+            # 1) 寫 status_logs（這才是 StatusNotification 應該做的事）
+            try:
+                with sqlite3.connect(DB_FILE, check_same_thread=False, timeout=15) as conn:
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        """
+                        INSERT INTO status_logs
+                        (charge_point_id, connector_id, status, timestamp, error_code)
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (cp_id, connector_id, status, status_ts_utc, error_code),
+                    )
+                    conn.commit()
+            except Exception as e:
+                logging.exception(
+                    f"[STATUS][DB_LOG_ERR] cp_id={cp_id} | connector_id={connector_id} | err={e}"
                 )
 
-            # === 更新即時狀態 ===
+            # 2) 更新記憶體狀態
+            prev_status = charging_point_status.get(cp_id, {}) or {}
             charging_point_status[cp_id] = {
+                **prev_status,
                 "connector_id": connector_id,
                 "status": status,
-                "timestamp": timestamp,
+                "timestamp": status_ts_utc,
                 "error_code": error_code,
+                "derived": False,
             }
 
-            logging.info(
-                f"📡 StatusNotification | CP={cp_id} | connector={connector_id} | "
-                f"errorCode={error_code} | status={status}"
-            )
+            # 3) 順手 patch live cache 的 status，不清空功率/電流
+            prev_live = live_status_cache.get(cp_id, {}) or {}
+            live_status_cache[cp_id] = {
+                **prev_live,
+                "status": status,
+                "error_code": error_code,
+                "timestamp": prev_live.get("timestamp") or status_ts_utc,
+                "updated_at": time.time(),
+                "derived": prev_live.get("derived", False),
+            }
 
-            # ⭐ 修正重點：
-            # StatusNotification 僅更新「狀態」，不再清除 live_status_cache
-            if status == "Available":
-                logging.info(
-                    f"ℹ️ StatusNotification=Available | CP={cp_id} | "
-                    f"僅更新狀態，不清除 live_status_cache"
-                )
+            logging.warning(
+                f"[STATUS][OK] "
+                f"cp_id={cp_id} | connector_id={connector_id} | "
+                f"status={status} | error_code={error_code} | timestamp={status_ts_utc}"
+            )
 
             return call_result.StatusNotificationPayload()
 
         except Exception as e:
-            logging.exception(f"❌ StatusNotification 發生未預期錯誤：{e}")
+            logging.exception(f"[STATUS][ERR] cp_id={getattr(self, 'id', None)} | err={e}")
             return call_result.StatusNotificationPayload()
 
     from ocpp.v16.enums import RegistrationStatus
@@ -2859,7 +2853,7 @@ class ChargePoint(OcppChargePoint):
             # =================================================
             # [2] 預約檢查（若命中 → completed）
             # =================================================
-            now_utc = datetime.utcnow().isoformat()
+            now_utc = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
 
             if _is_debug_target_cp(self.id):
                 logging.warning(
@@ -2948,22 +2942,55 @@ class ChargePoint(OcppChargePoint):
                 trial_count = active_now + 1
 
                 # 模擬加入後的分配結果
-                trial_cp_ids = [f"TRIAL_CP_{i+1}" for i in range(trial_count)]
+            try:
+                effective_active_cp_ids_before = get_effective_active_cp_ids()
+                active_now = len(effective_active_cp_ids_before)
+
+                cp_norm = _normalize_cp_id(self.id)
+                trial_cp_ids = list(effective_active_cp_ids_before)
+
+                if cp_norm not in trial_cp_ids:
+                    trial_cp_ids.append(cp_norm)
+
+                trial_count = len(trial_cp_ids)
+
                 allocated_kw = calculate_allocated_power_kw_by_cp_ids(trial_cp_ids)
                 preview_current_a = (
-                    convert_power_kw_to_current_a(allocated_kw, self.id)
+                    convert_power_kw_to_current_a(allocated_kw, cp_norm)
                     if allocated_kw is not None
                     else None
                 )
 
                 logging.warning(
                     f"[SMART][START_TX][CHECK] "
-                    f"cp_id={self.id} | "
+                    f"cp_id={cp_norm} | "
+                    f"effective_active_cp_ids_before={effective_active_cp_ids_before} | "
                     f"active_now={active_now} | "
+                    f"trial_cp_ids_after_join={trial_cp_ids} | "
                     f"trial_count={trial_count} | "
                     f"allocated_kw={allocated_kw} | "
                     f"preview_current_a={preview_current_a} | "
                     f"single_cp_max_kw={SINGLE_CP_MAX_POWER_KW}"
+                )
+
+                if allocated_kw is None:
+                    logging.error(
+                        f"[SMART][START_TX][BLOCKED] "
+                        f"cp_id={cp_norm} | reason=contract_kw_invalid_or_zero | "
+                        f"trial_cp_ids_after_join={trial_cp_ids}"
+                    )
+                    logging.warning(
+                        f"[DEBUG][START_TX][EXIT] "
+                        f"cp_id={cp_norm} | transaction_id=0 | result=Blocked | total_ms={_ms_since(tx_t0)}"
+                    )
+                    return call_result.StartTransactionPayload(
+                        transaction_id=0,
+                        id_tag_info={"status": "Blocked"},
+                    )
+
+            except Exception as e:
+                logging.exception(
+                    f"[SMART][START_TX][ERROR] cp_id={self.id} | err={e}"
                 )
 
                 # 若回傳 None，代表最後一台不可充電（低於最低功率門檻）
@@ -3635,12 +3662,52 @@ class ChargePoint(OcppChargePoint):
             # =====================================================
             # ✅ 先更新即時狀態（讓 ΣV 計算拿得到最新 voltage）
             # =====================================================
+            allocated_kw_for_live = None
+            preview_current_a_for_live = None
+
+            try:
+                with sqlite3.connect(DB_FILE, check_same_thread=False, timeout=15) as conn:
+                    cur = conn.cursor()
+                    cur.execute(
+                        """
+                        SELECT charge_point_id
+                        FROM transactions
+                        WHERE stop_timestamp IS NULL
+                          AND start_timestamp IS NOT NULL
+                        """
+                    )
+                    rows = cur.fetchall()
+
+                active_cp_ids = []
+                for (cpid,) in rows:
+                    cpid = _normalize_cp_id(str(cpid))
+                    if cpid not in active_cp_ids:
+                        active_cp_ids.append(cpid)
+
+                active_cp_ids = [
+                    cid for cid in active_cp_ids
+                    if is_cp_effectively_available_for_allocation(cid)
+                ]
+
+                if cp_id in active_cp_ids:
+                    allocated_kw_for_live = calculate_allocated_power_kw_by_cp_ids(active_cp_ids)
+                    preview_current_a_for_live = (
+                        convert_power_kw_to_current_a(allocated_kw_for_live, cp_id)
+                        if allocated_kw_for_live is not None
+                        else None
+                    )
+            except Exception as e:
+                logging.warning(f"[LIVE][ALLOC_PATCH_ERR] cp_id={cp_id} | err={e}")
+
             _upsert_live(
                 cp_id,
+                status="Charging",
                 voltage=batch_voltage,
                 current=batch_current,
                 power=batch_power_kw,
                 timestamp=last_ts,
+                allocated_power_kw=allocated_kw_for_live,
+                preview_current_a=preview_current_a_for_live,
             )
 
 
@@ -4807,14 +4874,48 @@ def get_live_status(charge_point_id: str):
 
     # ✅ 用後端收到資料的時間做 TTL 判斷（最穩，避免樁端 timestamp 不準造成立刻 stale）
     updated_at = live.get("updated_at")
+    age_sec = None
+
     if isinstance(updated_at, (int, float)):
         age_sec = time.time() - updated_at
-        if age_sec > LIVE_TTL:
-            ts = live.get("timestamp")
+    else:
+        # ✅ 沒有 updated_at / 格式異常，直接視為 stale
+        age_sec = LIVE_TTL + 1
 
-            # ✅ stale 狀態下也不要優先沿用 cache 舊 allocation
+    if age_sec > LIVE_TTL:
+        ts = live.get("timestamp")
+
+        # ✅ stale 狀態下也不要優先沿用 cache 舊 allocation
+        allocated_power_kw = None
+        preview_current_a = None
+
+        try:
+            active_cp_ids = get_effective_active_cp_ids()
+            if cp_id in active_cp_ids:
+                allocated_power_kw = calculate_allocated_power_kw_by_cp_ids(active_cp_ids)
+                preview_current_a = (
+                    convert_power_kw_to_current_a(allocated_power_kw, cp_id)
+                    if allocated_power_kw is not None
+                    else None
+                )
+        except Exception as e:
+            logging.exception(f"[LIVE_STATUS][STALE_ALLOC_ERR] cp={cp_id} err={e}")
             allocated_power_kw = None
             preview_current_a = None
+
+        # ✅ 若目前不在 active 清單，才退回 cache
+        if allocated_power_kw is None:
+            allocated_power_kw = live.get("allocated_power_kw")
+
+        if preview_current_a is None:
+            preview_current_a = live.get("preview_current_a")
+
+        if preview_current_a is None:
+            preview_current_a = (
+                convert_power_kw_to_current_a(allocated_power_kw, cp_id)
+                if allocated_power_kw is not None
+                else None
+            )
 
             try:
                 active_cp_ids = get_effective_active_cp_ids()
