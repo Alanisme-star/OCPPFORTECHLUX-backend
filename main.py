@@ -1440,30 +1440,17 @@ async def websocket_endpoint(websocket: WebSocket, charge_point_id: str):
         cp_norm = _normalize_cp_id(charge_point_id)
 
         # ==================================================
-        # 3) WebSocket 斷線：先保留這次 endpoint 對應的舊連線物件進入 grace
-        #    不立刻 pop，不立刻 auto-stop / force Available / reset live
+        # 3) WebSocket 斷線處理
+        #    規則：
+        #    - 若目前沒有 active transaction：直接快速清理（接近舊版）
+        #    - 若目前仍有 active transaction：才進入 grace 保護
         # ==================================================
         current_cp = cp if "cp" in locals() else None
 
         try:
             now = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
-            started_at = time.time()
-            expire_at = started_at + float(WS_DISCONNECT_GRACE_SECONDS)
 
-            disconnect_seq = int(ws_disconnect_seq.get(cp_norm, 0) or 0) + 1
-            ws_disconnect_seq[cp_norm] = disconnect_seq
-
-            ws_disconnect_grace[cp_norm] = {
-                "started_at": started_at,
-                "expire_at": expire_at,
-                "started_at_iso": now,
-                "seq": disconnect_seq,
-            }
-
-            # ✅ 這裡只標記 grace 視窗，不直接洗成 Unavailable
-            prev_status = charging_point_status.get(cp_norm, {})
-
-            effective_status = prev_status.get("status")
+            active_row = None
             try:
                 with sqlite3.connect(DB_FILE, check_same_thread=False, timeout=15) as conn:
                     cur = conn.cursor()
@@ -1479,11 +1466,55 @@ async def websocket_endpoint(websocket: WebSocket, charge_point_id: str):
                         (cp_norm,),
                     )
                     active_row = cur.fetchone()
+            except Exception as db_err:
+                logger.exception(
+                    f"[WS_DISCONNECT][ACTIVE_TX_LOOKUP_ERR] cp_id={cp_norm} | err={db_err}"
+                )
 
-                if active_row and effective_status in (None, "Available", "Unknown", "未知"):
-                    effective_status = "Charging"
-            except Exception:
-                pass
+            # ==================================================
+            # A) 無 active transaction
+            #    → 不進 grace，直接快速清理
+            #    → 這是「刷卡但不插槍」最需要的行為
+            # ==================================================
+            if not active_row:
+                disconnect_seq = int(ws_disconnect_seq.get(cp_norm, 0) or 0) + 1
+                ws_disconnect_seq[cp_norm] = disconnect_seq
+
+                old_task = pending_ws_disconnect_tasks.pop(cp_norm, None)
+                if old_task:
+                    old_task.cancel()
+
+                ws_disconnect_grace.pop(cp_norm, None)
+                connected_charge_points.pop(cp_norm, None)
+
+                logger.warning(
+                    f"[WS_DISCONNECT][NO_ACTIVE_TX][FAST_CLEANUP] "
+                    f"cp_id={cp_norm} | seq={disconnect_seq}"
+                )
+                return
+
+            # ==================================================
+            # B) 有 active transaction
+            #    → 才進入 grace 保護
+            # ==================================================
+            started_at = time.time()
+            expire_at = started_at + float(WS_DISCONNECT_GRACE_SECONDS)
+
+            disconnect_seq = int(ws_disconnect_seq.get(cp_norm, 0) or 0) + 1
+            ws_disconnect_seq[cp_norm] = disconnect_seq
+
+            ws_disconnect_grace[cp_norm] = {
+                "started_at": started_at,
+                "expire_at": expire_at,
+                "started_at_iso": now,
+                "seq": disconnect_seq,
+            }
+
+            prev_status = charging_point_status.get(cp_norm, {})
+            effective_status = prev_status.get("status")
+
+            if effective_status in (None, "Available", "Unknown", "未知"):
+                effective_status = "Charging"
 
             charging_point_status[cp_norm] = {
                 **prev_status,
@@ -1495,7 +1526,6 @@ async def websocket_endpoint(websocket: WebSocket, charge_point_id: str):
                 "ws_grace_until": expire_at,
             }
 
-            # ✅ live cache 保留原本狀態，只補 grace 資訊
             prev_live = live_status_cache.get(cp_norm, {})
             live_status_cache[cp_norm] = {
                 **prev_live,
@@ -1505,7 +1535,8 @@ async def websocket_endpoint(websocket: WebSocket, charge_point_id: str):
             }
 
             logger.warning(
-                f"[WS_DISCONNECT][GRACE_START] cp_id={cp_norm} | grace_seconds={WS_DISCONNECT_GRACE_SECONDS}"
+                f"[WS_DISCONNECT][GRACE_START] "
+                f"cp_id={cp_norm} | grace_seconds={WS_DISCONNECT_GRACE_SECONDS}"
             )
 
             old_task = pending_ws_disconnect_tasks.pop(cp_norm, None)
@@ -1520,7 +1551,6 @@ async def websocket_endpoint(websocket: WebSocket, charge_point_id: str):
                 )
             )
 
-            # ✅ grace 期間不直接重算，改成「登記一次全域 rebalance」
             try:
                 request_rebalance(reason="ws_disconnect_grace")
                 logger.warning(
@@ -1537,12 +1567,8 @@ async def websocket_endpoint(websocket: WebSocket, charge_point_id: str):
                 f"[WS_DISCONNECT][GRACE_START][ERR] cp_id={cp_norm} | err={e}"
             )
 
-        # ✅ 到這裡就結束
-        # grace 期間只做：
-        # 1. 保留目前 ws 連線物件進入 grace
-        # 2. 建立 ws_disconnect_grace
-        # 3. 啟動 finalize_ws_disconnect_cleanup(cp_norm, expected_cp=current_cp)
-        # 4. 做一次 grace re-balance
+
+
 
 # 初始化狀態儲存
 # charging_point_status = {}
