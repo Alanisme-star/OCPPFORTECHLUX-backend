@@ -299,8 +299,33 @@ async def finalize_ws_disconnect_cleanup(
         raise
 
     finally:
-        pending_ws_disconnect_tasks.pop(cp_norm, None)
-        ws_disconnect_grace.pop(cp_norm, None)
+        try:
+            current_seq = int(ws_disconnect_seq.get(cp_norm, 0) or 0)
+
+            # 只有這個 finalize 仍然是同一輪 seq，才允許清理 grace
+            if expected_seq is not None and current_seq == expected_seq:
+                pending_ws_disconnect_tasks.pop(cp_norm, None)
+
+                grace_info = ws_disconnect_grace.get(cp_norm) or {}
+                grace_seq = int(grace_info.get("seq", 0) or 0)
+
+                if grace_seq == expected_seq:
+                    ws_disconnect_grace.pop(cp_norm, None)
+                else:
+                    logger.warning(
+                        f"[WS_DISCONNECT][FINALLY_SKIP][GRACE_SEQ_CHANGED] "
+                        f"cp_id={cp_norm} | expected_seq={expected_seq} | grace_seq={grace_seq}"
+                    )
+            else:
+                logger.warning(
+                    f"[WS_DISCONNECT][FINALLY_SKIP][STALE_SEQ] "
+                    f"cp_id={cp_norm} | expected_seq={expected_seq} | current_seq={current_seq}"
+                )
+
+        except Exception as e:
+            logger.exception(
+                f"[WS_DISCONNECT][FINALLY_CLEANUP_ERR] cp_id={cp_norm} | err={e}"
+            )
 
 
 
@@ -5013,6 +5038,13 @@ def get_live_status(charge_point_id: str):
 
         if preview_current_a is None:
             preview_current_a = live.get("preview_current_a")
+
+        # stale 時若 cache 也沒有 allocation，至少回單槍上限
+        if allocated_power_kw is None:
+            try:
+                allocated_power_kw = float(SINGLE_CP_MAX_POWER_KW)
+            except Exception:
+                allocated_power_kw = None
 
         if preview_current_a is None:
             preview_current_a = (
