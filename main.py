@@ -1343,6 +1343,49 @@ def _upsert_live(cp_id: str, **kv):
 from fastapi import WebSocket, WebSocketDisconnect
 
 
+# ======================
+# WebSocket 白名單：熱更新 / 即時重查保護
+# ======================
+charge_point_whitelist_cache = set()
+charge_point_whitelist_cache_updated_at = 0.0
+
+
+def _load_charge_point_whitelist_from_db():
+    with get_conn() as _c:
+        cur = _c.cursor()
+        cur.execute("SELECT charge_point_id FROM charge_points")
+        rows = cur.fetchall()
+
+    allowed_ids = []
+    for (row_cp_id,) in rows:
+        cp_norm = _normalize_cp_id(str(row_cp_id or ""))
+        if cp_norm and cp_norm not in allowed_ids:
+            allowed_ids.append(cp_norm)
+
+    return allowed_ids
+
+
+def refresh_charge_point_whitelist_cache(reason: str = "manual"):
+    global charge_point_whitelist_cache
+    global charge_point_whitelist_cache_updated_at
+
+    allowed_ids = _load_charge_point_whitelist_from_db()
+    charge_point_whitelist_cache = set(allowed_ids)
+    charge_point_whitelist_cache_updated_at = time.time()
+
+    logger.warning(
+        f"[WHITELIST][REFRESH] "
+        f"reason={reason} | count={len(allowed_ids)} | allowed_ids={allowed_ids}"
+    )
+    return allowed_ids
+
+
+def get_charge_point_whitelist_cache():
+    if not charge_point_whitelist_cache:
+        return refresh_charge_point_whitelist_cache(reason="cache_empty")
+    return sorted(charge_point_whitelist_cache)
+
+
 async def _accept_or_reject_ws(websocket: WebSocket, raw_cp_id: str):
     # 標準化 CPID
     cp_id = _normalize_cp_id(raw_cp_id)
@@ -1352,23 +1395,51 @@ async def _accept_or_reject_ws(websocket: WebSocket, raw_cp_id: str):
     qs = dict(parse_qsl(urlparse(url).query))
     supplied_token = qs.get("token")
 
-    # 查白名單
-    with get_conn() as _c:
-        cur = _c.cursor()
-        cur.execute("SELECT charge_point_id FROM charge_points")
-        allowed_ids = [row[0] for row in cur.fetchall()]
-
     # === 驗證檢查 ===
     # if REQUIRED_TOKEN:
     #   if supplied_token is None:
     #      print(f"❌ 拒絕：缺少 token；URL={url}")
-    #     await websocket.close(code=1008)
-    #    return None
-    # if supplied_token != REQUIRED_TOKEN:
-    #   print(f"❌ 拒絕：token 不正確；給定={supplied_token}")
-    #  await websocket.close(code=1008)
-    # return None
+    #      await websocket.close(code=1008)
+    #      return None
+    #   if supplied_token != REQUIRED_TOKEN:
+    #      print(f"❌ 拒絕：token 不正確；給定={supplied_token}")
+    #      await websocket.close(code=1008)
+    #      return None
+
+    # 先看 cache；若 miss，不要立刻拒絕，要短暫重查 DB 幾次
+    allowed_ids = get_charge_point_whitelist_cache()
+    whitelist_source = "cache"
+
+    if cp_id not in allowed_ids:
+        whitelist_source = "db_retry_after_cache_miss"
+
+        # 關鍵：避免「白名單剛新增，但這一輪 attempt 剛好撞到舊狀態」而白白浪費整輪 retry
+        retry_plan = (0.0, 0.25, 0.5, 1.0)
+
+        for idx, sleep_s in enumerate(retry_plan, start=1):
+            if sleep_s > 0:
+                await asyncio.sleep(sleep_s)
+
+            allowed_ids = refresh_charge_point_whitelist_cache(
+                reason=f"ws_miss_retry#{idx}:{cp_id}"
+            )
+
+            if cp_id in allowed_ids:
+                logger.warning(
+                    f"[WS_AUTH][RECOVERED_AFTER_REFRESH] "
+                    f"cp_id={cp_id} | retry_index={idx} | allowed_ids={allowed_ids}"
+                )
+                break
+
+    logger.warning(
+        f"[WS_AUTH][CHECK] "
+        f"cp_id={cp_id} | source={whitelist_source} | "
+        f"allowed_ids={allowed_ids} | "
+        f"cache_updated_at={charge_point_whitelist_cache_updated_at}"
+    )
+
     print(f"📝 白名單允許={allowed_ids}, 本次連線={cp_id}")
+
     if cp_id not in allowed_ids:
         print(f"❌ 拒絕：{cp_id} 不在白名單 {allowed_ids}")
         await websocket.close(code=1008)
@@ -1388,7 +1459,6 @@ async def _accept_or_reject_ws(websocket: WebSocket, raw_cp_id: str):
         _c.commit()
 
     return cp_id
-
 
 
 @app.websocket("/{charge_point_id:path}")
@@ -4003,6 +4073,8 @@ def force_add_charge_point(
     Debug 用 API：強制新增一個充電樁到白名單 (charge_points 資料表)。
     不會自動建立任何卡片或餘額。
     """
+    charge_point_id = _normalize_cp_id(charge_point_id)
+
     with get_conn() as conn:
         cur = conn.cursor()
         # 只建立白名單，不建立卡片
@@ -4015,12 +4087,15 @@ def force_add_charge_point(
         )
         conn.commit()
 
+    refresh_charge_point_whitelist_cache(
+        reason=f"debug_force_add_charge_point:{charge_point_id}"
+    )
+
     return {
         "message": f"已新增或存在白名單: {charge_point_id}",
         "charge_point_id": charge_point_id,
         "name": name,
     }
-
 
 # ------------------------------------------------------------
 # ✅ 修正版：充電樁斷線時，不主動改寫交易狀態
@@ -4266,6 +4341,8 @@ def update_charge_point(charge_point_id: str, data: dict = Body(...)):
         cur.execute(sql, params)
         conn.commit()
 
+    refresh_charge_point_whitelist_cache(reason=f"api_update_charge_point:{cp_id}")
+
     # 6️⃣ 回傳結果（方便前端確認）
     return {
         "message": "Charge point updated",
@@ -4273,9 +4350,6 @@ def update_charge_point(charge_point_id: str, data: dict = Body(...)):
         "updated": {
             "name": name,
             "status": status,
-            "max_current_a": max_current,
-        },
-    }
 
 
 @app.get("/api/charge-points/{charge_point_id:path}/current-limit")
@@ -4358,6 +4432,8 @@ async def set_current_limit(
             )
 
         conn.commit()
+
+    refresh_charge_point_whitelist_cache(reason=f"api_set_current_limit:{cp_id}")
 
     cp = connected_charge_points.get(cp_id)
     applied = False
@@ -6658,7 +6734,9 @@ async def list_charge_points():
 async def add_charge_point(data: dict = Body(...)):
     print("🔥 payload=", data)
 
-    cp_id = (data.get("chargePointId") or data.get("charge_point_id") or "").strip()
+    cp_id = _normalize_cp_id(
+        (data.get("chargePointId") or data.get("charge_point_id") or "").strip()
+    )
     name = (data.get("name") or "").strip()
     status = str(data.get("status") or "enabled").lower().strip()
 
@@ -6699,6 +6777,8 @@ async def add_charge_point(data: dict = Body(...)):
             )
             row = cur.fetchone()
 
+        refresh_charge_point_whitelist_cache(reason=f"api_add_charge_point:{cp_id}")
+
         print(f"✅ 新增白名單到資料庫: {cp_id}, {name}, {status}")
 
         return {
@@ -6720,9 +6800,10 @@ async def add_charge_point(data: dict = Body(...)):
         print("❌ 其他新增錯誤:", e)
         raise HTTPException(status_code=500, detail=f"內部錯誤: {e}")
 
-
 @app.put("/api/charge-points/{cp_id}")
 async def update_charge_point(cp_id: str = Path(...), data: dict = Body(...)):
+    cp_id = _normalize_cp_id(cp_id)
+
     name = data.get("name")
     status = data.get("status")
 
@@ -6765,15 +6846,21 @@ async def update_charge_point(cp_id: str = Path(...), data: dict = Body(...)):
         )
         _conn.commit()
 
+    refresh_charge_point_whitelist_cache(reason=f"api_update_charge_point:{cp_id}")
+
     return {"message": "已更新"}
 
 
 @app.delete("/api/charge-points/{cp_id}")
 async def delete_charge_point(cp_id: str = Path(...)):
+    cp_id = _normalize_cp_id(cp_id)
+
     with get_conn() as conn:
         cur = conn.cursor()
         cur.execute("DELETE FROM charge_points WHERE charge_point_id = ?", (cp_id,))
         conn.commit()
+
+    refresh_charge_point_whitelist_cache(reason=f"api_delete_charge_point:{cp_id}")
 
     return {"message": "已刪除"}
 
