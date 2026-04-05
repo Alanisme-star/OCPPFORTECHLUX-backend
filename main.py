@@ -4350,6 +4350,9 @@ def update_charge_point(charge_point_id: str, data: dict = Body(...)):
         "updated": {
             "name": name,
             "status": status,
+            "max_current_a": max_current,
+        },
+    }
 
 
 @app.get("/api/charge-points/{charge_point_id:path}/current-limit")
