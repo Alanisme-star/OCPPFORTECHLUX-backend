@@ -85,7 +85,7 @@ def cancel_ws_disconnect_cleanup(cp_id: str):
     cp_id = _normalize_cp_id(cp_id)
 
     # ==================================================
-    # 1) 先把 seq +1，讓所有舊的 grace / finalize 立即失效
+    # 1) 先把 seq +1，讓所有舊的 grace / finalize / prepare-delay 立即失效
     # ==================================================
     prev_seq = int(ws_disconnect_seq.get(cp_id, 0) or 0)
     new_seq = prev_seq + 1
@@ -107,16 +107,109 @@ def cancel_ws_disconnect_cleanup(cp_id: str):
             )
 
     # ==================================================
-    # 3) 清掉 grace 視窗
+    # 3) 取消舊的 prepare feedback delay task
+    # ==================================================
+    prepare_task = pending_ws_prepare_feedback_tasks.pop(cp_id, None)
+    had_prepare_task = prepare_task is not None
+
+    if prepare_task:
+        try:
+            prepare_task.cancel()
+        except Exception as e:
+            logger.warning(
+                f"[WS_RECONNECT][PREPARE_DELAY_CANCEL_TASK_ERR] "
+                f"cp_id={cp_id} | seq={new_seq} | err={e}"
+            )
+
+    # ==================================================
+    # 4) 清掉 grace 視窗
     # ==================================================
     had_grace = ws_disconnect_grace.pop(cp_id, None) is not None
 
-    if had_task or had_grace:
+    if had_task or had_prepare_task or had_grace:
         logger.warning(
             f"[WS_RECONNECT][GRACE_CANCEL] "
             f"cp_id={cp_id} | new_seq={new_seq} | "
-            f"had_task={had_task} | had_grace={had_grace}"
+            f"had_task={had_task} | had_prepare_task={had_prepare_task} | had_grace={had_grace}"
         )
+
+async def finalize_ws_prepare_feedback_cleanup(
+    cp_norm: str,
+    expected_cp=None,
+    expected_seq: int | None = None,
+):
+    try:
+        await asyncio.sleep(WS_PREPARE_FEEDBACK_SECONDS)
+
+        current_seq = int(ws_disconnect_seq.get(cp_norm, 0) or 0)
+        if expected_seq is not None and current_seq != expected_seq:
+            logger.warning(
+                f"[WS_PREPARE_FEEDBACK][SKIP][STALE_SEQ] "
+                f"cp_id={cp_norm} | expected_seq={expected_seq} | current_seq={current_seq}"
+            )
+            return
+
+        current_cp = connected_charge_points.get(cp_norm)
+        if current_cp is not None and current_cp is not expected_cp:
+            logger.warning(
+                f"[WS_PREPARE_FEEDBACK][SKIP][RECONNECTED] "
+                f"cp_id={cp_norm} | expected_seq={expected_seq}"
+            )
+            return
+
+        has_active_tx = False
+        try:
+            with sqlite3.connect(DB_FILE, check_same_thread=False, timeout=15) as conn:
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    SELECT 1
+                    FROM transactions
+                    WHERE charge_point_id = ?
+                      AND stop_timestamp IS NULL
+                    LIMIT 1
+                    """,
+                    (cp_norm,),
+                )
+                has_active_tx = cur.fetchone() is not None
+        except Exception as e:
+            logger.exception(
+                f"[WS_PREPARE_FEEDBACK][ACTIVE_TX_CHECK_ERR] cp_id={cp_norm} | err={e}"
+            )
+            return
+
+        if has_active_tx:
+            logger.warning(
+                f"[WS_PREPARE_FEEDBACK][SKIP][ACTIVE_TX_FOUND] cp_id={cp_norm}"
+            )
+            return
+
+        if current_cp is expected_cp:
+            connected_charge_points.pop(cp_norm, None)
+
+        logger.warning(
+            f"[WS_PREPARE_FEEDBACK][CLEANUP_DONE] "
+            f"cp_id={cp_norm} | delay={WS_PREPARE_FEEDBACK_SECONDS}s"
+        )
+
+    except asyncio.CancelledError:
+        logger.warning(f"[WS_PREPARE_FEEDBACK][CANCELLED] cp_id={cp_norm}")
+        raise
+
+    finally:
+        try:
+            current_seq = int(ws_disconnect_seq.get(cp_norm, 0) or 0)
+            if expected_seq is not None and current_seq == expected_seq:
+                pending_ws_prepare_feedback_tasks.pop(cp_norm, None)
+            else:
+                logger.warning(
+                    f"[WS_PREPARE_FEEDBACK][FINALLY_SKIP][STALE_SEQ] "
+                    f"cp_id={cp_norm} | expected_seq={expected_seq} | current_seq={current_seq}"
+                )
+        except Exception as e:
+            logger.exception(
+                f"[WS_PREPARE_FEEDBACK][FINALLY_ERR] cp_id={cp_norm} | err={e}"
+            )
 
 
 async def finalize_ws_disconnect_cleanup(
@@ -389,7 +482,20 @@ def _get_ws_disconnect_grace_seconds() -> int:
 
 
 WS_DISCONNECT_GRACE_SECONDS = _get_ws_disconnect_grace_seconds()
+
+
+def _get_ws_prepare_feedback_seconds() -> float:
+    raw = os.getenv("WS_PREPARE_FEEDBACK_SECONDS", "2.5")
+    try:
+        value = float(str(raw).strip())
+        return max(0.0, value)
+    except Exception:
+        return 2.5
+
+
+WS_PREPARE_FEEDBACK_SECONDS = _get_ws_prepare_feedback_seconds()
 pending_ws_disconnect_tasks = {}
+pending_ws_prepare_feedback_tasks = {}
 ws_disconnect_grace = {}
 ws_disconnect_seq = {}
 
@@ -1554,12 +1660,24 @@ async def websocket_endpoint(websocket: WebSocket, charge_point_id: str):
                 if old_task:
                     old_task.cancel()
 
+                old_prepare_task = pending_ws_prepare_feedback_tasks.pop(cp_norm, None)
+                if old_prepare_task:
+                    old_prepare_task.cancel()
+
                 ws_disconnect_grace.pop(cp_norm, None)
-                connected_charge_points.pop(cp_norm, None)
+
+                pending_ws_prepare_feedback_tasks[cp_norm] = asyncio.create_task(
+                    finalize_ws_prepare_feedback_cleanup(
+                        cp_norm,
+                        expected_cp=current_cp,
+                        expected_seq=disconnect_seq,
+                    )
+                )
 
                 logger.warning(
-                    f"[WS_DISCONNECT][NO_ACTIVE_TX][FAST_CLEANUP] "
-                    f"cp_id={cp_norm} | seq={disconnect_seq}"
+                    f"[WS_DISCONNECT][NO_ACTIVE_TX][PREPARE_FEEDBACK_DELAY] "
+                    f"cp_id={cp_norm} | seq={disconnect_seq} | "
+                    f"delay={WS_PREPARE_FEEDBACK_SECONDS}s"
                 )
                 return
 
