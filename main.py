@@ -80,12 +80,11 @@ def is_cp_in_ws_disconnect_grace(cp_id: str) -> bool:
 def is_cp_effectively_available_for_allocation(cp_id: str) -> bool:
     return cp_id in connected_charge_points or is_cp_in_ws_disconnect_grace(cp_id)
 
-
 def cancel_ws_disconnect_cleanup(cp_id: str):
     cp_id = _normalize_cp_id(cp_id)
 
     # ==================================================
-    # 1) 先把 seq +1，讓所有舊的 grace / finalize / prepare-delay 立即失效
+    # 1) 先把 seq +1，讓所有舊的 grace / finalize 立即失效
     # ==================================================
     prev_seq = int(ws_disconnect_seq.get(cp_id, 0) or 0)
     new_seq = prev_seq + 1
@@ -107,109 +106,17 @@ def cancel_ws_disconnect_cleanup(cp_id: str):
             )
 
     # ==================================================
-    # 3) 取消舊的 prepare feedback delay task
-    # ==================================================
-    prepare_task = pending_ws_prepare_feedback_tasks.pop(cp_id, None)
-    had_prepare_task = prepare_task is not None
-
-    if prepare_task:
-        try:
-            prepare_task.cancel()
-        except Exception as e:
-            logger.warning(
-                f"[WS_RECONNECT][PREPARE_DELAY_CANCEL_TASK_ERR] "
-                f"cp_id={cp_id} | seq={new_seq} | err={e}"
-            )
-
-    # ==================================================
-    # 4) 清掉 grace 視窗
+    # 3) 清掉 grace 視窗
     # ==================================================
     had_grace = ws_disconnect_grace.pop(cp_id, None) is not None
 
-    if had_task or had_prepare_task or had_grace:
+    if had_task or had_grace:
         logger.warning(
             f"[WS_RECONNECT][GRACE_CANCEL] "
             f"cp_id={cp_id} | new_seq={new_seq} | "
-            f"had_task={had_task} | had_prepare_task={had_prepare_task} | had_grace={had_grace}"
+            f"had_task={had_task} | had_grace={had_grace}"
         )
 
-async def finalize_ws_prepare_feedback_cleanup(
-    cp_norm: str,
-    expected_cp=None,
-    expected_seq: int | None = None,
-):
-    try:
-        await asyncio.sleep(WS_PREPARE_FEEDBACK_SECONDS)
-
-        current_seq = int(ws_disconnect_seq.get(cp_norm, 0) or 0)
-        if expected_seq is not None and current_seq != expected_seq:
-            logger.warning(
-                f"[WS_PREPARE_FEEDBACK][SKIP][STALE_SEQ] "
-                f"cp_id={cp_norm} | expected_seq={expected_seq} | current_seq={current_seq}"
-            )
-            return
-
-        current_cp = connected_charge_points.get(cp_norm)
-        if current_cp is not None and current_cp is not expected_cp:
-            logger.warning(
-                f"[WS_PREPARE_FEEDBACK][SKIP][RECONNECTED] "
-                f"cp_id={cp_norm} | expected_seq={expected_seq}"
-            )
-            return
-
-        has_active_tx = False
-        try:
-            with sqlite3.connect(DB_FILE, check_same_thread=False, timeout=15) as conn:
-                cur = conn.cursor()
-                cur.execute(
-                    """
-                    SELECT 1
-                    FROM transactions
-                    WHERE charge_point_id = ?
-                      AND stop_timestamp IS NULL
-                    LIMIT 1
-                    """,
-                    (cp_norm,),
-                )
-                has_active_tx = cur.fetchone() is not None
-        except Exception as e:
-            logger.exception(
-                f"[WS_PREPARE_FEEDBACK][ACTIVE_TX_CHECK_ERR] cp_id={cp_norm} | err={e}"
-            )
-            return
-
-        if has_active_tx:
-            logger.warning(
-                f"[WS_PREPARE_FEEDBACK][SKIP][ACTIVE_TX_FOUND] cp_id={cp_norm}"
-            )
-            return
-
-        if current_cp is expected_cp:
-            connected_charge_points.pop(cp_norm, None)
-
-        logger.warning(
-            f"[WS_PREPARE_FEEDBACK][CLEANUP_DONE] "
-            f"cp_id={cp_norm} | delay={WS_PREPARE_FEEDBACK_SECONDS}s"
-        )
-
-    except asyncio.CancelledError:
-        logger.warning(f"[WS_PREPARE_FEEDBACK][CANCELLED] cp_id={cp_norm}")
-        raise
-
-    finally:
-        try:
-            current_seq = int(ws_disconnect_seq.get(cp_norm, 0) or 0)
-            if expected_seq is not None and current_seq == expected_seq:
-                pending_ws_prepare_feedback_tasks.pop(cp_norm, None)
-            else:
-                logger.warning(
-                    f"[WS_PREPARE_FEEDBACK][FINALLY_SKIP][STALE_SEQ] "
-                    f"cp_id={cp_norm} | expected_seq={expected_seq} | current_seq={current_seq}"
-                )
-        except Exception as e:
-            logger.exception(
-                f"[WS_PREPARE_FEEDBACK][FINALLY_ERR] cp_id={cp_norm} | err={e}"
-            )
 
 
 async def finalize_ws_disconnect_cleanup(
@@ -482,20 +389,7 @@ def _get_ws_disconnect_grace_seconds() -> int:
 
 
 WS_DISCONNECT_GRACE_SECONDS = _get_ws_disconnect_grace_seconds()
-
-
-def _get_ws_prepare_feedback_seconds() -> float:
-    raw = os.getenv("WS_PREPARE_FEEDBACK_SECONDS", "2.5")
-    try:
-        value = float(str(raw).strip())
-        return max(0.0, value)
-    except Exception:
-        return 2.5
-
-
-WS_PREPARE_FEEDBACK_SECONDS = _get_ws_prepare_feedback_seconds()
 pending_ws_disconnect_tasks = {}
-pending_ws_prepare_feedback_tasks = {}
 ws_disconnect_grace = {}
 ws_disconnect_seq = {}
 
@@ -1814,19 +1708,25 @@ async def websocket_endpoint(websocket: WebSocket, charge_point_id: str):
 
         current_cp = cp if "cp" in locals() else None
 
-        logger.warning(
-            f"[DEBUG][WS][FINALLY_STATE] "
-            f"cp_id={cp_norm} | alive_ms={_ms_since(ws_t0)} | "
-            f"has_local_cp={current_cp is not None} | "
-            f"in_connected={cp_norm in connected_charge_points} | "
-            f"same_obj_connected={connected_charge_points.get(cp_norm) is current_cp if current_cp else False} | "
-            f"in_grace={cp_norm in ws_disconnect_grace}"
-        )
-
         try:
             now = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
+            started_at = time.time()
+            expire_at = started_at + float(WS_DISCONNECT_GRACE_SECONDS)
 
-            active_row = None
+            disconnect_seq = int(ws_disconnect_seq.get(cp_norm, 0) or 0) + 1
+            ws_disconnect_seq[cp_norm] = disconnect_seq
+
+            ws_disconnect_grace[cp_norm] = {
+                "started_at": started_at,
+                "expire_at": expire_at,
+                "started_at_iso": now,
+                "seq": disconnect_seq,
+            }
+
+            # ✅ 這裡只標記 grace 視窗，不直接洗成 Unavailable
+            prev_status = charging_point_status.get(cp_norm, {})
+
+            effective_status = prev_status.get("status")
             try:
                 with sqlite3.connect(DB_FILE, check_same_thread=False, timeout=15) as conn:
                     cur = conn.cursor()
@@ -1842,75 +1742,11 @@ async def websocket_endpoint(websocket: WebSocket, charge_point_id: str):
                         (cp_norm,),
                     )
                     active_row = cur.fetchone()
-            except Exception as db_err:
-                logger.exception(
-                    f"[WS_DISCONNECT][ACTIVE_TX_LOOKUP_ERR] cp_id={cp_norm} | err={db_err}"
-                )
 
-            logger.warning(
-                f"[DEBUG][WS][ACTIVE_TX_LOOKUP] "
-                f"cp_id={cp_norm} | active_row={active_row} | alive_ms={_ms_since(ws_t0)}"
-            )
-
-            if not active_row:
-                disconnect_seq = int(ws_disconnect_seq.get(cp_norm, 0) or 0) + 1
-                ws_disconnect_seq[cp_norm] = disconnect_seq
-
-                old_task = pending_ws_disconnect_tasks.pop(cp_norm, None)
-                if old_task:
-                    old_task.cancel()
-
-                old_prepare_task = pending_ws_prepare_feedback_tasks.pop(cp_norm, None)
-                if old_prepare_task:
-                    old_prepare_task.cancel()
-
-                ws_disconnect_grace.pop(cp_norm, None)
-
-                pending_ws_prepare_feedback_tasks[cp_norm] = asyncio.create_task(
-                    finalize_ws_prepare_feedback_cleanup(
-                        cp_norm,
-                        expected_cp=current_cp,
-                        expected_seq=disconnect_seq,
-                    )
-                )
-
-                logger.warning(
-                    f"[DEBUG][WS][NO_ACTIVE_TX_PATH] "
-                    f"cp_id={cp_norm} | seq={disconnect_seq} | "
-                    f"same_obj_connected={connected_charge_points.get(cp_norm) is current_cp if current_cp else False}"
-                )
-
-                logger.warning(
-                    f"[WS_DISCONNECT][NO_ACTIVE_TX][PREPARE_FEEDBACK_DELAY] "
-                    f"cp_id={cp_norm} | seq={disconnect_seq} | "
-                    f"delay={WS_PREPARE_FEEDBACK_SECONDS}s"
-                )
-                return
-
-            started_at = time.time()
-            expire_at = started_at + float(WS_DISCONNECT_GRACE_SECONDS)
-
-            disconnect_seq = int(ws_disconnect_seq.get(cp_norm, 0) or 0) + 1
-            ws_disconnect_seq[cp_norm] = disconnect_seq
-
-            logger.warning(
-                f"[DEBUG][WS][ACTIVE_TX_PATH] "
-                f"cp_id={cp_norm} | active_tx_id={active_row[0]} | "
-                f"seq={disconnect_seq} | grace_until={expire_at}"
-            )
-
-            ws_disconnect_grace[cp_norm] = {
-                "started_at": started_at,
-                "expire_at": expire_at,
-                "started_at_iso": now,
-                "seq": disconnect_seq,
-            }
-
-            prev_status = charging_point_status.get(cp_norm, {})
-            effective_status = prev_status.get("status")
-
-            if effective_status in (None, "Available", "Unknown", "未知"):
-                effective_status = "Charging"
+                if active_row and effective_status in (None, "Available", "Unknown", "未知"):
+                    effective_status = "Charging"
+            except Exception:
+                pass
 
             charging_point_status[cp_norm] = {
                 **prev_status,
@@ -1922,6 +1758,7 @@ async def websocket_endpoint(websocket: WebSocket, charge_point_id: str):
                 "ws_grace_until": expire_at,
             }
 
+            # ✅ live cache 保留原本狀態，只補 grace 資訊
             prev_live = live_status_cache.get(cp_norm, {})
             live_status_cache[cp_norm] = {
                 **prev_live,
@@ -1931,8 +1768,7 @@ async def websocket_endpoint(websocket: WebSocket, charge_point_id: str):
             }
 
             logger.warning(
-                f"[WS_DISCONNECT][GRACE_START] "
-                f"cp_id={cp_norm} | grace_seconds={WS_DISCONNECT_GRACE_SECONDS}"
+                f"[WS_DISCONNECT][GRACE_START] cp_id={cp_norm} | grace_seconds={WS_DISCONNECT_GRACE_SECONDS}"
             )
 
             old_task = pending_ws_disconnect_tasks.pop(cp_norm, None)
@@ -1947,6 +1783,7 @@ async def websocket_endpoint(websocket: WebSocket, charge_point_id: str):
                 )
             )
 
+            # ✅ grace 期間不直接重算，改成「登記一次全域 rebalance」
             try:
                 request_rebalance(reason="ws_disconnect_grace")
                 logger.warning(
@@ -1962,147 +1799,6 @@ async def websocket_endpoint(websocket: WebSocket, charge_point_id: str):
             logger.exception(
                 f"[WS_DISCONNECT][GRACE_START][ERR] cp_id={cp_norm} | err={e}"
             )
-
-        # ==================================================
-        # 3) WebSocket 斷線處理
-        #    規則：
-        #    - 若目前沒有 active transaction：直接快速清理（接近舊版）
-        #    - 若目前仍有 active transaction：才進入 grace 保護
-        # ==================================================
-        current_cp = cp if "cp" in locals() else None
-
-        try:
-            now = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
-
-            active_row = None
-            try:
-                with sqlite3.connect(DB_FILE, check_same_thread=False, timeout=15) as conn:
-                    cur = conn.cursor()
-                    cur.execute(
-                        """
-                        SELECT transaction_id
-                        FROM transactions
-                        WHERE charge_point_id = ?
-                          AND stop_timestamp IS NULL
-                        ORDER BY start_timestamp DESC
-                        LIMIT 1
-                        """,
-                        (cp_norm,),
-                    )
-                    active_row = cur.fetchone()
-            except Exception as db_err:
-                logger.exception(
-                    f"[WS_DISCONNECT][ACTIVE_TX_LOOKUP_ERR] cp_id={cp_norm} | err={db_err}"
-                )
-
-            # ==================================================
-            # A) 無 active transaction
-            #    → 不進 grace，直接快速清理
-            #    → 這是「刷卡但不插槍」最需要的行為
-            # ==================================================
-            if not active_row:
-                disconnect_seq = int(ws_disconnect_seq.get(cp_norm, 0) or 0) + 1
-                ws_disconnect_seq[cp_norm] = disconnect_seq
-
-                old_task = pending_ws_disconnect_tasks.pop(cp_norm, None)
-                if old_task:
-                    old_task.cancel()
-
-                old_prepare_task = pending_ws_prepare_feedback_tasks.pop(cp_norm, None)
-                if old_prepare_task:
-                    old_prepare_task.cancel()
-
-                ws_disconnect_grace.pop(cp_norm, None)
-
-                pending_ws_prepare_feedback_tasks[cp_norm] = asyncio.create_task(
-                    finalize_ws_prepare_feedback_cleanup(
-                        cp_norm,
-                        expected_cp=current_cp,
-                        expected_seq=disconnect_seq,
-                    )
-                )
-
-                logger.warning(
-                    f"[WS_DISCONNECT][NO_ACTIVE_TX][PREPARE_FEEDBACK_DELAY] "
-                    f"cp_id={cp_norm} | seq={disconnect_seq} | "
-                    f"delay={WS_PREPARE_FEEDBACK_SECONDS}s"
-                )
-                return
-
-            # ==================================================
-            # B) 有 active transaction
-            #    → 才進入 grace 保護
-            # ==================================================
-            started_at = time.time()
-            expire_at = started_at + float(WS_DISCONNECT_GRACE_SECONDS)
-
-            disconnect_seq = int(ws_disconnect_seq.get(cp_norm, 0) or 0) + 1
-            ws_disconnect_seq[cp_norm] = disconnect_seq
-
-            ws_disconnect_grace[cp_norm] = {
-                "started_at": started_at,
-                "expire_at": expire_at,
-                "started_at_iso": now,
-                "seq": disconnect_seq,
-            }
-
-            prev_status = charging_point_status.get(cp_norm, {})
-            effective_status = prev_status.get("status")
-
-            if effective_status in (None, "Available", "Unknown", "未知"):
-                effective_status = "Charging"
-
-            charging_point_status[cp_norm] = {
-                **prev_status,
-                "status": effective_status or prev_status.get("status") or "Unknown",
-                "timestamp": now,
-                "error_code": "ConnectionLost",
-                "derived": True,
-                "grace_seconds": WS_DISCONNECT_GRACE_SECONDS,
-                "ws_grace_until": expire_at,
-            }
-
-            prev_live = live_status_cache.get(cp_norm, {})
-            live_status_cache[cp_norm] = {
-                **prev_live,
-                "derived": True,
-                "ws_grace_until": expire_at,
-                "updated_at": time.time(),
-            }
-
-            logger.warning(
-                f"[WS_DISCONNECT][GRACE_START] "
-                f"cp_id={cp_norm} | grace_seconds={WS_DISCONNECT_GRACE_SECONDS}"
-            )
-
-            old_task = pending_ws_disconnect_tasks.pop(cp_norm, None)
-            if old_task:
-                old_task.cancel()
-
-            pending_ws_disconnect_tasks[cp_norm] = asyncio.create_task(
-                finalize_ws_disconnect_cleanup(
-                    cp_norm,
-                    expected_cp=current_cp,
-                    expected_seq=disconnect_seq,
-                )
-            )
-
-            try:
-                request_rebalance(reason="ws_disconnect_grace")
-                logger.warning(
-                    f"[SMART][WS_DISCONNECT][GRACE_REBALANCE_REQUESTED] cp_id={cp_norm}"
-                )
-            except Exception as rebalance_err:
-                logger.exception(
-                    f"[SMART][WS_DISCONNECT][GRACE_REBALANCE_REQUEST_ERR] "
-                    f"cp_id={cp_norm} | err={rebalance_err}"
-                )
-
-        except Exception as e:
-            logger.exception(
-                f"[WS_DISCONNECT][GRACE_START][ERR] cp_id={cp_norm} | err={e}"
-            )
-
 
 
 
