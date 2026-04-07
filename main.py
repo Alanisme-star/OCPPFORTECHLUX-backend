@@ -1101,23 +1101,103 @@ charging_point_status = {}
 class FastAPIWebSocketAdapter:
     def __init__(self, websocket):
         self.websocket = websocket
+        self.cp_id = _get_ws_debug_cp_id(websocket)
+        self.recv_seq = 0
+        self.send_seq = 0
 
     async def recv(self):
-        msg = await self.websocket.receive_text()
-        return msg
+        t0 = time.perf_counter()
+
+        try:
+            msg = await self.websocket.receive_text()
+            self.recv_seq += 1
+
+            meta = _parse_ocpp_frame_meta(msg)
+
+            logger.warning(
+                f"[DEBUG][WS][RECV] "
+                f"cp_id={self.cp_id} | seq={self.recv_seq} | wait_ms={_ms_since(t0)} | "
+                f"frame_type={meta['frame_type']} | msg_type_id={meta['message_type_id']} | "
+                f"uid={meta['unique_id']} | action={meta['action']} | "
+                f"payload_keys={meta['payload_keys']} | "
+                f"error_code={meta['error_code']} | "
+                f"raw={_safe_log_text(msg)}"
+            )
+            return msg
+
+        except WebSocketDisconnect as e:
+            logger.warning(
+                f"[DEBUG][WS][RECV_DISCONNECT] "
+                f"cp_id={self.cp_id} | next_seq={self.recv_seq + 1} | "
+                f"wait_ms={_ms_since(t0)} | code={getattr(e, 'code', None)}"
+            )
+            raise
+
+        except Exception as e:
+            logger.exception(
+                f"[DEBUG][WS][RECV_ERR] "
+                f"cp_id={self.cp_id} | next_seq={self.recv_seq + 1} | "
+                f"wait_ms={_ms_since(t0)} | err={e}"
+            )
+            raise
 
     async def send(self, data):
+        t0 = time.perf_counter()
+        meta = _parse_ocpp_frame_meta(data)
+
+        logger.warning(
+            f"[DEBUG][WS][SEND_TRY] "
+            f"cp_id={self.cp_id} | next_seq={self.send_seq + 1} | "
+            f"frame_type={meta['frame_type']} | msg_type_id={meta['message_type_id']} | "
+            f"uid={meta['unique_id']} | action={meta['action']} | "
+            f"payload_keys={meta['payload_keys']} | "
+            f"error_code={meta['error_code']} | "
+            f"raw={_safe_log_text(data)}"
+        )
+
         try:
             await self.websocket.send_text(data)
-        except (WebSocketDisconnect, ConnectionClosedOK):
+            self.send_seq += 1
+
+            logger.warning(
+                f"[DEBUG][WS][SEND_OK] "
+                f"cp_id={self.cp_id} | seq={self.send_seq} | send_ms={_ms_since(t0)} | "
+                f"frame_type={meta['frame_type']} | msg_type_id={meta['message_type_id']} | "
+                f"uid={meta['unique_id']} | action={meta['action']}"
+            )
+
+        except (WebSocketDisconnect, ConnectionClosedOK) as e:
+            logger.warning(
+                f"[DEBUG][WS][SEND_CLOSED] "
+                f"cp_id={self.cp_id} | next_seq={self.send_seq + 1} | "
+                f"send_ms={_ms_since(t0)} | err={e} | "
+                f"frame_type={meta['frame_type']} | uid={meta['unique_id']} | action={meta['action']}"
+            )
             raise
+
         except RuntimeError as e:
-            # WebSocket 已 close / 已 completed 時，視為連線已失效
-            if "websocket.send" in str(e) or "websocket.close" in str(e):
+            err_text = str(e)
+
+            logger.warning(
+                f"[DEBUG][WS][SEND_RUNTIME_ERR] "
+                f"cp_id={self.cp_id} | next_seq={self.send_seq + 1} | "
+                f"send_ms={_ms_since(t0)} | err={err_text} | "
+                f"frame_type={meta['frame_type']} | uid={meta['unique_id']} | action={meta['action']}"
+            )
+
+            if "websocket.send" in err_text or "websocket.close" in err_text:
                 raise WebSocketDisconnect(code=1006)
             raise
 
-    # ocpp 會取 subprotocol 屬性
+        except Exception as e:
+            logger.exception(
+                f"[DEBUG][WS][SEND_ERR] "
+                f"cp_id={self.cp_id} | next_seq={self.send_seq + 1} | "
+                f"send_ms={_ms_since(t0)} | err={e} | "
+                f"frame_type={meta['frame_type']} | uid={meta['unique_id']} | action={meta['action']}"
+            )
+            raise
+
     @property
     def subprotocol(self):
         return self.websocket.headers.get("sec-websocket-protocol") or "ocpp1.6"
@@ -1141,6 +1221,85 @@ def _ms_since(start_ts: float) -> int:
         return int((time.perf_counter() - start_ts) * 1000)
     except Exception:
         return -1
+
+
+def _safe_log_text(text, limit: int = 280) -> str:
+    try:
+        s = str(text)
+    except Exception:
+        s = repr(text)
+
+    s = s.replace("\n", "\\n").replace("\r", "\\r")
+    if len(s) > limit:
+        return s[:limit] + "...(truncated)"
+    return s
+
+
+def _get_ws_debug_cp_id(websocket) -> str:
+    try:
+        raw = ""
+
+        if hasattr(websocket, "path_params"):
+            raw = websocket.path_params.get("charge_point_id") or ""
+
+        if not raw:
+            url_obj = getattr(websocket, "url", None)
+            if url_obj is not None:
+                raw = str(getattr(url_obj, "path", "") or "")
+                raw = raw.rsplit("/", 1)[-1]
+
+        return _normalize_cp_id(raw)
+    except Exception:
+        return "unknown"
+
+
+def _parse_ocpp_frame_meta(raw_text: str) -> dict:
+    meta = {
+        "frame_type": "UNKNOWN",
+        "message_type_id": None,
+        "unique_id": None,
+        "action": None,
+        "payload_keys": None,
+        "error_code": None,
+        "error_description": None,
+    }
+
+    try:
+        obj = json.loads(raw_text)
+
+        if not isinstance(obj, list) or not obj:
+            return meta
+
+        meta["message_type_id"] = obj[0]
+
+        if len(obj) > 1:
+            meta["unique_id"] = obj[1]
+
+        if obj[0] == 2:
+            meta["frame_type"] = "CALL"
+            meta["action"] = obj[2] if len(obj) > 2 else None
+            payload = obj[3] if len(obj) > 3 else None
+            meta["payload_keys"] = (
+                sorted(payload.keys()) if isinstance(payload, dict) else None
+            )
+
+        elif obj[0] == 3:
+            meta["frame_type"] = "CALLRESULT"
+            payload = obj[2] if len(obj) > 2 else None
+            meta["payload_keys"] = (
+                sorted(payload.keys()) if isinstance(payload, dict) else None
+            )
+
+        elif obj[0] == 4:
+            meta["frame_type"] = "CALLERROR"
+            meta["error_code"] = obj[2] if len(obj) > 2 else None
+            meta["error_description"] = obj[3] if len(obj) > 3 else None
+
+    except Exception as e:
+        meta["frame_type"] = "PARSE_ERR"
+        meta["error_description"] = repr(e)
+
+    return meta
 
 
 # ✅ 不再需要 connected_devices
@@ -1386,9 +1545,13 @@ LIVE_TTL = 15  # 秒：視情況調整
 DEBUG_TARGET_CP_ID = "TW*MSI*E000100"
 
 
+def _normalize_cp_id_for_debug_match(cp_id: str) -> str:
+    return _normalize_cp_id(cp_id).replace("*", "").upper()
+
+
 def _is_debug_target_cp(cp_id: str | None) -> bool:
     try:
-        return _normalize_cp_id(cp_id or "") == DEBUG_TARGET_CP_ID
+        return _normalize_cp_id_for_debug_match(cp_id or "") == DEBUG_TARGET_CP_ID
     except Exception:
         return False
 
@@ -1570,32 +1733,70 @@ async def _accept_or_reject_ws(websocket: WebSocket, raw_cp_id: str):
 @app.websocket("/{charge_point_id:path}")
 async def websocket_endpoint(websocket: WebSocket, charge_point_id: str):
     ws_t0 = time.perf_counter()
+    raw_cp_norm = _normalize_cp_id(charge_point_id)
+
+    logger.warning(
+        f"[DEBUG][WS][ATTEMPT] "
+        f"raw_path={charge_point_id} | normalized_cp_id={raw_cp_norm} | "
+        f"client={getattr(websocket.client, 'host', None)} | "
+        f"subprotocol={websocket.headers.get('sec-websocket-protocol')}"
+    )
 
     print(
         f"🌐 WS attempt | raw_path={charge_point_id} | headers={dict(websocket.headers)}"
     )
 
     try:
+        logger.warning(
+            f"[DEBUG][WS][ACCEPT_START] "
+            f"cp_id={raw_cp_norm} | alive_ms={_ms_since(ws_t0)}"
+        )
+
         # 1) 驗證 + accept(subprotocol="ocpp1.6")，並回傳標準化 cp_id
         cp_id = await _accept_or_reject_ws(websocket, charge_point_id)
         if cp_id is None:
+            logger.warning(
+                f"[DEBUG][WS][ACCEPT_REJECTED] "
+                f"cp_id={raw_cp_norm} | alive_ms={_ms_since(ws_t0)}"
+            )
             return
 
         logging.warning(
             f"[DEBUG][WS][ACCEPTED] cp_id={cp_id} | alive_ms={_ms_since(ws_t0)}"
         )
 
+        logging.warning(
+            f"[DEBUG][WS][CP_CREATE] "
+            f"cp_id={cp_id} | connected_before={list(connected_charge_points.keys())}"
+        )
+
         # 2) 啟動 OCPP handler
         cp = ChargePoint(cp_id, FastAPIWebSocketAdapter(websocket))
         cp.supports_smart_charging = True
         connected_charge_points[cp_id] = cp
-        cancel_ws_disconnect_cleanup(cp_id)
-        await cp.start()
 
-    except WebSocketDisconnect:
+        logging.warning(
+            f"[DEBUG][WS][CP_REGISTERED] "
+            f"cp_id={cp_id} | connected_after={list(connected_charge_points.keys())} | "
+            f"supports_smart_charging={getattr(cp, 'supports_smart_charging', None)}"
+        )
+
+        cancel_ws_disconnect_cleanup(cp_id)
+
+        logging.warning(
+            f"[DEBUG][WS][CP_START_ENTER] "
+            f"cp_id={cp_id} | alive_ms={_ms_since(ws_t0)}"
+        )
+        await cp.start()
+        logging.warning(
+            f"[DEBUG][WS][CP_START_EXIT] "
+            f"cp_id={cp_id} | alive_ms={_ms_since(ws_t0)}"
+        )
+
+    except WebSocketDisconnect as e:
         logger.warning(
             f"[DEBUG][WS][DISCONNECTED] cp_id={_normalize_cp_id(charge_point_id)} | "
-            f"alive_ms={_ms_since(ws_t0)}"
+            f"alive_ms={_ms_since(ws_t0)} | code={getattr(e, 'code', None)}"
         )
 
     except Exception as e:
@@ -1614,6 +1815,157 @@ async def websocket_endpoint(websocket: WebSocket, charge_point_id: str):
             f"alive_ms={_ms_since(ws_t0)}"
         )
         cp_norm = _normalize_cp_id(charge_point_id)
+
+        current_cp = cp if "cp" in locals() else None
+
+        logger.warning(
+            f"[DEBUG][WS][FINALLY_STATE] "
+            f"cp_id={cp_norm} | alive_ms={_ms_since(ws_t0)} | "
+            f"has_local_cp={current_cp is not None} | "
+            f"in_connected={cp_norm in connected_charge_points} | "
+            f"same_obj_connected={connected_charge_points.get(cp_norm) is current_cp if current_cp else False} | "
+            f"in_grace={cp_norm in ws_disconnect_grace}"
+        )
+
+        try:
+            now = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
+
+            active_row = None
+            try:
+                with sqlite3.connect(DB_FILE, check_same_thread=False, timeout=15) as conn:
+                    cur = conn.cursor()
+                    cur.execute(
+                        """
+                        SELECT transaction_id
+                        FROM transactions
+                        WHERE charge_point_id = ?
+                          AND stop_timestamp IS NULL
+                        ORDER BY start_timestamp DESC
+                        LIMIT 1
+                        """,
+                        (cp_norm,),
+                    )
+                    active_row = cur.fetchone()
+            except Exception as db_err:
+                logger.exception(
+                    f"[WS_DISCONNECT][ACTIVE_TX_LOOKUP_ERR] cp_id={cp_norm} | err={db_err}"
+                )
+
+            logger.warning(
+                f"[DEBUG][WS][ACTIVE_TX_LOOKUP] "
+                f"cp_id={cp_norm} | active_row={active_row} | alive_ms={_ms_since(ws_t0)}"
+            )
+
+            if not active_row:
+                disconnect_seq = int(ws_disconnect_seq.get(cp_norm, 0) or 0) + 1
+                ws_disconnect_seq[cp_norm] = disconnect_seq
+
+                old_task = pending_ws_disconnect_tasks.pop(cp_norm, None)
+                if old_task:
+                    old_task.cancel()
+
+                old_prepare_task = pending_ws_prepare_feedback_tasks.pop(cp_norm, None)
+                if old_prepare_task:
+                    old_prepare_task.cancel()
+
+                ws_disconnect_grace.pop(cp_norm, None)
+
+                pending_ws_prepare_feedback_tasks[cp_norm] = asyncio.create_task(
+                    finalize_ws_prepare_feedback_cleanup(
+                        cp_norm,
+                        expected_cp=current_cp,
+                        expected_seq=disconnect_seq,
+                    )
+                )
+
+                logger.warning(
+                    f"[DEBUG][WS][NO_ACTIVE_TX_PATH] "
+                    f"cp_id={cp_norm} | seq={disconnect_seq} | "
+                    f"same_obj_connected={connected_charge_points.get(cp_norm) is current_cp if current_cp else False}"
+                )
+
+                logger.warning(
+                    f"[WS_DISCONNECT][NO_ACTIVE_TX][PREPARE_FEEDBACK_DELAY] "
+                    f"cp_id={cp_norm} | seq={disconnect_seq} | "
+                    f"delay={WS_PREPARE_FEEDBACK_SECONDS}s"
+                )
+                return
+
+            started_at = time.time()
+            expire_at = started_at + float(WS_DISCONNECT_GRACE_SECONDS)
+
+            disconnect_seq = int(ws_disconnect_seq.get(cp_norm, 0) or 0) + 1
+            ws_disconnect_seq[cp_norm] = disconnect_seq
+
+            logger.warning(
+                f"[DEBUG][WS][ACTIVE_TX_PATH] "
+                f"cp_id={cp_norm} | active_tx_id={active_row[0]} | "
+                f"seq={disconnect_seq} | grace_until={expire_at}"
+            )
+
+            ws_disconnect_grace[cp_norm] = {
+                "started_at": started_at,
+                "expire_at": expire_at,
+                "started_at_iso": now,
+                "seq": disconnect_seq,
+            }
+
+            prev_status = charging_point_status.get(cp_norm, {})
+            effective_status = prev_status.get("status")
+
+            if effective_status in (None, "Available", "Unknown", "未知"):
+                effective_status = "Charging"
+
+            charging_point_status[cp_norm] = {
+                **prev_status,
+                "status": effective_status or prev_status.get("status") or "Unknown",
+                "timestamp": now,
+                "error_code": "ConnectionLost",
+                "derived": True,
+                "grace_seconds": WS_DISCONNECT_GRACE_SECONDS,
+                "ws_grace_until": expire_at,
+            }
+
+            prev_live = live_status_cache.get(cp_norm, {})
+            live_status_cache[cp_norm] = {
+                **prev_live,
+                "derived": True,
+                "ws_grace_until": expire_at,
+                "updated_at": time.time(),
+            }
+
+            logger.warning(
+                f"[WS_DISCONNECT][GRACE_START] "
+                f"cp_id={cp_norm} | grace_seconds={WS_DISCONNECT_GRACE_SECONDS}"
+            )
+
+            old_task = pending_ws_disconnect_tasks.pop(cp_norm, None)
+            if old_task:
+                old_task.cancel()
+
+            pending_ws_disconnect_tasks[cp_norm] = asyncio.create_task(
+                finalize_ws_disconnect_cleanup(
+                    cp_norm,
+                    expected_cp=current_cp,
+                    expected_seq=disconnect_seq,
+                )
+            )
+
+            try:
+                request_rebalance(reason="ws_disconnect_grace")
+                logger.warning(
+                    f"[SMART][WS_DISCONNECT][GRACE_REBALANCE_REQUESTED] cp_id={cp_norm}"
+                )
+            except Exception as rebalance_err:
+                logger.exception(
+                    f"[SMART][WS_DISCONNECT][GRACE_REBALANCE_REQUEST_ERR] "
+                    f"cp_id={cp_norm} | err={rebalance_err}"
+                )
+
+        except Exception as e:
+            logger.exception(
+                f"[WS_DISCONNECT][GRACE_START][ERR] cp_id={cp_norm} | err={e}"
+            )
 
         # ==================================================
         # 3) WebSocket 斷線處理
@@ -2893,19 +3245,25 @@ class ChargePoint(OcppChargePoint):
         response = await self.call(request)
         return response
 
+
     @on(Action.StatusNotification)
     async def on_status_notification(
         self, connector_id=None, status=None, error_code=None, timestamp=None, **kwargs
     ):
         global charging_point_status
 
+        sn_t0 = time.perf_counter()
+
         try:
             cp_id = getattr(self, "id", None)
+            prev_status = charging_point_status.get(cp_id, {}) or {}
+            prev_live = live_status_cache.get(cp_id, {}) or {}
 
             logging.warning(
                 f"[DEBUG][STATUS][ENTER] "
                 f"cp_id={cp_id} | connector_id={connector_id} | "
-                f"status={status} | error_code={error_code} | timestamp={timestamp} | kwargs={kwargs}"
+                f"status={status} | error_code={error_code} | "
+                f"timestamp={timestamp} | kwargs={kwargs}"
             )
 
             if cp_id is None:
@@ -2920,7 +3278,6 @@ class ChargePoint(OcppChargePoint):
             status = str(status or "Unknown")
             error_code = str(error_code or "NoError")
 
-            # 統一 timestamp 為 UTC ISO8601
             status_ts_utc = None
             if timestamp:
                 try:
@@ -2933,7 +3290,11 @@ class ChargePoint(OcppChargePoint):
             else:
                 status_ts_utc = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
 
-            # 1) 寫 status_logs（這才是 StatusNotification 應該做的事）
+            logging.warning(
+                f"[DEBUG][STATUS][TS_NORMALIZED] "
+                f"cp_id={cp_id} | raw_timestamp={timestamp} | normalized_timestamp={status_ts_utc}"
+            )
+
             try:
                 with sqlite3.connect(DB_FILE, check_same_thread=False, timeout=15) as conn:
                     cursor = conn.cursor()
@@ -2979,8 +3340,6 @@ class ChargePoint(OcppChargePoint):
                     f"[STATUS][DB_LOG_ERR] cp_id={cp_id} | connector_id={connector_id} | err={e}"
                 )
 
-            # 2) 更新記憶體狀態
-            prev_status = charging_point_status.get(cp_id, {}) or {}
             charging_point_status[cp_id] = {
                 **prev_status,
                 "connector_id": connector_id,
@@ -2990,8 +3349,6 @@ class ChargePoint(OcppChargePoint):
                 "derived": False,
             }
 
-            # 3) 順手 patch live cache 的 status，不清空功率/電流
-            prev_live = live_status_cache.get(cp_id, {}) or {}
             live_status_cache[cp_id] = {
                 **prev_live,
                 "status": status,
@@ -3002,6 +3359,16 @@ class ChargePoint(OcppChargePoint):
             }
 
             logging.warning(
+                f"[DEBUG][STATUS][TRANSITION] "
+                f"cp_id={cp_id} | connector_id={connector_id} | "
+                f"prev_status={prev_status.get('status')} | new_status={status} | "
+                f"prev_status_ts={prev_status.get('timestamp')} | new_status_ts={status_ts_utc} | "
+                f"prev_live_status={prev_live.get('status')} | "
+                f"in_ws_grace={cp_id in ws_disconnect_grace} | "
+                f"total_ms={_ms_since(sn_t0)}"
+            )
+
+            logging.warning(
                 f"[STATUS][OK] "
                 f"cp_id={cp_id} | connector_id={connector_id} | "
                 f"status={status} | error_code={error_code} | timestamp={status_ts_utc}"
@@ -3010,8 +3377,15 @@ class ChargePoint(OcppChargePoint):
             return call_result.StatusNotificationPayload()
 
         except Exception as e:
-            logging.exception(f"[STATUS][ERR] cp_id={getattr(self, 'id', None)} | err={e}")
+            logging.exception(
+                f"[STATUS][ERR] cp_id={getattr(self, 'id', None)} | total_ms={_ms_since(sn_t0)} | err={e}"
+            )
             return call_result.StatusNotificationPayload()
+
+
+
+
+
 
     from ocpp.v16.enums import RegistrationStatus
     import os
@@ -3097,7 +3471,8 @@ class ChargePoint(OcppChargePoint):
         cp_id = getattr(self, "id", "unknown")
 
         logging.warning(
-            f"[DEBUG][AUTHORIZE][ENTER] cp_id={cp_id} | idTag={id_tag}"
+            f"[DEBUG][AUTHORIZE][ENTER] "
+            f"cp_id={cp_id} | idTag={id_tag} | kwargs={kwargs}"
         )
 
         try:
@@ -3382,7 +3757,13 @@ class ChargePoint(OcppChargePoint):
                     tzinfo=timezone.utc
                 ).isoformat()
 
+            logging.warning(
+                f"[DEBUG][START_TX][TS_NORMALIZED] "
+                f"cp_id={self.id} | ocpp_timestamp={timestamp} | start_ts_to_save={start_ts_to_save}"
+            )
+
             t_step = time.perf_counter()
+
             with sqlite3.connect(DB_FILE, check_same_thread=False, timeout=15) as conn:
                 cursor = conn.cursor()
                 cursor.execute(
