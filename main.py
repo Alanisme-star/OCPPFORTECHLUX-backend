@@ -1545,13 +1545,9 @@ LIVE_TTL = 15  # 秒：視情況調整
 DEBUG_TARGET_CP_ID = "TW*MSI*E000100"
 
 
-def _normalize_cp_id_for_debug_match(cp_id: str) -> str:
-    return _normalize_cp_id(cp_id).replace("*", "").upper()
-
-
 def _is_debug_target_cp(cp_id: str | None) -> bool:
     try:
-        return _normalize_cp_id_for_debug_match(cp_id or "") == DEBUG_TARGET_CP_ID
+        return _normalize_cp_id(cp_id or "") == DEBUG_TARGET_CP_ID
     except Exception:
         return False
 
