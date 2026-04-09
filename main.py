@@ -2620,10 +2620,23 @@ CREATE TABLE IF NOT EXISTS transactions (
     start_timestamp TEXT,
     meter_stop INTEGER,
     stop_timestamp TEXT,
-    reason TEXT
+    reason TEXT,
+    balance_before REAL,
+    balance_after REAL
 )
 """
 )
+
+cursor.execute("PRAGMA table_info(transactions)")
+_tx_cols = [r[1] for r in cursor.fetchall()]
+
+if "balance_before" not in _tx_cols:
+    cursor.execute("ALTER TABLE transactions ADD COLUMN balance_before REAL")
+
+if "balance_after" not in _tx_cols:
+    cursor.execute("ALTER TABLE transactions ADD COLUMN balance_after REAL")
+
+conn.commit()
 
 
 cursor.execute(
@@ -3606,8 +3619,11 @@ class ChargePoint(OcppChargePoint):
                     )
 
                     # ==================================================
-                    # 卡片扣款（正式結算）
+                    # 卡片扣款（正式結算）＋ 寫入交易前後餘額快照
                     # ==================================================
+                    balance_before = None
+                    balance_after = None
+
                     _cur.execute(
                         "SELECT balance FROM cards WHERE card_id = ?",
                         (id_tag,),
@@ -3617,22 +3633,30 @@ class ChargePoint(OcppChargePoint):
                     if not card:
                         logger.error(f"[STOP][ERR] card not found | card_id={id_tag}")
                     else:
-                        old_balance = float(card[0] or 0)
-                        new_balance = max(0.0, old_balance - total_amount)
+                        balance_before = round(float(card[0] or 0), 2)
+                        balance_after = round(max(0.0, balance_before - total_amount), 2)
 
                         _cur.execute(
                             "UPDATE cards SET balance = ? WHERE card_id = ?",
-                            (new_balance, id_tag),
+                            (balance_after, id_tag),
+                        )
+
+                        _cur.execute(
+                            """
+                            UPDATE transactions
+                            SET balance_before = ?, balance_after = ?
+                            WHERE transaction_id = ?
+                            """,
+                            (balance_before, balance_after, transaction_id),
                         )
 
                         logger.error(
                             f"[STOP][UPDATE] card_id={id_tag} "
-                            f"| old={old_balance} "
-                            f"| new={new_balance} "
+                            f"| balance_before={balance_before} "
+                            f"| balance_after={balance_after} "
                             f"| cost={total_amount} "
                             f"| rowcount={_cur.rowcount}"
                         )
-
                     # ==================================================
                     # 紀錄付款
                     # ==================================================
@@ -5958,76 +5982,291 @@ async def get_transactions(
     start: str = Query(None),
     end: str = Query(None),
 ):
-    query = "SELECT * FROM transactions WHERE 1=1"
+    query = """
+        SELECT
+            t.transaction_id,
+            t.charge_point_id,
+            t.connector_id,
+            t.id_tag,
+            t.meter_start,
+            t.start_timestamp,
+            t.meter_stop,
+            t.stop_timestamp,
+            t.reason,
+            t.balance_before,
+            t.balance_after,
+            u.name,
+            u.card_number,
+            (
+                SELECT p.total_amount
+                FROM payments p
+                WHERE p.transaction_id = t.transaction_id
+                ORDER BY p.id DESC
+                LIMIT 1
+            ) AS total_amount
+        FROM transactions t
+        LEFT JOIN users u
+            ON u.id_tag = t.id_tag
+        WHERE 1=1
+    """
     params = []
 
     if idTag:
-        query += " AND id_tag = ?"
+        query += " AND t.id_tag = ?"
         params.append(idTag)
     if chargePointId:
-        query += " AND charge_point_id = ?"
+        query += " AND t.charge_point_id = ?"
         params.append(chargePointId)
     if start:
-        query += " AND start_timestamp >= ?"
+        query += " AND t.start_timestamp >= ?"
         params.append(start)
     if end:
-        query += " AND start_timestamp <= ?"
+        query += " AND t.start_timestamp <= ?"
         params.append(end)
 
-    cursor.execute(query, params)
-    rows = cursor.fetchall()
+    query += " ORDER BY t.start_timestamp DESC, t.transaction_id DESC"
 
-    result = {}
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(query, params)
+        rows = cur.fetchall()
+
+    result = []
+
     for row in rows:
-        txn_id = row[0]
-        result[txn_id] = {
-            "chargePointId": row[1],
-            "connectorId": row[2],
-            "idTag": row[3],
-            "meterStart": row[4],
-            "startTimestamp": row[5],
-            "meterStop": row[6],
-            "stopTimestamp": row[7],
-            "reason": row[8],
-            "meterValues": [],
-        }
+        (
+            transaction_id,
+            cp_id,
+            connector_id,
+            id_tag,
+            meter_start,
+            start_timestamp,
+            meter_stop,
+            stop_timestamp,
+            reason,
+            balance_before,
+            balance_after,
+            resident_name,
+            card_number,
+            total_amount,
+        ) = row
 
-        cursor.execute(
-            """
-            SELECT timestamp, value, measurand, unit, context, format
-            FROM meter_values WHERE transaction_id = ?
-        """,
-            (txn_id,),
+        energy_kwh = None
+        if meter_start is not None and meter_stop is not None:
+            try:
+                energy_kwh = round(
+                    max(0.0, (float(meter_stop) - float(meter_start)) / 1000.0), 2
+                )
+            except Exception:
+                energy_kwh = None
+
+        duration_minutes = None
+        duration_text = "--"
+        if start_timestamp and stop_timestamp:
+            try:
+                dt_start = parse_date(start_timestamp)
+                dt_stop = parse_date(stop_timestamp)
+                diff_seconds = max(0, int((dt_stop - dt_start).total_seconds()))
+                duration_minutes = diff_seconds // 60
+
+                hours = diff_seconds // 3600
+                minutes = (diff_seconds % 3600) // 60
+                duration_text = f"{hours}小時{minutes}分"
+            except Exception:
+                duration_minutes = None
+                duration_text = "--"
+
+        result.append(
+            {
+                "transactionId": transaction_id,
+                "chargePointId": cp_id,
+                "connectorId": connector_id,
+                "residentName": resident_name or "--",
+                "cardId": card_number or id_tag,
+                "idTag": id_tag,
+                "cardNumber": card_number or id_tag,
+                "startTimestamp": start_timestamp,
+                "stopTimestamp": stop_timestamp,
+                "durationMinutes": duration_minutes,
+                "durationText": duration_text,
+                "energyKwh": energy_kwh,
+                "balanceBefore": (
+                    round(float(balance_before), 2)
+                    if balance_before is not None
+                    else None
+                ),
+                "cost": (
+                    round(float(total_amount), 2)
+                    if total_amount is not None
+                    else None
+                ),
+                "balanceAfter": (
+                    round(float(balance_after), 2)
+                    if balance_after is not None
+                    else None
+                ),
+                "meterStart": meter_start,
+                "meterStop": meter_stop,
+                "reason": reason,
+            }
         )
-        mv_rows = cursor.fetchall()
-        for mv in mv_rows:
-            result[txn_id]["meterValues"].append(
-                {
-                    "timestamp": mv[0],
-                    "sampledValue": [
-                        {
-                            "value": mv[1],
-                            "measurand": mv[2],
-                            "unit": mv[3],
-                            "context": mv[4],
-                            "format": mv[5],
-                        }
-                    ],
-                }
-            )
+
+    return JSONResponse(content=result)@app.get("/api/transactions")
+async def get_transactions(
+    idTag: str = Query(None),
+    chargePointId: str = Query(None),
+    start: str = Query(None),
+    end: str = Query(None),
+):
+    query = """
+        SELECT
+            t.transaction_id,
+            t.charge_point_id,
+            t.connector_id,
+            t.id_tag,
+            t.meter_start,
+            t.start_timestamp,
+            t.meter_stop,
+            t.stop_timestamp,
+            t.reason,
+            t.balance_before,
+            t.balance_after,
+            u.name,
+            u.card_number,
+            (
+                SELECT p.total_amount
+                FROM payments p
+                WHERE p.transaction_id = t.transaction_id
+                ORDER BY p.id DESC
+                LIMIT 1
+            ) AS total_amount
+        FROM transactions t
+        LEFT JOIN users u
+            ON u.id_tag = t.id_tag
+        WHERE 1=1
+    """
+    params = []
+
+    if idTag:
+        query += " AND t.id_tag = ?"
+        params.append(idTag)
+    if chargePointId:
+        query += " AND t.charge_point_id = ?"
+        params.append(chargePointId)
+    if start:
+        query += " AND t.start_timestamp >= ?"
+        params.append(start)
+    if end:
+        query += " AND t.start_timestamp <= ?"
+        params.append(end)
+
+    query += " ORDER BY t.start_timestamp DESC, t.transaction_id DESC"
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(query, params)
+        rows = cur.fetchall()
+
+    result = []
+
+    for row in rows:
+        (
+            transaction_id,
+            cp_id,
+            connector_id,
+            id_tag,
+            meter_start,
+            start_timestamp,
+            meter_stop,
+            stop_timestamp,
+            reason,
+            balance_before,
+            balance_after,
+            resident_name,
+            card_number,
+            total_amount,
+        ) = row
+
+        energy_kwh = None
+        if meter_start is not None and meter_stop is not None:
+            try:
+                energy_kwh = round(
+                    max(0.0, (float(meter_stop) - float(meter_start)) / 1000.0), 2
+                )
+            except Exception:
+                energy_kwh = None
+
+        duration_minutes = None
+        duration_text = "--"
+        if start_timestamp and stop_timestamp:
+            try:
+                dt_start = parse_date(start_timestamp)
+                dt_stop = parse_date(stop_timestamp)
+                diff_seconds = max(0, int((dt_stop - dt_start).total_seconds()))
+                duration_minutes = diff_seconds // 60
+
+                hours = diff_seconds // 3600
+                minutes = (diff_seconds % 3600) // 60
+                duration_text = f"{hours}小時{minutes}分"
+            except Exception:
+                duration_minutes = None
+                duration_text = "--"
+
+        result.append(
+            {
+                "transactionId": transaction_id,
+                "chargePointId": cp_id,
+                "connectorId": connector_id,
+                "residentName": resident_name or "--",
+                "cardId": card_number or id_tag,
+                "idTag": id_tag,
+                "cardNumber": card_number or id_tag,
+                "startTimestamp": start_timestamp,
+                "stopTimestamp": stop_timestamp,
+                "durationMinutes": duration_minutes,
+                "durationText": duration_text,
+                "energyKwh": energy_kwh,
+                "balanceBefore": (
+                    round(float(balance_before), 2)
+                    if balance_before is not None
+                    else None
+                ),
+                "cost": (
+                    round(float(total_amount), 2)
+                    if total_amount is not None
+                    else None
+                ),
+                "balanceAfter": (
+                    round(float(balance_after), 2)
+                    if balance_after is not None
+                    else None
+                ),
+                "meterStart": meter_start,
+                "meterStop": meter_stop,
+                "reason": reason,
+            }
+        )
 
     return JSONResponse(content=result)
-
 
 def compute_transaction_cost(transaction_id: int):
     with get_conn() as conn:
         cur = conn.cursor()
 
-        # 1. 先查交易主資料，確認 transaction 存在
         cur.execute(
             """
-            SELECT transaction_id, charge_point_id, connector_id, id_tag,
-                   meter_start, start_timestamp, meter_stop, stop_timestamp, reason
+            SELECT
+                transaction_id,
+                charge_point_id,
+                connector_id,
+                id_tag,
+                meter_start,
+                start_timestamp,
+                meter_stop,
+                stop_timestamp,
+                reason,
+                balance_before,
+                balance_after
             FROM transactions
             WHERE transaction_id = ?
             """,
@@ -6048,9 +6287,10 @@ def compute_transaction_cost(transaction_id: int):
             meter_stop,
             stop_timestamp,
             reason,
+            balance_before,
+            balance_after,
         ) = tx
 
-        # 2. 查 payments 總金額（若已有正式帳單）
         cur.execute(
             """
             SELECT total_amount
@@ -6064,12 +6304,10 @@ def compute_transaction_cost(transaction_id: int):
         pay_row = cur.fetchone()
         payment_total = float(pay_row[0]) if pay_row and pay_row[0] is not None else None
 
-        # 3. 用既有 helper 算分段明細
         breakdown = _calculate_multi_period_cost_detailed(transaction_id)
         breakdown_total = float(breakdown.get("total") or 0.0)
         segments = breakdown.get("segments") or []
 
-        # 4. 這裡就是「只做欄位轉名」的地方
         details = [
             {
                 "from": seg.get("start"),
@@ -6081,26 +6319,27 @@ def compute_transaction_cost(transaction_id: int):
             for seg in segments
         ]
 
-        # 5. cost 優先用 payments，沒有才退回 breakdown total
         final_cost = round(
             float(payment_total if payment_total is not None else breakdown_total), 2
         )
 
-        # 6. 查卡片剩餘儲值金額
-        cur.execute(
-            """
-            SELECT balance
-            FROM cards
-            WHERE card_id = ?
-            """,
-            (id_tag,),
-        )
-        card_row = cur.fetchone()
-        remaining_balance = (
-            round(float(card_row[0]), 2)
-            if card_row and card_row[0] is not None
-            else None
-        )
+        if balance_after is not None:
+            remaining_balance = round(float(balance_after), 2)
+        else:
+            cur.execute(
+                """
+                SELECT balance
+                FROM cards
+                WHERE card_id = ?
+                """,
+                (id_tag,),
+            )
+            card_row = cur.fetchone()
+            remaining_balance = (
+                round(float(card_row[0]), 2)
+                if card_row and card_row[0] is not None
+                else None
+            )
 
         return {
             "transactionId": tx_id,
@@ -6111,9 +6350,18 @@ def compute_transaction_cost(transaction_id: int):
             "stopTimestamp": stop_timestamp,
             "cost": final_cost,
             "details": details,
+            "balanceBefore": (
+                round(float(balance_before), 2)
+                if balance_before is not None
+                else None
+            ),
+            "balanceAfter": (
+                round(float(balance_after), 2)
+                if balance_after is not None
+                else remaining_balance
+            ),
             "remainingBalance": remaining_balance,
         }
-
 
 @app.get("/api/transactions/{transaction_id}/cost")
 async def calculate_transaction_cost(transaction_id: int):
@@ -6124,37 +6372,77 @@ async def calculate_transaction_cost(transaction_id: int):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
 @app.get("/api/transactions/{transaction_id}")
 async def get_transaction_detail(transaction_id: int):
-    # 查詢交易主資料
     cursor.execute(
-        "SELECT * FROM transactions WHERE transaction_id = ?", (transaction_id,)
+        """
+        SELECT
+            transaction_id,
+            charge_point_id,
+            connector_id,
+            id_tag,
+            meter_start,
+            start_timestamp,
+            meter_stop,
+            stop_timestamp,
+            reason,
+            balance_before,
+            balance_after
+        FROM transactions
+        WHERE transaction_id = ?
+        """,
+        (transaction_id,),
     )
     row = cursor.fetchone()
 
     if not row:
         raise HTTPException(status_code=404, detail="Transaction not found")
 
+    (
+        tx_id,
+        charge_point_id,
+        connector_id,
+        id_tag,
+        meter_start,
+        start_timestamp,
+        meter_stop,
+        stop_timestamp,
+        reason,
+        balance_before,
+        balance_after,
+    ) = row
+
     energy_kwh = None
-    if row[4] is not None and row[6] is not None:
+    if meter_start is not None and meter_stop is not None:
         try:
-            energy_kwh = round(max(0.0, (float(row[6]) - float(row[4])) / 1000.0), 6)
+            energy_kwh = round(
+                max(0.0, (float(meter_stop) - float(meter_start)) / 1000.0), 6
+            )
         except Exception:
             energy_kwh = None
 
     result = {
-        "transactionId": row[0],
-        "chargePointId": row[1],
-        "connectorId": row[2],
-        "idTag": row[3],
-        "cardNumber": row[3],
-        "meterStart": row[4],
-        "startTimestamp": row[5],
-        "meterStop": row[6],
-        "stopTimestamp": row[7],
-        "reason": row[8],
+        "transactionId": tx_id,
+        "chargePointId": charge_point_id,
+        "connectorId": connector_id,
+        "idTag": id_tag,
+        "cardNumber": id_tag,
+        "meterStart": meter_start,
+        "startTimestamp": start_timestamp,
+        "meterStop": meter_stop,
+        "stopTimestamp": stop_timestamp,
+        "reason": reason,
         "energyKwh": energy_kwh,
+        "balanceBefore": (
+            round(float(balance_before), 2)
+            if balance_before is not None
+            else None
+        ),
+        "balanceAfter": (
+            round(float(balance_after), 2)
+            if balance_after is not None
+            else None
+        ),
         "meterValues": [],
     }
 
