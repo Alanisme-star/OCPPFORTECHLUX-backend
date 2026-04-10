@@ -445,7 +445,8 @@ ws_disconnect_seq = {}
 # ===============================
 # 🔁 全域 Rebalance 去抖 / 合併 / 節流
 # ===============================
-REBALANCE_DEBOUNCE_SECONDS = float(os.getenv("REBALANCE_DEBOUNCE_SECONDS", "2.0"))
+# 🚀 救回藍燈閃爍：將去抖動延遲拉長至 15 秒，避免打斷充電樁繼電器閉合的機械動作
+REBALANCE_DEBOUNCE_SECONDS = float(os.getenv("REBALANCE_DEBOUNCE_SECONDS", "15.0"))
 
 rebalance_lock = asyncio.Lock()
 pending_rebalance_task = None
