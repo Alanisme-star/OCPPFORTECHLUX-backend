@@ -36,7 +36,7 @@ HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "8000"))
 
 # =========================================================
-# 你的專案資訊（註解用 / debug 用）
+# 專案資訊
 # =========================================================
 PROJECT_NAME = "MSI充電樁"
 DEFAULT_CP_ID = "TW*MSI*E000100"
@@ -45,18 +45,18 @@ BACKEND_URL = "https://ocppfortechlux-backend.onrender.com"
 
 # =========================================================
 # 卡片設定
-# 需求：卡片全部接受
+# 需求：全部接受
 # =========================================================
 ALLOW_ALL_ID_TAGS = True
 
-# 若未來改成只接受指定卡號，再把上面改成 False
+# 即使目前全部接受，仍保留一份預設卡號作為資訊用途
 ALLOWED_ID_TAGS = {
     "6678B3EB",
 }
 
 # =========================================================
 # 充電樁白名單
-# 需求：不限制白名單充電樁
+# 需求：不限制
 # 空集合 = 全部允許
 # =========================================================
 ALLOWED_CP_IDS = set()
@@ -132,7 +132,7 @@ class ChargePoint(OcppChargePoint):
         super().__init__(cp_id, connection)
         self.id = cp_id
 
-    @on(Action.boot_notification)
+    @on(Action.BootNotification)
     async def on_boot_notification(self, charge_point_model, charge_point_vendor, **kwargs):
         logger.warning(
             f"[BOOT] cp_id={self.id} | vendor={charge_point_vendor} | model={charge_point_model}"
@@ -146,13 +146,13 @@ class ChargePoint(OcppChargePoint):
             "project_name": PROJECT_NAME,
         }
 
-        return call_result.BootNotification(
+        return call_result.BootNotificationPayload(
             current_time=utc_now_iso(),
             interval=30,
             status=RegistrationStatus.accepted,
         )
 
-    @on(Action.authorize)
+    @on(Action.Authorize)
     async def on_authorize(self, id_tag, **kwargs):
         accepted = is_id_tag_accepted(id_tag)
         status = "Accepted" if accepted else "Invalid"
@@ -169,18 +169,16 @@ class ChargePoint(OcppChargePoint):
             "project_name": PROJECT_NAME,
         }
 
-        return call_result.Authorize(
-            id_tag_info={
-                "status": status
-            }
+        return call_result.AuthorizePayload(
+            id_tag_info={"status": status}
         )
 
-    @on(Action.status_notification)
+    @on(Action.StatusNotification)
     async def on_status_notification(
         self,
-        connector_id,
-        error_code,
-        status,
+        connector_id=None,
+        error_code=None,
+        status=None,
         timestamp=None,
         info=None,
         vendor_id=None,
@@ -192,9 +190,9 @@ class ChargePoint(OcppChargePoint):
         )
 
         charging_point_status[self.id] = {
-            "status": status,
-            "connector_id": connector_id,
-            "error_code": error_code,
+            "status": status or "Unknown",
+            "connector_id": int(connector_id or 0),
+            "error_code": error_code or "NoError",
             "timestamp": timestamp or utc_now_iso(),
             "info": info,
             "vendor_id": vendor_id,
@@ -202,17 +200,17 @@ class ChargePoint(OcppChargePoint):
             "project_name": PROJECT_NAME,
         }
 
-        return call_result.StatusNotification()
+        return call_result.StatusNotificationPayload()
 
-    @on(Action.heartbeat)
+    @on(Action.Heartbeat)
     async def on_heartbeat(self, **kwargs):
         logger.warning(f"[HEARTBEAT] cp_id={self.id}")
 
-        return call_result.Heartbeat(
+        return call_result.HeartbeatPayload(
             current_time=utc_now_iso()
         )
 
-    @on(Action.start_transaction)
+    @on(Action.StartTransaction)
     async def on_start_transaction(
         self,
         connector_id,
@@ -237,7 +235,7 @@ class ChargePoint(OcppChargePoint):
 
         charging_point_status[self.id] = {
             "status": "Charging" if accepted else "StartTxRejected",
-            "connector_id": connector_id,
+            "connector_id": int(connector_id or 0),
             "id_tag": id_tag,
             "transaction_id": tx_id,
             "meter_start": meter_start,
@@ -246,19 +244,17 @@ class ChargePoint(OcppChargePoint):
             "project_name": PROJECT_NAME,
         }
 
-        return call_result.StartTransaction(
+        return call_result.StartTransactionPayload(
             transaction_id=tx_id,
-            id_tag_info={
-                "status": status
-            }
+            id_tag_info={"status": status}
         )
 
-    @on(Action.stop_transaction)
+    @on(Action.StopTransaction)
     async def on_stop_transaction(
         self,
-        meter_stop,
-        timestamp,
-        transaction_id,
+        meter_stop=None,
+        timestamp=None,
+        transaction_id=None,
         reason=None,
         id_tag=None,
         **kwargs,
@@ -267,8 +263,7 @@ class ChargePoint(OcppChargePoint):
             f"[STOP_TX] cp_id={self.id} | tx_id={transaction_id} | meter_stop={meter_stop} | reason={reason}"
         )
 
-        if self.id in active_transactions:
-            active_transactions.pop(self.id, None)
+        active_transactions.pop(self.id, None)
 
         charging_point_status[self.id] = {
             "status": "Available",
@@ -280,25 +275,23 @@ class ChargePoint(OcppChargePoint):
             "project_name": PROJECT_NAME,
         }
 
-        return call_result.StopTransaction(
-            id_tag_info={
-                "status": "Accepted"
-            }
+        return call_result.StopTransactionPayload(
+            id_tag_info={"status": "Accepted"}
         )
 
-    @on(Action.meter_values)
-    async def on_meter_values(self, connector_id, meter_value, transaction_id=None, **kwargs):
+    @on(Action.MeterValues)
+    async def on_meter_values(self, connector_id=None, meter_value=None, transaction_id=None, **kwargs):
         logger.warning(
             f"[METER] cp_id={self.id} | connector_id={connector_id} | tx_id={transaction_id}"
         )
-        return call_result.MeterValues()
+        return call_result.MeterValuesPayload()
 
-    @on(Action.data_transfer)
-    async def on_data_transfer(self, vendor_id, message_id=None, data=None, **kwargs):
+    @on(Action.DataTransfer)
+    async def on_data_transfer(self, vendor_id=None, message_id=None, data=None, **kwargs):
         logger.warning(
             f"[DATA_TRANSFER] cp_id={self.id} | vendor_id={vendor_id} | message_id={message_id}"
         )
-        return call_result.DataTransfer(
+        return call_result.DataTransferPayload(
             status="Accepted"
         )
 
@@ -351,7 +344,7 @@ async def websocket_endpoint(websocket: WebSocket, charge_point_id: str):
 
 
 # =========================================================
-# 簡易 HTTP API（debug 用）
+# Debug HTTP API
 # =========================================================
 @app.get("/")
 def root():
