@@ -2211,48 +2211,34 @@ def ensure_community_settings_table():
         c.commit()
 
 
-def ensure_community_settings_schema():
+def ensure_line_bindings_table():
     """
-    ✅ 舊 DB 相容用：
-    - 表存在但少欄位 → 自動補欄位
-    - 表不存在 → 直接跳過（避免 Deploy 炸掉）
+    ✅ LINE 綁定資料表
+    階段 3 用途：
+    - idTag 對應 LINE userId
+    - 供後續 webhook 綁定、後台測試推播、充電完成通知查詢使用
+
+    注意：
+    - 本階段不接 StopTransaction
+    - 不修改交易、扣款、餘額、SmartCharging 流程
     """
     with get_conn() as c:
         cur = c.cursor()
-
         cur.execute(
             """
-            SELECT name FROM sqlite_master
-            WHERE type='table' AND name='community_settings'
+            CREATE TABLE IF NOT EXISTS line_bindings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id_tag TEXT NOT NULL UNIQUE,
+                line_user_id TEXT NOT NULL UNIQUE,
+                display_name TEXT,
+                enabled INTEGER DEFAULT 1,
+                created_at TEXT,
+                updated_at TEXT
+            )
             """
         )
-        if not cur.fetchone():
-            logging.warning("⚠️ [MIGRATION] community_settings table not found, skip ALTER")
-            return
-
-        cur.execute("PRAGMA table_info(community_settings);")
-        cols = [r[1] for r in cur.fetchall()]
-
-        if "enabled" not in cols:
-            cur.execute("ALTER TABLE community_settings ADD COLUMN enabled INTEGER DEFAULT 1")
-
-        if "contract_kw" not in cols:
-            cur.execute("ALTER TABLE community_settings ADD COLUMN contract_kw REAL DEFAULT 0")
-
-        if "voltage_v" not in cols:
-            cur.execute("ALTER TABLE community_settings ADD COLUMN voltage_v REAL DEFAULT 220")
-
-        if "phases" not in cols:
-            cur.execute("ALTER TABLE community_settings ADD COLUMN phases INTEGER DEFAULT 1")
-
-        if "min_current_a" not in cols:
-            cur.execute("ALTER TABLE community_settings ADD COLUMN min_current_a REAL DEFAULT 16")
-
-        if "max_current_a" not in cols:
-            cur.execute("ALTER TABLE community_settings ADD COLUMN max_current_a REAL DEFAULT 32")
-
         c.commit()
-        logging.info("✅ [MIGRATION] community_settings schema checked")
+        logging.warning("✅ [LINE][DB] line_bindings table checked")
 
 
 
@@ -2269,6 +2255,9 @@ ensure_charge_points_schema()
 
 ensure_community_settings_table()
 ensure_community_settings_schema()
+
+# ✅ LINE 階段 3：建立住戶 / idTag 與 LINE userId 綁定資料表
+ensure_line_bindings_table()
 
 def _price_for_timestamp(ts: str) -> float:
     """
@@ -6869,6 +6858,588 @@ async def test_line_messaging(payload: dict = Body(...)):
         "line_result": result,
     }
 
+# =====================================================
+# LINE Messaging API：階段 3 住戶 / idTag 綁定資料
+# 注意：
+# 1. 本階段只建立 line_bindings CRUD
+# 2. 不接 StopTransaction
+# 3. 不自動推播充電完成通知
+# 4. 不修改交易、扣款、餘額、SmartCharging 流程
+# =====================================================
+
+def _line_now_iso() -> str:
+    return datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
+
+
+def _line_binding_row_to_dict(row):
+    if not row:
+        return None
+
+    return {
+        "id": row[0],
+        "idTag": row[1],
+        "lineUserId": row[2],
+        "displayName": row[3],
+        "enabled": bool(row[4]),
+        "createdAt": row[5],
+        "updatedAt": row[6],
+        "residentName": row[7] if len(row) > 7 else None,
+        "balance": float(row[8]) if len(row) > 8 and row[8] is not None else None,
+    }
+
+
+def _id_tag_exists_for_line_binding(cur, id_tag: str) -> bool:
+    """
+    檢查 idTag / card 是否存在。
+    階段 3 手動綁定時用來避免輸入錯誤卡號。
+    """
+    cur.execute(
+        """
+        SELECT 1
+        FROM id_tags
+        WHERE id_tag = ?
+        UNION
+        SELECT 1
+        FROM cards
+        WHERE card_id = ?
+        LIMIT 1
+        """,
+        (id_tag, id_tag),
+    )
+    return cur.fetchone() is not None
+
+
+@app.get("/api/line/bindings")
+async def list_line_bindings(
+    enabled: str | None = Query(default=None),
+    q: str | None = Query(default=None),
+):
+    """
+    查詢所有 LINE 綁定資料。
+
+    Query 可選：
+    - enabled=true：只看啟用
+    - enabled=false：只看停用
+    - q=關鍵字：搜尋 idTag / lineUserId / displayName / residentName
+    """
+
+    where = []
+    params = []
+
+    if enabled is not None:
+        enabled_str = str(enabled).strip().lower()
+        if enabled_str in ("true", "1", "yes", "y"):
+            where.append("lb.enabled = 1")
+        elif enabled_str in ("false", "0", "no", "n"):
+            where.append("lb.enabled = 0")
+
+    if q:
+        keyword = f"%{str(q).strip()}%"
+        where.append(
+            """
+            (
+                lb.id_tag LIKE ?
+                OR lb.line_user_id LIKE ?
+                OR IFNULL(lb.display_name, '') LIKE ?
+                OR IFNULL(co.owner_name, '') LIKE ?
+            )
+            """
+        )
+        params.extend([keyword, keyword, keyword, keyword])
+
+    where_sql = ""
+    if where:
+        where_sql = "WHERE " + " AND ".join(where)
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            f"""
+            SELECT
+                lb.id,
+                lb.id_tag,
+                lb.line_user_id,
+                lb.display_name,
+                lb.enabled,
+                lb.created_at,
+                lb.updated_at,
+                co.owner_name AS resident_name,
+                c.balance
+            FROM line_bindings lb
+            LEFT JOIN card_owners co ON co.card_id = lb.id_tag
+            LEFT JOIN cards c ON c.card_id = lb.id_tag
+            {where_sql}
+            ORDER BY lb.updated_at DESC, lb.created_at DESC, lb.id DESC
+            """,
+            params,
+        )
+        rows = cur.fetchall()
+
+    return {
+        "ok": True,
+        "count": len(rows),
+        "bindings": [_line_binding_row_to_dict(row) for row in rows],
+    }
+
+
+@app.get("/api/line/bindings/{id_tag}")
+async def get_line_binding(id_tag: str = Path(...)):
+    """
+    查詢單一 idTag 的 LINE 綁定資料。
+    """
+
+    id_tag = str(id_tag or "").strip()
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT
+                lb.id,
+                lb.id_tag,
+                lb.line_user_id,
+                lb.display_name,
+                lb.enabled,
+                lb.created_at,
+                lb.updated_at,
+                co.owner_name AS resident_name,
+                c.balance
+            FROM line_bindings lb
+            LEFT JOIN card_owners co ON co.card_id = lb.id_tag
+            LEFT JOIN cards c ON c.card_id = lb.id_tag
+            WHERE lb.id_tag = ?
+            """,
+            (id_tag,),
+        )
+        row = cur.fetchone()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="LINE binding not found")
+
+    return {
+        "ok": True,
+        "binding": _line_binding_row_to_dict(row),
+    }
+
+
+@app.post("/api/line/bindings")
+async def create_or_update_line_binding(payload: dict = Body(...)):
+    """
+    手動新增 / 更新 LINE 綁定。
+
+    Body 範例：
+    {
+        "idTag": "TEST_CARD_001",
+        "lineUserId": "Uxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "displayName": "Jimmy",
+        "enabled": true
+    }
+
+    若測試時卡號尚未存在，可暫時加：
+    {
+        "skipCardCheck": true
+    }
+    """
+
+    id_tag = str(
+        payload.get("idTag")
+        or payload.get("id_tag")
+        or payload.get("cardId")
+        or payload.get("card_id")
+        or ""
+    ).strip()
+
+    line_user_id = str(
+        payload.get("lineUserId")
+        or payload.get("line_user_id")
+        or payload.get("userId")
+        or payload.get("user_id")
+        or ""
+    ).strip()
+
+    display_name_raw = payload.get("displayName", payload.get("display_name"))
+    display_name = str(display_name_raw).strip() if display_name_raw is not None else None
+
+    enabled_raw = payload.get("enabled", True)
+    enabled_int = 1 if bool(enabled_raw) else 0
+
+    skip_card_check = bool(payload.get("skipCardCheck") or payload.get("skip_card_check") or False)
+
+    if not id_tag:
+        raise HTTPException(status_code=400, detail="idTag 不可為空")
+
+    if not line_user_id:
+        raise HTTPException(status_code=400, detail="lineUserId 不可為空")
+
+    now = _line_now_iso()
+
+    try:
+        with get_conn() as conn:
+            cur = conn.cursor()
+
+            if not skip_card_check and not _id_tag_exists_for_line_binding(cur, id_tag):
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"idTag/card not found: {id_tag}",
+                )
+
+            # 防止同一個 LINE userId 綁到另一張卡
+            cur.execute(
+                """
+                SELECT id_tag
+                FROM line_bindings
+                WHERE line_user_id = ?
+                  AND id_tag <> ?
+                """,
+                (line_user_id, id_tag),
+            )
+            conflict = cur.fetchone()
+            if conflict:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"此 LINE userId 已綁定其他 idTag: {conflict[0]}",
+                )
+
+            # 判斷是新增還是更新
+            cur.execute(
+                """
+                SELECT id
+                FROM line_bindings
+                WHERE id_tag = ?
+                """,
+                (id_tag,),
+            )
+            existing = cur.fetchone()
+
+            if existing:
+                cur.execute(
+                    """
+                    UPDATE line_bindings
+                    SET line_user_id = ?,
+                        display_name = ?,
+                        enabled = ?,
+                        updated_at = ?
+                    WHERE id_tag = ?
+                    """,
+                    (line_user_id, display_name, enabled_int, now, id_tag),
+                )
+                action = "updated"
+            else:
+                cur.execute(
+                    """
+                    INSERT INTO line_bindings
+                    (id_tag, line_user_id, display_name, enabled, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (id_tag, line_user_id, display_name, enabled_int, now, now),
+                )
+                action = "created"
+
+            conn.commit()
+
+            cur.execute(
+                """
+                SELECT
+                    lb.id,
+                    lb.id_tag,
+                    lb.line_user_id,
+                    lb.display_name,
+                    lb.enabled,
+                    lb.created_at,
+                    lb.updated_at,
+                    co.owner_name AS resident_name,
+                    c.balance
+                FROM line_bindings lb
+                LEFT JOIN card_owners co ON co.card_id = lb.id_tag
+                LEFT JOIN cards c ON c.card_id = lb.id_tag
+                WHERE lb.id_tag = ?
+                """,
+                (id_tag,),
+            )
+            row = cur.fetchone()
+
+        logging.warning(
+            f"[LINE][BINDING][{action.upper()}] idTag={id_tag} | line_user_id={line_user_id}"
+        )
+
+        return {
+            "ok": True,
+            "action": action,
+            "binding": _line_binding_row_to_dict(row),
+        }
+
+    except HTTPException:
+        raise
+    except sqlite3.IntegrityError as e:
+        logging.exception(f"[LINE][BINDING][INTEGRITY_ERR] {e}")
+        raise HTTPException(status_code=409, detail=str(e))
+    except Exception as e:
+        logging.exception(f"[LINE][BINDING][ERR] {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put("/api/line/bindings/{id_tag}")
+async def update_line_binding(id_tag: str = Path(...), payload: dict = Body(...)):
+    """
+    更新既有 LINE 綁定。
+    可更新：
+    - lineUserId
+    - displayName
+    - enabled
+    """
+
+    id_tag = str(id_tag or "").strip()
+
+    line_user_id_raw = (
+        payload.get("lineUserId")
+        or payload.get("line_user_id")
+        or payload.get("userId")
+        or payload.get("user_id")
+    )
+    display_name_raw = payload.get("displayName", payload.get("display_name"))
+    enabled_raw = payload.get("enabled", None)
+
+    if line_user_id_raw is None and display_name_raw is None and enabled_raw is None:
+        raise HTTPException(status_code=400, detail="No update fields provided")
+
+    now = _line_now_iso()
+
+    try:
+        with get_conn() as conn:
+            cur = conn.cursor()
+
+            cur.execute(
+                """
+                SELECT id
+                FROM line_bindings
+                WHERE id_tag = ?
+                """,
+                (id_tag,),
+            )
+            if not cur.fetchone():
+                raise HTTPException(status_code=404, detail="LINE binding not found")
+
+            if line_user_id_raw is not None:
+                line_user_id = str(line_user_id_raw).strip()
+                if not line_user_id:
+                    raise HTTPException(status_code=400, detail="lineUserId 不可為空")
+
+                cur.execute(
+                    """
+                    SELECT id_tag
+                    FROM line_bindings
+                    WHERE line_user_id = ?
+                      AND id_tag <> ?
+                    """,
+                    (line_user_id, id_tag),
+                )
+                conflict = cur.fetchone()
+                if conflict:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"此 LINE userId 已綁定其他 idTag: {conflict[0]}",
+                    )
+
+                cur.execute(
+                    """
+                    UPDATE line_bindings
+                    SET line_user_id = ?,
+                        updated_at = ?
+                    WHERE id_tag = ?
+                    """,
+                    (line_user_id, now, id_tag),
+                )
+
+            if display_name_raw is not None:
+                display_name = str(display_name_raw).strip()
+                cur.execute(
+                    """
+                    UPDATE line_bindings
+                    SET display_name = ?,
+                        updated_at = ?
+                    WHERE id_tag = ?
+                    """,
+                    (display_name, now, id_tag),
+                )
+
+            if enabled_raw is not None:
+                enabled_int = 1 if bool(enabled_raw) else 0
+                cur.execute(
+                    """
+                    UPDATE line_bindings
+                    SET enabled = ?,
+                        updated_at = ?
+                    WHERE id_tag = ?
+                    """,
+                    (enabled_int, now, id_tag),
+                )
+
+            conn.commit()
+
+            cur.execute(
+                """
+                SELECT
+                    lb.id,
+                    lb.id_tag,
+                    lb.line_user_id,
+                    lb.display_name,
+                    lb.enabled,
+                    lb.created_at,
+                    lb.updated_at,
+                    co.owner_name AS resident_name,
+                    c.balance
+                FROM line_bindings lb
+                LEFT JOIN card_owners co ON co.card_id = lb.id_tag
+                LEFT JOIN cards c ON c.card_id = lb.id_tag
+                WHERE lb.id_tag = ?
+                """,
+                (id_tag,),
+            )
+            row = cur.fetchone()
+
+        logging.warning(f"[LINE][BINDING][UPDATED] idTag={id_tag}")
+
+        return {
+            "ok": True,
+            "action": "updated",
+            "binding": _line_binding_row_to_dict(row),
+        }
+
+    except HTTPException:
+        raise
+    except sqlite3.IntegrityError as e:
+        logging.exception(f"[LINE][BINDING][UPDATE_INTEGRITY_ERR] {e}")
+        raise HTTPException(status_code=409, detail=str(e))
+    except Exception as e:
+        logging.exception(f"[LINE][BINDING][UPDATE_ERR] {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.patch("/api/line/bindings/{id_tag}/disable")
+async def disable_line_binding(id_tag: str = Path(...)):
+    """
+    停用某張 idTag 的 LINE 綁定。
+    資料保留，但 enabled = 0。
+    """
+
+    id_tag = str(id_tag or "").strip()
+    now = _line_now_iso()
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+
+        cur.execute(
+            """
+            SELECT id
+            FROM line_bindings
+            WHERE id_tag = ?
+            """,
+            (id_tag,),
+        )
+        if not cur.fetchone():
+            raise HTTPException(status_code=404, detail="LINE binding not found")
+
+        cur.execute(
+            """
+            UPDATE line_bindings
+            SET enabled = 0,
+                updated_at = ?
+            WHERE id_tag = ?
+            """,
+            (now, id_tag),
+        )
+        conn.commit()
+
+    logging.warning(f"[LINE][BINDING][DISABLED] idTag={id_tag}")
+
+    return {
+        "ok": True,
+        "action": "disabled",
+        "idTag": id_tag,
+    }
+
+
+@app.patch("/api/line/bindings/{id_tag}/enable")
+async def enable_line_binding(id_tag: str = Path(...)):
+    """
+    重新啟用某張 idTag 的 LINE 綁定。
+    """
+
+    id_tag = str(id_tag or "").strip()
+    now = _line_now_iso()
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+
+        cur.execute(
+            """
+            SELECT id
+            FROM line_bindings
+            WHERE id_tag = ?
+            """,
+            (id_tag,),
+        )
+        if not cur.fetchone():
+            raise HTTPException(status_code=404, detail="LINE binding not found")
+
+        cur.execute(
+            """
+            UPDATE line_bindings
+            SET enabled = 1,
+                updated_at = ?
+            WHERE id_tag = ?
+            """,
+            (now, id_tag),
+        )
+        conn.commit()
+
+    logging.warning(f"[LINE][BINDING][ENABLED] idTag={id_tag}")
+
+    return {
+        "ok": True,
+        "action": "enabled",
+        "idTag": id_tag,
+    }
+
+
+@app.delete("/api/line/bindings/{id_tag}")
+async def delete_line_binding(id_tag: str = Path(...)):
+    """
+    刪除某張 idTag 的 LINE 綁定。
+    """
+
+    id_tag = str(id_tag or "").strip()
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+
+        cur.execute(
+            """
+            SELECT id
+            FROM line_bindings
+            WHERE id_tag = ?
+            """,
+            (id_tag,),
+        )
+        if not cur.fetchone():
+            raise HTTPException(status_code=404, detail="LINE binding not found")
+
+        cur.execute(
+            """
+            DELETE FROM line_bindings
+            WHERE id_tag = ?
+            """,
+            (id_tag,),
+        )
+        conn.commit()
+
+    logging.warning(f"[LINE][BINDING][DELETED] idTag={id_tag}")
+
+    return {
+        "ok": True,
+        "action": "deleted",
+        "idTag": id_tag,
+    }
 
 @app.post("/webhook")
 async def webhook(request: Request):
