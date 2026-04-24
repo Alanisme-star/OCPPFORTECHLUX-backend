@@ -6729,6 +6729,7 @@ LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "").strip()
 LINE_TEST_USER_ID = os.getenv("LINE_TEST_USER_ID", "").strip()
 
 LINE_PUSH_API_URL = "https://api.line.me/v2/bot/message/push"
+LINE_REPLY_API_URL = "https://api.line.me/v2/bot/message/reply"
 
 
 def send_line_message(line_user_id: str, message: str) -> dict:
@@ -6827,6 +6828,100 @@ def send_line_message(line_user_id: str, message: str) -> dict:
             "status_code": None,
             "error": str(e),
         }
+
+
+
+
+def reply_line_message(reply_token: str, message: str) -> dict:
+    """
+    使用 LINE Reply API 回覆 webhook 訊息。
+
+    階段 4 用途：
+    - 收到 LINE 使用者輸入「綁定 卡號」後，直接回覆綁定結果
+    - 不接 StopTransaction
+    - 不修改交易、扣款、餘額、SmartCharging 流程
+    """
+
+    if not LINE_CHANNEL_ACCESS_TOKEN:
+        return {
+            "ok": False,
+            "status_code": None,
+            "error": "LINE_CHANNEL_ACCESS_TOKEN 尚未設定",
+        }
+
+    if not reply_token:
+        return {
+            "ok": False,
+            "status_code": None,
+            "error": "reply_token 不可為空",
+        }
+
+    if not message:
+        return {
+            "ok": False,
+            "status_code": None,
+            "error": "message 不可為空",
+        }
+
+    payload = {
+        "replyToken": reply_token,
+        "messages": [
+            {
+                "type": "text",
+                "text": message,
+            }
+        ],
+    }
+
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+    req = urllib.request.Request(
+        LINE_REPLY_API_URL,
+        data=body,
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            response_body = resp.read().decode("utf-8", errors="replace")
+
+            logging.warning(
+                f"[LINE][REPLY][OK] status_code={resp.status}"
+            )
+
+            return {
+                "ok": True,
+                "status_code": resp.status,
+                "response": response_body,
+            }
+
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode("utf-8", errors="replace")
+
+        logging.error(
+            f"[LINE][REPLY][HTTP_ERR] status_code={e.code} | error={error_body}"
+        )
+
+        return {
+            "ok": False,
+            "status_code": e.code,
+            "error": error_body,
+        }
+
+    except Exception as e:
+        logging.exception(f"[LINE][REPLY][ERR] err={e}")
+
+        return {
+            "ok": False,
+            "status_code": None,
+            "error": str(e),
+        }
+
+
 
 
 @app.post("/api/line/test-send")
@@ -6952,6 +7047,223 @@ def _id_tag_exists_for_line_binding(cur, id_tag: str) -> bool:
         (id_tag, id_tag),
     )
     return cur.fetchone() is not None
+
+
+
+def parse_line_bind_command(text: str):
+    """
+    解析 LINE 文字綁定指令。
+
+    支援格式：
+    - 綁定 TEST_CARD_001
+    - 綁定　TEST_CARD_001（全形空白）
+    - bind TEST_CARD_001
+    """
+
+    if text is None:
+        return None
+
+    normalized = str(text).replace("\u3000", " ").strip()
+    if not normalized:
+        return None
+
+    parts = normalized.split()
+    if len(parts) < 2:
+        return None
+
+    command = parts[0].strip().lower()
+    id_tag = parts[1].strip()
+
+    if command not in ("綁定", "绑定", "bind"):
+        return None
+
+    if not id_tag:
+        return None
+
+    return {
+        "id_tag": id_tag,
+        "raw_text": normalized,
+    }
+
+
+def bind_line_user_to_id_tag(
+    id_tag: str,
+    line_user_id: str,
+    display_name: str | None = None,
+) -> dict:
+    """
+    將 LINE userId 綁定到 idTag。
+
+    規則：
+    1. idTag / card 必須已存在。
+    2. 若該 idTag 已綁定其他 LINE userId，拒絕覆蓋。
+    3. 若同一個 LINE userId 原本綁定其他 idTag，允許改綁到新 idTag。
+    4. 綁定後 enabled 一律設為 1。
+    """
+
+    id_tag = str(id_tag or "").strip()
+    line_user_id = str(line_user_id or "").strip()
+    display_name = str(display_name).strip() if display_name else None
+
+    if not id_tag:
+        return {
+            "ok": False,
+            "status": "bad_request",
+            "message": "卡號不可為空，請輸入：綁定 卡號",
+        }
+
+    if not line_user_id:
+        return {
+            "ok": False,
+            "status": "bad_request",
+            "message": "無法取得 LINE userId，請從 LINE 官方帳號重新傳送綁定指令。",
+        }
+
+    now = _line_now_iso()
+
+    try:
+        with get_conn() as conn:
+            cur = conn.cursor()
+
+            if not _id_tag_exists_for_line_binding(cur, id_tag):
+                return {
+                    "ok": False,
+                    "status": "not_found",
+                    "message": f"查無此卡號 / idTag：{id_tag}，請確認卡號是否正確。",
+                }
+
+            # 先檢查目標 idTag 是否已經被別的 LINE userId 綁定
+            cur.execute(
+                """
+                SELECT line_user_id
+                FROM line_bindings
+                WHERE id_tag = ?
+                """,
+                (id_tag,),
+            )
+            id_tag_binding = cur.fetchone()
+
+            if id_tag_binding and str(id_tag_binding[0] or "").strip() != line_user_id:
+                return {
+                    "ok": False,
+                    "status": "conflict_id_tag",
+                    "message": f"此卡號已綁定其他 LINE 帳號，請洽管理員協助處理。卡號：{id_tag}",
+                }
+
+            # 再檢查同一個 LINE userId 是否已綁定其他 idTag
+            cur.execute(
+                """
+                SELECT id_tag
+                FROM line_bindings
+                WHERE line_user_id = ?
+                """,
+                (line_user_id,),
+            )
+            user_binding = cur.fetchone()
+            old_id_tag = str(user_binding[0] or "").strip() if user_binding else None
+
+            # 情境 A：同一張卡重複綁定 → 更新 display_name / enabled
+            if old_id_tag == id_tag:
+                cur.execute(
+                    """
+                    UPDATE line_bindings
+                    SET display_name = COALESCE(?, display_name),
+                        enabled = 1,
+                        updated_at = ?
+                    WHERE id_tag = ?
+                    """,
+                    (display_name, now, id_tag),
+                )
+                action = "updated_same_binding"
+
+            # 情境 B：同一個 LINE userId 改綁到新卡號
+            elif old_id_tag and old_id_tag != id_tag:
+                cur.execute(
+                    """
+                    UPDATE line_bindings
+                    SET id_tag = ?,
+                        display_name = COALESCE(?, display_name),
+                        enabled = 1,
+                        updated_at = ?
+                    WHERE line_user_id = ?
+                    """,
+                    (id_tag, display_name, now, line_user_id),
+                )
+                action = "rebound"
+
+            # 情境 C：全新綁定
+            else:
+                cur.execute(
+                    """
+                    INSERT INTO line_bindings
+                    (id_tag, line_user_id, display_name, enabled, created_at, updated_at)
+                    VALUES (?, ?, ?, 1, ?, ?)
+                    """,
+                    (id_tag, line_user_id, display_name, now, now),
+                )
+                action = "created"
+
+            conn.commit()
+
+            cur.execute(
+                """
+                SELECT
+                    lb.id,
+                    lb.id_tag,
+                    lb.line_user_id,
+                    lb.display_name,
+                    lb.enabled,
+                    lb.created_at,
+                    lb.updated_at,
+                    co.name AS resident_name,
+                    c.balance
+                FROM line_bindings lb
+                LEFT JOIN card_owners co ON co.card_id = lb.id_tag
+                LEFT JOIN cards c ON c.card_id = lb.id_tag
+                WHERE lb.id_tag = ?
+                """,
+                (id_tag,),
+            )
+            row = cur.fetchone()
+
+        logging.warning(
+            f"[LINE][WEBHOOK_BIND][OK] action={action} | idTag={id_tag} | line_user_id={line_user_id}"
+        )
+
+        return {
+            "ok": True,
+            "status": "ok",
+            "action": action,
+            "idTag": id_tag,
+            "oldIdTag": old_id_tag,
+            "binding": _line_binding_row_to_dict(row),
+            "message": f"綁定成功：{id_tag}",
+        }
+
+    except sqlite3.IntegrityError as e:
+        logging.exception(
+            f"[LINE][WEBHOOK_BIND][INTEGRITY_ERR] idTag={id_tag} | line_user_id={line_user_id} | err={e}"
+        )
+
+        return {
+            "ok": False,
+            "status": "integrity_error",
+            "message": "綁定失敗：資料已被其他帳號綁定，請洽管理員協助處理。",
+            "error": str(e),
+        }
+
+    except Exception as e:
+        logging.exception(
+            f"[LINE][WEBHOOK_BIND][ERR] idTag={id_tag} | line_user_id={line_user_id} | err={e}"
+        )
+
+        return {
+            "ok": False,
+            "status": "error",
+            "message": "綁定失敗：系統發生錯誤，請稍後再試或洽管理員。",
+            "error": str(e),
+        }
+
 
 
 @app.get("/api/line/bindings")
@@ -7489,16 +7801,23 @@ async def delete_line_binding(id_tag: str = Path(...)):
 @app.post("/webhook")
 async def webhook(request: Request):
     """
-    LINE Webhook 暫時測試用。
+    LINE Webhook：階段 4 綁定流程。
 
-    目的：
-    - 階段 2.5 先取得自己的 LINE userId
-    - 正式綁定流程會在階段 4 重新整理
+    支援使用者在 LINE 官方帳號輸入：
+    綁定 TEST_CARD_001
+
+    注意：
+    - 保留 userId debug log
+    - 不接 StopTransaction
+    - 不自動推播充電完成通知
+    - 不修改交易、扣款、餘額、SmartCharging、OCPP WebSocket 主流程
     """
 
     try:
-        body = await request.json()
-    except Exception:
+        raw_body = await request.body()
+        body = json.loads(raw_body.decode("utf-8")) if raw_body else {}
+    except Exception as e:
+        logging.exception(f"[LINE][WEBHOOK][BODY_PARSE_ERR] err={e}")
         body = {}
 
     logging.warning(f"[LINE][WEBHOOK][RAW] {body}")
@@ -7506,21 +7825,119 @@ async def webhook(request: Request):
     events = body.get("events", []) if isinstance(body, dict) else []
 
     found_users = []
+    processed_results = []
 
     for event in events:
-        source = event.get("source", {}) or {}
-        user_id = source.get("userId")
+        try:
+            event_type = event.get("type")
+            source = event.get("source", {}) or {}
+            user_id = source.get("userId")
+            reply_token = event.get("replyToken")
 
-        if user_id:
-            found_users.append(user_id)
-            logging.warning(f"[LINE][WEBHOOK][USER_ID] {user_id}")
+            if user_id:
+                found_users.append(user_id)
+                logging.warning(f"[LINE][WEBHOOK][USER_ID] {user_id}")
+
+            logging.warning(
+                f"[LINE][WEBHOOK][EVENT] type={event_type} | user_id={user_id} | has_reply_token={bool(reply_token)}"
+            )
+
+            # 目前只處理文字訊息
+            message_obj = event.get("message", {}) or {}
+            message_type = message_obj.get("type")
+            text = str(message_obj.get("text") or "").strip()
+
+            if event_type != "message" or message_type != "text":
+                processed_results.append(
+                    {
+                        "ok": True,
+                        "action": "ignored_non_text_event",
+                        "eventType": event_type,
+                        "messageType": message_type,
+                    }
+                )
+                continue
+
+            bind_command = parse_line_bind_command(text)
+
+            # 不是綁定指令：先回覆簡單提示，方便現場測試
+            if not bind_command:
+                reply_text = (
+                    "您好，若要綁定充電卡，請輸入：\n"
+                    "綁定 卡號\n\n"
+                    "例如：\n"
+                    "綁定 TEST_CARD_001"
+                )
+
+                reply_result = None
+                if reply_token:
+                    reply_result = reply_line_message(reply_token, reply_text)
+
+                processed_results.append(
+                    {
+                        "ok": True,
+                        "action": "help_replied",
+                        "text": text,
+                        "replyResult": reply_result,
+                    }
+                )
+                continue
+
+            id_tag = bind_command["id_tag"]
+
+            bind_result = bind_line_user_to_id_tag(
+                id_tag=id_tag,
+                line_user_id=user_id,
+                display_name=None,
+            )
+
+            if bind_result.get("ok"):
+                reply_text = (
+                    "✅ LINE 綁定成功\n"
+                    f"卡號：{id_tag}\n\n"
+                    "之後可用於接收充電相關通知。"
+                )
+            else:
+                reply_text = (
+                    "❌ LINE 綁定失敗\n"
+                    f"{bind_result.get('message') or '請確認卡號是否正確。'}"
+                )
+
+            reply_result = None
+            if reply_token:
+                reply_result = reply_line_message(reply_token, reply_text)
+
+            processed_results.append(
+                {
+                    "ok": bind_result.get("ok", False),
+                    "action": "bind_command",
+                    "idTag": id_tag,
+                    "bindResult": bind_result,
+                    "replyResult": reply_result,
+                }
+            )
+
+        except Exception as e:
+            logging.exception(f"[LINE][WEBHOOK][EVENT_ERR] event={event} | err={e}")
+
+            processed_results.append(
+                {
+                    "ok": False,
+                    "action": "event_error",
+                    "error": str(e),
+                }
+            )
+
+            # 避免單一 event 錯誤造成 LINE webhook 驗證失敗
+            continue
 
     return {
         "ok": True,
+        "events_count": len(events),
         "found_user_ids": found_users,
-        "message": "LINE webhook received. Check Render logs for [LINE][WEBHOOK][USER_ID].",
+        "results": processed_results,
+        "message": "LINE webhook received.",
     }
-
 
 
 @app.get("/api/users/{id_tag}")
