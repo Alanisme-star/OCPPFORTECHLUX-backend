@@ -2211,6 +2211,48 @@ def ensure_community_settings_table():
         c.commit()
 
 
+def ensure_community_settings_schema():
+    """
+    ✅ 舊 DB 相容用：
+    - 表存在但缺少欄位時，自動補齊欄位
+    - 避免 Render 啟動時因 ensure_community_settings_schema() 未定義而失敗
+    """
+    with get_conn() as c:
+        cur = c.cursor()
+
+        cur.execute("PRAGMA table_info(community_settings);")
+        cols = [r[1] for r in cur.fetchall()]
+
+        migrations = [
+            ("enabled", "ALTER TABLE community_settings ADD COLUMN enabled INTEGER DEFAULT 1"),
+            ("contract_kw", "ALTER TABLE community_settings ADD COLUMN contract_kw REAL DEFAULT 0"),
+            ("voltage_v", "ALTER TABLE community_settings ADD COLUMN voltage_v REAL DEFAULT 220"),
+            ("phases", "ALTER TABLE community_settings ADD COLUMN phases INTEGER DEFAULT 1"),
+            ("min_current_a", "ALTER TABLE community_settings ADD COLUMN min_current_a REAL DEFAULT 16"),
+            ("max_current_a", "ALTER TABLE community_settings ADD COLUMN max_current_a REAL DEFAULT 32"),
+        ]
+
+        for col_name, sql in migrations:
+            if col_name not in cols:
+                cur.execute(sql)
+                logging.warning(f"🛠️ [MIGRATION] community_settings add column {col_name}")
+
+        cur.execute("SELECT id FROM community_settings WHERE id = 1")
+        row = cur.fetchone()
+
+        if not row:
+            cur.execute(
+                """
+                INSERT INTO community_settings
+                (id, enabled, contract_kw, voltage_v, phases, min_current_a, max_current_a)
+                VALUES (1, 1, 0, 220, 1, 16, 32)
+                """
+            )
+
+        c.commit()
+        logging.warning("✅ [MIGRATION] community_settings schema checked")
+
+
 def ensure_line_bindings_table():
     """
     ✅ LINE 綁定資料表
@@ -6109,7 +6151,10 @@ async def get_transactions(
             }
         )
 
-    return JSONResponse(content=result)@app.get("/api/transactions")
+    return JSONResponse(content=result)
+
+
+@app.get("/api/transactions")
 async def get_transactions(
     idTag: str = Query(None),
     chargePointId: str = Query(None),
@@ -6941,7 +6986,7 @@ async def list_line_bindings(
                 lb.id_tag LIKE ?
                 OR lb.line_user_id LIKE ?
                 OR IFNULL(lb.display_name, '') LIKE ?
-                OR IFNULL(co.owner_name, '') LIKE ?
+                OR IFNULL(co.name, '') LIKE ?
             )
             """
         )
@@ -6963,7 +7008,7 @@ async def list_line_bindings(
                 lb.enabled,
                 lb.created_at,
                 lb.updated_at,
-                co.owner_name AS resident_name,
+                co.name AS resident_name,
                 c.balance
             FROM line_bindings lb
             LEFT JOIN card_owners co ON co.card_id = lb.id_tag
@@ -7002,7 +7047,7 @@ async def get_line_binding(id_tag: str = Path(...)):
                 lb.enabled,
                 lb.created_at,
                 lb.updated_at,
-                co.owner_name AS resident_name,
+                co.name AS resident_name,
                 c.balance
             FROM line_bindings lb
             LEFT JOIN card_owners co ON co.card_id = lb.id_tag
@@ -7147,7 +7192,7 @@ async def create_or_update_line_binding(payload: dict = Body(...)):
                     lb.enabled,
                     lb.created_at,
                     lb.updated_at,
-                    co.owner_name AS resident_name,
+                    co.name AS resident_name,
                     c.balance
                 FROM line_bindings lb
                 LEFT JOIN card_owners co ON co.card_id = lb.id_tag
@@ -7286,7 +7331,7 @@ async def update_line_binding(id_tag: str = Path(...), payload: dict = Body(...)
                     lb.enabled,
                     lb.created_at,
                     lb.updated_at,
-                    co.owner_name AS resident_name,
+                    co.name AS resident_name,
                     c.balance
                 FROM line_bindings lb
                 LEFT JOIN card_owners co ON co.card_id = lb.id_tag
