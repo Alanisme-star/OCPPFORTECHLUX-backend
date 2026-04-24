@@ -383,6 +383,8 @@ import logging
 import sqlite3
 import uvicorn
 import asyncio
+import urllib.request
+import urllib.error
 
 pending_stop_transactions = {}
 # 針對每筆交易做「已送停充」去重，避免前端/後端重複送
@@ -6680,105 +6682,211 @@ import threading
 import time
 
 
+# =====================================================
+# LINE Messaging API：階段 2 手動測試推播
+# 注意：
+# 1. 本階段只測試 LINE 發送能力
+# 2. 不接 StopTransaction
+# 3. 不修改交易、扣款、餘額、SmartCharging 流程
+# =====================================================
+
+LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "").strip()
+LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "").strip()
+LINE_TEST_USER_ID = os.getenv("LINE_TEST_USER_ID", "").strip()
+
+LINE_PUSH_API_URL = "https://api.line.me/v2/bot/message/push"
+
+
+def send_line_message(line_user_id: str, message: str) -> dict:
+    """
+    發送 LINE 文字推播。
+
+    階段 2 用途：
+    - 測試 Render 環境變數 LINE_CHANNEL_ACCESS_TOKEN 是否正確
+    - 測試後端是否能成功呼叫 LINE Push API
+    - 測試指定 LINE userId 是否能收到訊息
+
+    注意：
+    - 不讀取交易資料
+    - 不修改資料庫
+    - 不接 StopTransaction
+    """
+
+    if not LINE_CHANNEL_ACCESS_TOKEN:
+        return {
+            "ok": False,
+            "status_code": None,
+            "error": "LINE_CHANNEL_ACCESS_TOKEN 尚未設定",
+        }
+
+    if not line_user_id:
+        return {
+            "ok": False,
+            "status_code": None,
+            "error": "line_user_id 不可為空",
+        }
+
+    if not message:
+        return {
+            "ok": False,
+            "status_code": None,
+            "error": "message 不可為空",
+        }
+
+    payload = {
+        "to": line_user_id,
+        "messages": [
+            {
+                "type": "text",
+                "text": message,
+            }
+        ],
+    }
+
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+    req = urllib.request.Request(
+        LINE_PUSH_API_URL,
+        data=body,
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            response_body = resp.read().decode("utf-8", errors="replace")
+
+            logging.warning(
+                f"[LINE][PUSH][OK] status_code={resp.status} | user_id={line_user_id}"
+            )
+
+            return {
+                "ok": True,
+                "status_code": resp.status,
+                "response": response_body,
+            }
+
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode("utf-8", errors="replace")
+
+        logging.error(
+            f"[LINE][PUSH][HTTP_ERR] status_code={e.code} | "
+            f"user_id={line_user_id} | error={error_body}"
+        )
+
+        return {
+            "ok": False,
+            "status_code": e.code,
+            "error": error_body,
+        }
+
+    except Exception as e:
+        logging.exception(
+            f"[LINE][PUSH][ERR] user_id={line_user_id} | err={e}"
+        )
+
+        return {
+            "ok": False,
+            "status_code": None,
+            "error": str(e),
+        }
+
+
+@app.post("/api/line/test-send")
+async def api_line_test_send(payload: dict = Body(...)):
+    """
+    LINE 推播手動測試 API。
+
+    Body 範例：
+    {
+        "line_user_id": "Uxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "message": "LINE 推播測試成功"
+    }
+
+    或若 Render 已設定 LINE_TEST_USER_ID：
+    {
+        "message": "LINE 推播測試成功"
+    }
+    """
+
+    line_user_id = str(payload.get("line_user_id") or LINE_TEST_USER_ID or "").strip()
+    message = str(payload.get("message") or "LINE 推播測試成功").strip()
+
+    if not line_user_id:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "ok": False,
+                "message": "請提供 line_user_id，或在 Render 設定 LINE_TEST_USER_ID",
+            },
+        )
+
+    result = send_line_message(
+        line_user_id=line_user_id,
+        message=message,
+    )
+
+    return {
+        "ok": result.get("ok", False),
+        "line_user_id_source": "request_body" if payload.get("line_user_id") else "LINE_TEST_USER_ID",
+        "line_result": result,
+    }
+
+
 @app.post("/api/messaging/test")
 async def test_line_messaging(payload: dict = Body(...)):
-    logging.info("🔕 已停用 LINE 推播功能，略過發送")
-    return {"message": "LINE 通知功能已暫時停用"}
+    """
+    保留舊前端 LinePush.jsx 可能呼叫的路由名稱。
 
-    # 查詢對應的 user_id
-    recipient_ids = []
-    if targets and isinstance(targets, list):
-        query = f"SELECT card_number FROM users WHERE id_tag IN ({','.join(['?']*len(targets))})"
-        cursor.execute(query, targets)
-        rows = cursor.fetchall()
-        recipient_ids = [row[0] for row in rows if row[0]]
-    else:
-        recipient_ids = LINE_USER_IDS  # 預設全部
+    階段 2 暫時用途：
+    - 允許手動指定 line_user_id 測試
+    - 或使用 Render 的 LINE_TEST_USER_ID
+    - 暫時不處理 targets/idTag 綁定查詢
+    """
 
-    # 發送
-    for user_id in recipient_ids:
-        try:
-            payload = {"to": user_id, "messages": [{"type": "text", "text": message}]}
-            headers = {
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {LINE_TOKEN}",
-            }
-            resp = requests.post(
-                "https://api.line.me/v2/bot/message/push",
-                headers=headers,
-                data=json.dumps(payload),
-            )
-            logging.info(f"🔔 發送至 {user_id}：{resp.status_code} | 回應：{resp.text}")
-        except Exception as e:
-            logging.error(f"發送至 {user_id} 失敗：{e}")
+    message = str(payload.get("message") or "LINE 推播測試成功").strip()
+    line_user_id = str(payload.get("line_user_id") or LINE_TEST_USER_ID or "").strip()
 
-    return {"message": f"Sent to {len(recipient_ids)} users"}
+    if not line_user_id:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "ok": False,
+                "message": "階段 2 請先提供 line_user_id，或設定 LINE_TEST_USER_ID。targets/idTag 綁定會在階段 5 處理。",
+            },
+        )
 
+    result = send_line_message(
+        line_user_id=line_user_id,
+        message=message,
+    )
 
-import requests
-
-LINE_TOKEN = os.getenv("LINE_TOKEN", "")
+    return {
+        "ok": result.get("ok", False),
+        "line_result": result,
+    }
 
 
 @app.post("/webhook")
 async def webhook(request: Request):
-    if not LINE_TOKEN:
-        return {"status": "no token"}
+    """
+    LINE Webhook 預留端點。
 
-    body = await request.json()
-    for event in body.get("events", []):
-        user_id = event.get("source", {}).get("userId")
-        message = event.get("message", {})
+    階段 4 才會正式實作：
+    - 驗證 LINE_CHANNEL_SECRET 簽章
+    - 解析 LINE userId
+    - 處理「綁定 卡號」
+    - 寫入 line_bindings
+    """
 
-        if message.get("type") == "text":
-            text = message.get("text", "").strip()
-            if text.startswith("綁定 ") or text.startswith("綁定:"):
-                id_tag = text.replace("綁定:", "").replace("綁定 ", "").strip()
-                cursor.execute("SELECT * FROM users WHERE id_tag = ?", (id_tag,))
-                row = cursor.fetchone()
-                if row:
-                    cursor.execute(
-                        "UPDATE users SET card_number = ? WHERE id_tag = ?",
-                        (user_id, id_tag),
-                    )
-                    conn.commit()
-                    reply_text = f"✅ 已成功綁定 {id_tag}"
-                else:
-                    reply_text = f"❌ 找不到使用者 IDTag：{id_tag}"
+    return {
+        "ok": True,
+        "message": "LINE webhook endpoint exists, but binding flow is not enabled until stage 4.",
+    }
 
-            elif text in ["取消綁定", "解除綁定"]:
-                cursor.execute(
-                    "SELECT id_tag FROM users WHERE card_number = ?", (user_id,)
-                )
-                row = cursor.fetchone()
-                if row:
-                    cursor.execute(
-                        "UPDATE users SET card_number = NULL WHERE id_tag = ?",
-                        (row[0],),
-                    )
-                    conn.commit()
-                    reply_text = f"🔓 已取消綁定：{row[0]}"
-                else:
-                    reply_text = "⚠️ 尚未綁定任何帳號"
-
-            else:
-                reply_text = "請輸入：\n綁定 {IDTag} 來綁定帳號\n取消綁定 來解除綁定"
-
-            headers = {
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {LINE_TOKEN}",
-            }
-            reply_payload = {
-                "replyToken": event.get("replyToken"),
-                "messages": [{"type": "text", "text": reply_text}],
-            }
-            requests.post(
-                "https://api.line.me/v2/bot/message/reply",
-                headers=headers,
-                data=json.dumps(reply_payload),
-            )
-
-    return {"status": "ok"}
 
 
 @app.get("/api/users/{id_tag}")
