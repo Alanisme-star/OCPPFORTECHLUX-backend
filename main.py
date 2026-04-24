@@ -6873,18 +6873,36 @@ async def test_line_messaging(payload: dict = Body(...)):
 @app.post("/webhook")
 async def webhook(request: Request):
     """
-    LINE Webhook 預留端點。
+    LINE Webhook 暫時測試用。
 
-    階段 4 才會正式實作：
-    - 驗證 LINE_CHANNEL_SECRET 簽章
-    - 解析 LINE userId
-    - 處理「綁定 卡號」
-    - 寫入 line_bindings
+    目的：
+    - 階段 2.5 先取得自己的 LINE userId
+    - 正式綁定流程會在階段 4 重新整理
     """
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    logging.warning(f"[LINE][WEBHOOK][RAW] {body}")
+
+    events = body.get("events", []) if isinstance(body, dict) else []
+
+    found_users = []
+
+    for event in events:
+        source = event.get("source", {}) or {}
+        user_id = source.get("userId")
+
+        if user_id:
+            found_users.append(user_id)
+            logging.warning(f"[LINE][WEBHOOK][USER_ID] {user_id}")
 
     return {
         "ok": True,
-        "message": "LINE webhook endpoint exists, but binding flow is not enabled until stage 4.",
+        "found_user_ids": found_users,
+        "message": "LINE webhook received. Check Render logs for [LINE][WEBHOOK][USER_ID].",
     }
 
 
