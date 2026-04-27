@@ -6964,27 +6964,299 @@ async def api_line_test_send(payload: dict = Body(...)):
         "line_result": result,
     }
 
+def _extract_line_test_targets(payload: dict) -> list[str]:
+    """
+    階段 5：解析後台手動測試推播 targets。
+
+    支援格式：
+    1. {"targets": ["6678B3EB", "TEST_CARD_001"]}
+    2. {"target": "6678B3EB"}
+    3. {"idTag": "6678B3EB"}
+    4. {"id_tag": "6678B3EB"}
+    5. {"cardId": "6678B3EB"}
+    6. {"card_id": "6678B3EB"}
+
+    回傳：
+    - 去空白
+    - 去空值
+    - 去重複
+    """
+
+    if not isinstance(payload, dict):
+        return []
+
+    raw_targets = payload.get("targets", None)
+
+    if raw_targets is None:
+        raw_targets = payload.get("target", None)
+
+    if raw_targets is None:
+        single_target = (
+            payload.get("idTag")
+            or payload.get("id_tag")
+            or payload.get("cardId")
+            or payload.get("card_id")
+        )
+        if single_target:
+            raw_targets = [single_target]
+
+    if isinstance(raw_targets, str):
+        raw_targets = [raw_targets]
+
+    if not isinstance(raw_targets, list):
+        return []
+
+    targets = []
+    seen = set()
+
+    for item in raw_targets:
+        value = str(item or "").strip()
+        if not value:
+            continue
+
+        if value in seen:
+            continue
+
+        seen.add(value)
+        targets.append(value)
+
+    return targets
+
 
 @app.post("/api/messaging/test")
 async def test_line_messaging(payload: dict = Body(...)):
     """
-    保留舊前端 LinePush.jsx 可能呼叫的路由名稱。
+    LINE 後台手動測試推播。
 
-    階段 2 暫時用途：
-    - 允許手動指定 line_user_id 測試
-    - 或使用 Render 的 LINE_TEST_USER_ID
-    - 暫時不處理 targets/idTag 綁定查詢
+    階段 5 用途：
+    - 前端 LinePush.jsx 可送出 message + targets
+    - targets 內容為 idTag / card_id
+    - 後端依 targets 查 line_bindings
+    - 只推播給 enabled = 1 且有 line_user_id 的綁定資料
+    - 未綁定 / 停用 / 發送失敗會分別回傳 skipped / failed / sent
+
+    相容舊格式：
+    - 若沒有帶 targets / target / idTag / cardId，
+      則維持舊版 line_user_id 或 LINE_TEST_USER_ID 測試模式。
+
+    注意：
+    - 不使用 Broadcast API
+    - 不群發所有好友
+    - 不接 StopTransaction
+    - 不修改扣款、餘額、SmartCharging、OCPP WebSocket 流程
     """
 
+    if not isinstance(payload, dict):
+        return JSONResponse(
+            status_code=400,
+            content={
+                "ok": False,
+                "mode": "bad_request",
+                "message": "payload 必須是 JSON object",
+            },
+        )
+
     message = str(payload.get("message") or "LINE 推播測試成功").strip()
-    line_user_id = str(payload.get("line_user_id") or LINE_TEST_USER_ID or "").strip()
+
+    if not message:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "ok": False,
+                "mode": "bad_request",
+                "message": "message 不可為空",
+            },
+        )
+
+    has_target_field = any(
+        key in payload
+        for key in ("targets", "target", "idTag", "id_tag", "cardId", "card_id")
+    )
+
+    # =====================================================
+    # A) 階段 5 新格式：message + targets
+    # =====================================================
+    if has_target_field:
+        targets = _extract_line_test_targets(payload)
+
+        if not targets:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "ok": False,
+                    "mode": "targets",
+                    "message": "請至少選擇一個推播對象 targets",
+                    "summary": {
+                        "total": 0,
+                        "sent": 0,
+                        "skipped": 0,
+                        "failed": 0,
+                    },
+                    "results": [],
+                },
+            )
+
+        logging.warning(
+            f"[LINE][MESSAGING_TEST][TARGETS_ENTER] targets={targets} | message_len={len(message)}"
+        )
+
+        placeholders = ",".join(["?"] * len(targets))
+
+        with get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                f"""
+                SELECT
+                    lb.id_tag,
+                    lb.line_user_id,
+                    lb.display_name,
+                    lb.enabled,
+                    co.name AS resident_name,
+                    c.balance
+                FROM line_bindings lb
+                LEFT JOIN card_owners co ON co.card_id = lb.id_tag
+                LEFT JOIN cards c ON c.card_id = lb.id_tag
+                WHERE lb.id_tag IN ({placeholders})
+                """,
+                targets,
+            )
+            rows = cur.fetchall()
+
+        binding_map = {}
+
+        for row in rows:
+            id_tag = str(row[0] or "").strip()
+            binding_map[id_tag] = {
+                "idTag": id_tag,
+                "lineUserId": str(row[1] or "").strip(),
+                "displayName": row[2],
+                "enabled": bool(row[3]),
+                "residentName": row[4],
+                "balance": float(row[5]) if row[5] is not None else None,
+            }
+
+        results = []
+
+        for target in targets:
+            binding = binding_map.get(target)
+
+            if not binding:
+                results.append(
+                    {
+                        "target": target,
+                        "idTag": target,
+                        "status": "skipped",
+                        "reason": "not_bound",
+                        "message": "此卡號尚未綁定 LINE userId",
+                    }
+                )
+                continue
+
+            if not binding.get("enabled"):
+                results.append(
+                    {
+                        "target": target,
+                        "idTag": target,
+                        "status": "skipped",
+                        "reason": "disabled",
+                        "residentName": binding.get("residentName"),
+                        "displayName": binding.get("displayName"),
+                        "message": "此卡號的 LINE 綁定已停用",
+                    }
+                )
+                continue
+
+            line_user_id = str(binding.get("lineUserId") or "").strip()
+
+            if not line_user_id:
+                results.append(
+                    {
+                        "target": target,
+                        "idTag": target,
+                        "status": "skipped",
+                        "reason": "empty_line_user_id",
+                        "residentName": binding.get("residentName"),
+                        "displayName": binding.get("displayName"),
+                        "message": "此卡號沒有有效的 LINE userId",
+                    }
+                )
+                continue
+
+            line_result = send_line_message(
+                line_user_id=line_user_id,
+                message=message,
+            )
+
+            if line_result.get("ok"):
+                results.append(
+                    {
+                        "target": target,
+                        "idTag": target,
+                        "status": "sent",
+                        "reason": "ok",
+                        "residentName": binding.get("residentName"),
+                        "displayName": binding.get("displayName"),
+                        "lineResult": line_result,
+                    }
+                )
+            else:
+                results.append(
+                    {
+                        "target": target,
+                        "idTag": target,
+                        "status": "failed",
+                        "reason": "line_api_error",
+                        "residentName": binding.get("residentName"),
+                        "displayName": binding.get("displayName"),
+                        "lineResult": line_result,
+                    }
+                )
+
+        sent_items = [r for r in results if r.get("status") == "sent"]
+        skipped_items = [r for r in results if r.get("status") == "skipped"]
+        failed_items = [r for r in results if r.get("status") == "failed"]
+
+        summary = {
+            "total": len(results),
+            "sent": len(sent_items),
+            "skipped": len(skipped_items),
+            "failed": len(failed_items),
+        }
+
+        ok = summary["failed"] == 0 and summary["sent"] > 0
+
+        logging.warning(
+            f"[LINE][MESSAGING_TEST][TARGETS_DONE] summary={summary}"
+        )
+
+        return {
+            "ok": ok,
+            "mode": "targets",
+            "message": "LINE 後台手動測試推播完成",
+            "summary": summary,
+            "results": results,
+            "sent": sent_items,
+            "skipped": skipped_items,
+            "failed": failed_items,
+        }
+
+    # =====================================================
+    # B) 舊格式相容：line_user_id / LINE_TEST_USER_ID
+    # =====================================================
+    line_user_id = str(
+        payload.get("line_user_id")
+        or payload.get("lineUserId")
+        or LINE_TEST_USER_ID
+        or ""
+    ).strip()
 
     if not line_user_id:
         return JSONResponse(
             status_code=400,
             content={
                 "ok": False,
-                "message": "階段 2 請先提供 line_user_id，或設定 LINE_TEST_USER_ID。targets/idTag 綁定會在階段 5 處理。",
+                "mode": "legacy_line_user_id",
+                "message": "請提供 line_user_id，或設定 LINE_TEST_USER_ID；若使用階段 5 前端，請提供 targets。",
             },
         )
 
@@ -6995,8 +7267,13 @@ async def test_line_messaging(payload: dict = Body(...)):
 
     return {
         "ok": result.get("ok", False),
+        "mode": "legacy_line_user_id",
+        "line_user_id_source": "request_body"
+        if (payload.get("line_user_id") or payload.get("lineUserId"))
+        else "LINE_TEST_USER_ID",
         "line_result": result,
     }
+
 
 # =====================================================
 # LINE Messaging API：階段 3 住戶 / idTag 綁定資料
