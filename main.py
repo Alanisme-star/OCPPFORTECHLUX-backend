@@ -6406,8 +6406,345 @@ def compute_transaction_cost(transaction_id: int):
             "remainingBalance": remaining_balance,
         }
 
+
+# =====================================================
+# LINE Messaging API：階段 6 充電完成通知訊息產生器
+# 注意：
+# 1. 本階段只產生 LINE 訊息內容
+# 2. 不自動推播
+# 3. 不接 StopTransaction
+# 4. 不修改交易、扣款、餘額、SmartCharging、OCPP WebSocket 流程
+# =====================================================
+
+def _format_line_taipei_time(value) -> str:
+    """
+    將資料庫 timestamp 安全轉成台灣時間字串。
+    顯示格式：YYYY-MM-DD HH:mm
+    """
+    if value is None:
+        return "--"
+
+    raw = str(value or "").strip()
+    if not raw:
+        return "--"
+
+    try:
+        dt = parse_date(raw)
+
+        # 目前系統多數交易時間以 UTC ISO 儲存；若缺少 tzinfo，先視為 UTC 再轉台灣時間
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+
+        return dt.astimezone(TZ_TAIPEI).strftime("%Y-%m-%d %H:%M")
+
+    except Exception:
+        # fallback：避免單筆格式異常造成 preview API 崩潰
+        try:
+            return raw.replace("T", " ")[:16]
+        except Exception:
+            return "--"
+
+
+def _format_line_segment_time(value) -> str:
+    """
+    多時段電價摘要使用的短時間格式。
+    _calculate_multi_period_cost_detailed() 產出的 segment 已是台灣日期/時間，
+    這裡不再做 UTC -> 台灣轉換，只做顯示格式整理。
+    """
+    if value is None:
+        return "--"
+
+    raw = str(value or "").strip()
+    if not raw:
+        return "--"
+
+    try:
+        dt = parse_date(raw.replace("T", " "))
+        return dt.strftime("%m/%d %H:%M")
+    except Exception:
+        return raw.replace("T", " ")[:16]
+
+
+def _format_line_number(value, digits: int = 2) -> str:
+    if value is None:
+        return "--"
+
+    try:
+        num = round(float(value), digits)
+        return f"{num:.{digits}f}".rstrip("0").rstrip(".")
+    except Exception:
+        return str(value)
+
+
+def _format_line_amount(value) -> str:
+    if value is None:
+        return "--"
+    return f"{_format_line_number(value, 2)} 元"
+
+
+def _format_line_kwh(value) -> str:
+    if value is None:
+        return "--"
+    return f"{_format_line_number(value, 2)} kWh"
+
+
+def _build_line_duration_text(start_timestamp, stop_timestamp) -> str:
+    if not start_timestamp or not stop_timestamp:
+        return "--"
+
+    try:
+        dt_start = parse_date(str(start_timestamp))
+        dt_stop = parse_date(str(stop_timestamp))
+
+        if dt_start.tzinfo is None:
+            dt_start = dt_start.replace(tzinfo=timezone.utc)
+        if dt_stop.tzinfo is None:
+            dt_stop = dt_stop.replace(tzinfo=timezone.utc)
+
+        diff_seconds = max(0, int((dt_stop - dt_start).total_seconds()))
+        hours = diff_seconds // 3600
+        minutes = (diff_seconds % 3600) // 60
+
+        if hours > 0:
+            return f"{hours}小時{minutes}分"
+
+        return f"{minutes}分"
+
+    except Exception:
+        return "--"
+
+
+def _build_line_price_summary_lines(details: list, max_items: int = 5) -> list[str]:
+    """
+    將 compute_transaction_cost() 回傳的 details 轉成 LINE 文字摘要。
+    為避免 LINE 訊息過長，最多顯示 max_items 筆。
+    """
+    if not details:
+        return []
+
+    lines = ["電價摘要："]
+
+    for seg in details[:max_items]:
+        start_text = _format_line_segment_time(seg.get("from"))
+        end_text = _format_line_segment_time(seg.get("to"))
+        kwh_text = _format_line_number(seg.get("kWh"), 3)
+        price_text = _format_line_number(seg.get("price"), 2)
+        cost_text = _format_line_amount(seg.get("cost"))
+
+        lines.append(
+            f"- {start_text}~{end_text}：{kwh_text} kWh × {price_text} 元/kWh = {cost_text}"
+        )
+
+    remaining_count = len(details) - max_items
+    if remaining_count > 0:
+        lines.append(f"- 其餘 {remaining_count} 個時段略")
+
+    return lines
+
+
+def build_charge_completed_line_message(transaction_id: int) -> dict:
+    """
+    階段 6：建立充電完成 LINE 通知訊息。
+
+    注意：
+    - 只產生 message，不發送 LINE
+    - 沿用 compute_transaction_cost(transaction_id)，避免費用邏輯分岔
+    - 欄位缺失時用 fallback，避免 preview API 直接崩潰
+    """
+    try:
+        tx_id_param = int(transaction_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid transaction_id")
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT
+                t.transaction_id,
+                t.charge_point_id,
+                t.connector_id,
+                t.id_tag,
+                t.meter_start,
+                t.start_timestamp,
+                t.meter_stop,
+                t.stop_timestamp,
+                t.reason,
+                t.balance_before,
+                t.balance_after,
+                co.name AS card_owner_name,
+                u.name AS user_name,
+                u.card_number,
+                c.balance AS current_card_balance
+            FROM transactions t
+            LEFT JOIN card_owners co
+                ON co.card_id = t.id_tag
+            LEFT JOIN users u
+                ON u.id_tag = t.id_tag
+            LEFT JOIN cards c
+                ON c.card_id = t.id_tag
+            WHERE t.transaction_id = ?
+            """,
+            (tx_id_param,),
+        )
+        row = cur.fetchone()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+
+    (
+        tx_id,
+        charge_point_id,
+        connector_id,
+        id_tag,
+        meter_start,
+        start_timestamp,
+        meter_stop,
+        stop_timestamp,
+        reason,
+        balance_before,
+        balance_after,
+        card_owner_name,
+        user_name,
+        card_number,
+        current_card_balance,
+    ) = row
+
+    resident_name = card_owner_name or user_name or "--"
+    display_card = id_tag or card_number or "--"
+    is_completed = bool(stop_timestamp)
+
+    energy_kwh = None
+    if meter_start is not None and meter_stop is not None:
+        try:
+            energy_kwh = round(
+                max(0.0, (float(meter_stop) - float(meter_start)) / 1000.0), 2
+            )
+        except Exception:
+            energy_kwh = None
+
+    cost_info = {}
+    cost_error = None
+
+    try:
+        cost_info = compute_transaction_cost(tx_id)
+    except HTTPException as e:
+        cost_error = str(e.detail)
+    except Exception as e:
+        cost_error = str(e)
+        logging.exception(
+            f"[LINE][CHARGE_COMPLETED_MESSAGE][COST_ERR] transaction_id={tx_id} | err={e}"
+        )
+
+    cost_value = cost_info.get("cost") if isinstance(cost_info, dict) else None
+    details = cost_info.get("details", []) if isinstance(cost_info, dict) else []
+
+    balance_after_value = None
+    if isinstance(cost_info, dict):
+        balance_after_value = cost_info.get("balanceAfter")
+        if balance_after_value is None:
+            balance_after_value = cost_info.get("remainingBalance")
+
+    if balance_after_value is None:
+        balance_after_value = balance_after
+
+    if balance_after_value is None:
+        balance_after_value = current_card_balance
+
+    duration_text = _build_line_duration_text(start_timestamp, stop_timestamp)
+
+    message_lines = ["充電完成通知"]
+
+    if not is_completed:
+        message_lines.append("提醒：此交易目前尚未有結束時間，以下為預覽內容。")
+
+    message_lines.extend(
+        [
+            f"住戶：{resident_name}",
+            f"卡號：{display_card}",
+            f"充電樁：{charge_point_id or '--'}",
+            f"交易編號：{tx_id}",
+            f"開始時間：{_format_line_taipei_time(start_timestamp)}",
+            f"結束時間：{_format_line_taipei_time(stop_timestamp)}",
+            f"充電時間：{duration_text}",
+            f"使用度數：{_format_line_kwh(energy_kwh)}",
+            f"本次費用：{_format_line_amount(cost_value)}",
+            f"扣款後餘額：{_format_line_amount(balance_after_value)}",
+        ]
+    )
+
+    price_summary_lines = _build_line_price_summary_lines(details)
+    if price_summary_lines:
+        message_lines.append("")
+        message_lines.extend(price_summary_lines)
+
+    if cost_error:
+        message_lines.append("")
+        message_lines.append(f"費用摘要狀態：暫時無法取得（{cost_error}）")
+
+    message = "\n".join(message_lines)
+
+    return {
+        "ok": True,
+        "previewOnly": True,
+        "willSend": False,
+        "isCompleted": is_completed,
+        "transactionId": tx_id,
+        "idTag": id_tag,
+        "chargePointId": charge_point_id,
+        "message": message,
+        "data": {
+            "residentName": resident_name,
+            "cardId": display_card,
+            "idTag": id_tag,
+            "chargePointId": charge_point_id,
+            "connectorId": connector_id,
+            "transactionId": tx_id,
+            "startTimestamp": start_timestamp,
+            "stopTimestamp": stop_timestamp,
+            "startTimeText": _format_line_taipei_time(start_timestamp),
+            "stopTimeText": _format_line_taipei_time(stop_timestamp),
+            "durationText": duration_text,
+            "energyKwh": energy_kwh,
+            "cost": cost_value,
+            "balanceBefore": (
+                round(float(balance_before), 2)
+                if balance_before is not None
+                else None
+            ),
+            "balanceAfter": (
+                round(float(balance_after_value), 2)
+                if balance_after_value is not None
+                else None
+            ),
+            "reason": reason,
+            "costDetails": details,
+            "costError": cost_error,
+        },
+    }
+
+
+
+@app.get("/api/line/debug/charge-completed-message/{transaction_id}")
+async def preview_charge_completed_line_message(transaction_id: int = Path(...)):
+    """
+    階段 6 Preview API：
+    只回傳充電完成 LINE 訊息內容，不會發送 LINE。
+    """
+    try:
+        return build_charge_completed_line_message(transaction_id)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.exception(
+            f"[LINE][CHARGE_COMPLETED_MESSAGE][ERR] transaction_id={transaction_id} | err={e}"
+        )
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/api/transactions/{transaction_id}/cost")
 async def calculate_transaction_cost(transaction_id: int):
+
     try:
         return compute_transaction_cost(transaction_id)
     except HTTPException:
