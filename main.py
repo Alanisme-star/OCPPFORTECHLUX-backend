@@ -3721,6 +3721,19 @@ class ChargePoint(OcppChargePoint):
                 _conn.commit()
                 logger.error("[STOP][COMMIT] DB commit done")
 
+                # ==================================================
+                # LINE 階段 7：StopTransaction 完成後自動推播
+                # 放在 DB commit 後，確保交易、扣款、餘額已完成。
+                # 注意：此處只排程，不等待 LINE API，避免影響 StopTransaction 回覆。
+                # ==================================================
+                try:
+                    schedule_charge_completed_line_notification(transaction_id)
+                except Exception as e:
+                    logger.exception(
+                        f"[LINE][CHARGE_COMPLETED][SCHEDULE_CALL_ERR] "
+                        f"tx_id={transaction_id} | err={e}"
+                    )
+
         except Exception as e:
             logger.exception(f"🔴 StopTransaction DB/計算發生錯誤：{e}")
 
@@ -6742,8 +6755,272 @@ async def preview_charge_completed_line_message(transaction_id: int = Path(...))
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# =====================================================
+# LINE Messaging API：階段 7 StopTransaction 完成後自動推播
+# 注意：
+# 1. 只在 StopTransaction DB commit 後由排程呼叫
+# 2. 不修改交易、扣款、餘額、SmartCharging、OCPP WebSocket 主流程
+# 3. LINE 發送失敗不得影響 StopTransaction 回覆
+# 4. 不使用 Broadcast API，不群發所有好友
+# =====================================================
+
+def get_line_binding_by_id_tag(id_tag: str) -> dict | None:
+    """
+    依 idTag 查詢 LINE 綁定資料。
+    回傳 None 代表未綁定。
+    """
+
+    id_tag = str(id_tag or "").strip()
+    if not id_tag:
+        return None
+
+    try:
+        with get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT
+                    id,
+                    id_tag,
+                    line_user_id,
+                    display_name,
+                    enabled,
+                    created_at,
+                    updated_at
+                FROM line_bindings
+                WHERE id_tag = ?
+                """,
+                (id_tag,),
+            )
+            row = cur.fetchone()
+
+        if not row:
+            return None
+
+        return {
+            "id": row[0],
+            "idTag": row[1],
+            "lineUserId": row[2],
+            "displayName": row[3],
+            "enabled": bool(row[4]),
+            "createdAt": row[5],
+            "updatedAt": row[6],
+        }
+
+    except Exception as e:
+        logging.exception(
+            f"[LINE][BINDING_LOOKUP][ERR] idTag={id_tag} | err={e}"
+        )
+        return None
+
+
+def send_charge_completed_line_notification(transaction_id: int) -> dict:
+    """
+    StopTransaction 完成後發送充電完成 LINE 通知。
+
+    安全設計：
+    - 找不到交易：只記錄 failed，不丟出例外
+    - 沒有 LINE 綁定：只記錄 skipped
+    - 綁定停用：只記錄 skipped
+    - LINE API 失敗：只記錄 failed
+    - 任何例外都不往外拋，避免影響 StopTransaction
+    """
+
+    try:
+        tx_id = int(transaction_id)
+    except Exception:
+        logging.warning(
+            f"[LINE][CHARGE_COMPLETED][SKIP] invalid transaction_id={transaction_id}"
+        )
+        return {
+            "ok": False,
+            "status": "skipped",
+            "reason": "invalid_transaction_id",
+            "transactionId": transaction_id,
+        }
+
+    try:
+        message_info = build_charge_completed_line_message(tx_id)
+
+        id_tag = str(
+            message_info.get("idTag")
+            or (message_info.get("data") or {}).get("idTag")
+            or ""
+        ).strip()
+
+        message = str(message_info.get("message") or "").strip()
+
+        if not id_tag:
+            logging.warning(
+                f"[LINE][CHARGE_COMPLETED][SKIP] tx_id={tx_id} | reason=no_id_tag"
+            )
+            return {
+                "ok": False,
+                "status": "skipped",
+                "reason": "no_id_tag",
+                "transactionId": tx_id,
+            }
+
+        if not message:
+            logging.warning(
+                f"[LINE][CHARGE_COMPLETED][SKIP] tx_id={tx_id} | idTag={id_tag} | reason=empty_message"
+            )
+            return {
+                "ok": False,
+                "status": "skipped",
+                "reason": "empty_message",
+                "transactionId": tx_id,
+                "idTag": id_tag,
+            }
+
+        binding = get_line_binding_by_id_tag(id_tag)
+
+        if not binding:
+            logging.warning(
+                f"[LINE][CHARGE_COMPLETED][SKIP] tx_id={tx_id} | idTag={id_tag} | reason=no_binding"
+            )
+            return {
+                "ok": True,
+                "status": "skipped",
+                "reason": "no_binding",
+                "transactionId": tx_id,
+                "idTag": id_tag,
+            }
+
+        if not binding.get("enabled"):
+            logging.warning(
+                f"[LINE][CHARGE_COMPLETED][SKIP] tx_id={tx_id} | idTag={id_tag} | reason=binding_disabled"
+            )
+            return {
+                "ok": True,
+                "status": "skipped",
+                "reason": "binding_disabled",
+                "transactionId": tx_id,
+                "idTag": id_tag,
+            }
+
+        line_user_id = str(binding.get("lineUserId") or "").strip()
+
+        if not line_user_id:
+            logging.warning(
+                f"[LINE][CHARGE_COMPLETED][SKIP] tx_id={tx_id} | idTag={id_tag} | reason=empty_line_user_id"
+            )
+            return {
+                "ok": True,
+                "status": "skipped",
+                "reason": "empty_line_user_id",
+                "transactionId": tx_id,
+                "idTag": id_tag,
+            }
+
+        line_result = send_line_message(
+            line_user_id=line_user_id,
+            message=message,
+        )
+
+        if line_result.get("ok"):
+            logging.warning(
+                f"[LINE][CHARGE_COMPLETED][SENT] tx_id={tx_id} | idTag={id_tag} | line_user_id={line_user_id}"
+            )
+            return {
+                "ok": True,
+                "status": "sent",
+                "transactionId": tx_id,
+                "idTag": id_tag,
+                "lineResult": line_result,
+            }
+
+        logging.error(
+            f"[LINE][CHARGE_COMPLETED][FAILED] tx_id={tx_id} | idTag={id_tag} | line_result={line_result}"
+        )
+        return {
+            "ok": False,
+            "status": "failed",
+            "reason": "line_api_failed",
+            "transactionId": tx_id,
+            "idTag": id_tag,
+            "lineResult": line_result,
+        }
+
+    except HTTPException as e:
+        logging.warning(
+            f"[LINE][CHARGE_COMPLETED][FAILED] tx_id={tx_id} | http_detail={e.detail}"
+        )
+        return {
+            "ok": False,
+            "status": "failed",
+            "reason": "message_build_http_exception",
+            "transactionId": tx_id,
+            "detail": e.detail,
+        }
+
+    except Exception as e:
+        logging.exception(
+            f"[LINE][CHARGE_COMPLETED][ERR] tx_id={tx_id} | err={e}"
+        )
+        return {
+            "ok": False,
+            "status": "failed",
+            "reason": "unexpected_error",
+            "transactionId": tx_id,
+            "error": str(e),
+        }
+
+
+def schedule_charge_completed_line_notification(transaction_id: int) -> None:
+    """
+    排程執行充電完成 LINE 推播。
+
+    重點：
+    - StopTransaction 不等待 LINE API 回應
+    - send_line_message 內部使用 urllib，放到 thread 避免阻塞 OCPP handler
+    - 任何錯誤只 log，不影響 StopTransaction 回覆
+    """
+
+    try:
+        tx_id = int(transaction_id)
+    except Exception:
+        logging.warning(
+            f"[LINE][CHARGE_COMPLETED][SCHEDULE_SKIP] invalid transaction_id={transaction_id}"
+        )
+        return
+
+    async def _runner():
+        try:
+            result = await asyncio.to_thread(
+                send_charge_completed_line_notification,
+                tx_id,
+            )
+            logging.warning(
+                f"[LINE][CHARGE_COMPLETED][SCHEDULE_DONE] tx_id={tx_id} | result={result}"
+            )
+        except Exception as e:
+            logging.exception(
+                f"[LINE][CHARGE_COMPLETED][SCHEDULE_ERR] tx_id={tx_id} | err={e}"
+            )
+
+    try:
+        asyncio.create_task(_runner())
+        logging.warning(
+            f"[LINE][CHARGE_COMPLETED][SCHEDULED] tx_id={tx_id}"
+        )
+
+    except RuntimeError:
+        # 理論上 StopTransaction 內會有 event loop；
+        # 此 fallback 只避免未來被同步流程誤呼叫時直接炸掉。
+        try:
+            result = send_charge_completed_line_notification(tx_id)
+            logging.warning(
+                f"[LINE][CHARGE_COMPLETED][SYNC_DONE] tx_id={tx_id} | result={result}"
+            )
+        except Exception as e:
+            logging.exception(
+                f"[LINE][CHARGE_COMPLETED][SYNC_ERR] tx_id={tx_id} | err={e}"
+            )
+
+
 @app.get("/api/transactions/{transaction_id}/cost")
-async def calculate_transaction_cost(transaction_id: int):
+async def get_transaction_cost(transaction_id: int):
 
     try:
         return compute_transaction_cost(transaction_id)
