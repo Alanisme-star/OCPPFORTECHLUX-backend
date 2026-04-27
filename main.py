@@ -2283,9 +2283,70 @@ def ensure_line_bindings_table():
         logging.warning("✅ [LINE][DB] line_bindings table checked")
 
 
+def ensure_line_message_logs_table():
+    """
+    ✅ LINE 推播紀錄表
+    階段 8 用途：
+    - 紀錄 StopTransaction 完成後的 LINE 推播結果
+    - 可追蹤 sent / skipped / failed
+    - 可查詢 transaction_id、id_tag、LINE API 回應與錯誤原因
+
+    注意：
+    - 只新增紀錄表
+    - 不修改 StopTransaction 交易、扣款、餘額流程
+    - 不修改 SmartCharging
+    - 不新增 Broadcast API
+    """
+    with get_conn() as c:
+        cur = c.cursor()
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS line_message_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_type TEXT NOT NULL,
+                transaction_id INTEGER,
+                id_tag TEXT,
+                line_user_id TEXT,
+                status TEXT,
+                reason TEXT,
+                message TEXT,
+                line_status_code INTEGER,
+                line_response TEXT,
+                created_at TEXT
+            )
+            """
+        )
+
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_line_message_logs_transaction_id
+            ON line_message_logs (transaction_id)
+            """
+        )
+
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_line_message_logs_id_tag
+            ON line_message_logs (id_tag)
+            """
+        )
+
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_line_message_logs_created_at
+            ON line_message_logs (created_at)
+            """
+        )
+
+        c.commit()
+        logging.warning("✅ [LINE][DB] line_message_logs table checked")
+
+
 
 
 # 建立一個全域連線（僅供少數 legacy 用途）
+
+
 conn = sqlite3.connect(DB_FILE, check_same_thread=False, timeout=15)
 conn.execute("PRAGMA journal_mode=WAL;")
 conn.execute("PRAGMA synchronous=NORMAL;")
@@ -2300,6 +2361,9 @@ ensure_community_settings_schema()
 
 # ✅ LINE 階段 3：建立住戶 / idTag 與 LINE userId 綁定資料表
 ensure_line_bindings_table()
+
+# ✅ LINE 階段 8：建立 LINE 推播紀錄表
+ensure_line_message_logs_table()
 
 def _price_for_timestamp(ts: str) -> float:
     """
@@ -6764,6 +6828,7 @@ async def preview_charge_completed_line_message(transaction_id: int = Path(...))
 # 4. 不使用 Broadcast API，不群發所有好友
 # =====================================================
 
+
 def get_line_binding_by_id_tag(id_tag: str) -> dict | None:
     """
     依 idTag 查詢 LINE 綁定資料。
@@ -6814,16 +6879,178 @@ def get_line_binding_by_id_tag(id_tag: str) -> dict | None:
         return None
 
 
+def _safe_json_dumps_for_line_log(value) -> str | None:
+    """
+    將 LINE API 回傳或錯誤內容安全轉成 JSON 字串。
+    """
+    if value is None:
+        return None
+
+    try:
+        return json.dumps(value, ensure_ascii=False)
+    except Exception:
+        return str(value)
+
+
+def insert_line_message_log(
+    event_type: str,
+    transaction_id: int | None = None,
+    id_tag: str | None = None,
+    line_user_id: str | None = None,
+    status: str | None = None,
+    reason: str | None = None,
+    message: str | None = None,
+    line_result: dict | None = None,
+) -> dict:
+    """
+    新增 LINE 推播紀錄。
+
+    注意：
+    - 此函式失敗時不可影響主流程
+    - 只記錄結果，不改變交易、扣款、餘額、SmartCharging
+    """
+
+    try:
+        created_at = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
+
+        line_status_code = None
+        line_response = None
+
+        if isinstance(line_result, dict):
+            line_status_code = line_result.get("status_code")
+
+            if line_result.get("response") is not None:
+                line_response = str(line_result.get("response"))
+
+            elif line_result.get("error") is not None:
+                line_response = str(line_result.get("error"))
+
+            else:
+                line_response = _safe_json_dumps_for_line_log(line_result)
+
+        elif line_result is not None:
+            line_response = str(line_result)
+
+        with get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                INSERT INTO line_message_logs (
+                    event_type,
+                    transaction_id,
+                    id_tag,
+                    line_user_id,
+                    status,
+                    reason,
+                    message,
+                    line_status_code,
+                    line_response,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(event_type or "").strip() or "unknown",
+                    transaction_id,
+                    str(id_tag or "").strip() or None,
+                    str(line_user_id or "").strip() or None,
+                    str(status or "").strip() or None,
+                    str(reason or "").strip() or None,
+                    message,
+                    line_status_code,
+                    line_response,
+                    created_at,
+                ),
+            )
+            log_id = cur.lastrowid
+            conn.commit()
+
+        logging.warning(
+            f"[LINE][MESSAGE_LOG][INSERTED] "
+            f"id={log_id} | event_type={event_type} | "
+            f"tx_id={transaction_id} | idTag={id_tag} | status={status} | reason={reason}"
+        )
+
+        return {
+            "ok": True,
+            "logId": log_id,
+        }
+
+    except Exception as e:
+        logging.exception(
+            f"[LINE][MESSAGE_LOG][INSERT_ERR] "
+            f"event_type={event_type} | tx_id={transaction_id} | idTag={id_tag} | err={e}"
+        )
+        return {
+            "ok": False,
+            "error": str(e),
+        }
+
+
+def finalize_charge_completed_line_result(
+    result: dict,
+    message: str | None = None,
+    line_user_id: str | None = None,
+) -> dict:
+    """
+    將 send_charge_completed_line_notification 的結果寫入 line_message_logs。
+    回傳原本 result，避免影響既有第七階段流程。
+    """
+
+    try:
+        if not isinstance(result, dict):
+            result = {
+                "ok": False,
+                "status": "failed",
+                "reason": "invalid_result",
+                "rawResult": str(result),
+            }
+
+        status = result.get("status")
+        reason = result.get("reason")
+
+        if status == "sent" and not reason:
+            reason = "ok"
+
+        line_result = result.get("lineResult")
+
+        log_result = insert_line_message_log(
+            event_type="charge_completed",
+            transaction_id=result.get("transactionId"),
+            id_tag=result.get("idTag"),
+            line_user_id=result.get("lineUserId") or line_user_id,
+            status=status,
+            reason=reason,
+            message=message,
+            line_result=line_result,
+        )
+
+        result["messageLog"] = log_result
+        return result
+
+    except Exception as e:
+        logging.exception(
+            f"[LINE][CHARGE_COMPLETED][LOG_FINALIZE_ERR] result={result} | err={e}"
+        )
+
+        if isinstance(result, dict):
+            result["messageLog"] = {
+                "ok": False,
+                "error": str(e),
+            }
+
+        return result
+
+
+
 def send_charge_completed_line_notification(transaction_id: int) -> dict:
     """
     StopTransaction 完成後發送充電完成 LINE 通知。
 
-    安全設計：
-    - 找不到交易：只記錄 failed，不丟出例外
-    - 沒有 LINE 綁定：只記錄 skipped
-    - 綁定停用：只記錄 skipped
-    - LINE API 失敗：只記錄 failed
-    - 任何例外都不往外拋，避免影響 StopTransaction
+    階段 8 更新：
+    - 每次結果都寫入 line_message_logs
+    - sent / skipped / failed 都會留下紀錄
+    - 推播紀錄失敗時，不影響 StopTransaction
     """
 
     try:
@@ -6832,12 +7059,14 @@ def send_charge_completed_line_notification(transaction_id: int) -> dict:
         logging.warning(
             f"[LINE][CHARGE_COMPLETED][SKIP] invalid transaction_id={transaction_id}"
         )
-        return {
-            "ok": False,
-            "status": "skipped",
-            "reason": "invalid_transaction_id",
-            "transactionId": transaction_id,
-        }
+        return finalize_charge_completed_line_result(
+            {
+                "ok": False,
+                "status": "skipped",
+                "reason": "invalid_transaction_id",
+                "transactionId": None,
+            }
+        )
 
     try:
         message_info = build_charge_completed_line_message(tx_id)
@@ -6854,24 +7083,30 @@ def send_charge_completed_line_notification(transaction_id: int) -> dict:
             logging.warning(
                 f"[LINE][CHARGE_COMPLETED][SKIP] tx_id={tx_id} | reason=no_id_tag"
             )
-            return {
-                "ok": False,
-                "status": "skipped",
-                "reason": "no_id_tag",
-                "transactionId": tx_id,
-            }
+            return finalize_charge_completed_line_result(
+                {
+                    "ok": False,
+                    "status": "skipped",
+                    "reason": "no_id_tag",
+                    "transactionId": tx_id,
+                },
+                message=message,
+            )
 
         if not message:
             logging.warning(
                 f"[LINE][CHARGE_COMPLETED][SKIP] tx_id={tx_id} | idTag={id_tag} | reason=empty_message"
             )
-            return {
-                "ok": False,
-                "status": "skipped",
-                "reason": "empty_message",
-                "transactionId": tx_id,
-                "idTag": id_tag,
-            }
+            return finalize_charge_completed_line_result(
+                {
+                    "ok": False,
+                    "status": "skipped",
+                    "reason": "empty_message",
+                    "transactionId": tx_id,
+                    "idTag": id_tag,
+                },
+                message=message,
+            )
 
         binding = get_line_binding_by_id_tag(id_tag)
 
@@ -6879,25 +7114,33 @@ def send_charge_completed_line_notification(transaction_id: int) -> dict:
             logging.warning(
                 f"[LINE][CHARGE_COMPLETED][SKIP] tx_id={tx_id} | idTag={id_tag} | reason=no_binding"
             )
-            return {
-                "ok": True,
-                "status": "skipped",
-                "reason": "no_binding",
-                "transactionId": tx_id,
-                "idTag": id_tag,
-            }
+            return finalize_charge_completed_line_result(
+                {
+                    "ok": True,
+                    "status": "skipped",
+                    "reason": "no_binding",
+                    "transactionId": tx_id,
+                    "idTag": id_tag,
+                },
+                message=message,
+            )
 
         if not binding.get("enabled"):
             logging.warning(
                 f"[LINE][CHARGE_COMPLETED][SKIP] tx_id={tx_id} | idTag={id_tag} | reason=binding_disabled"
             )
-            return {
-                "ok": True,
-                "status": "skipped",
-                "reason": "binding_disabled",
-                "transactionId": tx_id,
-                "idTag": id_tag,
-            }
+            return finalize_charge_completed_line_result(
+                {
+                    "ok": True,
+                    "status": "skipped",
+                    "reason": "binding_disabled",
+                    "transactionId": tx_id,
+                    "idTag": id_tag,
+                    "lineUserId": binding.get("lineUserId"),
+                },
+                message=message,
+                line_user_id=binding.get("lineUserId"),
+            )
 
         line_user_id = str(binding.get("lineUserId") or "").strip()
 
@@ -6905,13 +7148,16 @@ def send_charge_completed_line_notification(transaction_id: int) -> dict:
             logging.warning(
                 f"[LINE][CHARGE_COMPLETED][SKIP] tx_id={tx_id} | idTag={id_tag} | reason=empty_line_user_id"
             )
-            return {
-                "ok": True,
-                "status": "skipped",
-                "reason": "empty_line_user_id",
-                "transactionId": tx_id,
-                "idTag": id_tag,
-            }
+            return finalize_charge_completed_line_result(
+                {
+                    "ok": True,
+                    "status": "skipped",
+                    "reason": "empty_line_user_id",
+                    "transactionId": tx_id,
+                    "idTag": id_tag,
+                },
+                message=message,
+            )
 
         line_result = send_line_message(
             line_user_id=line_user_id,
@@ -6922,49 +7168,64 @@ def send_charge_completed_line_notification(transaction_id: int) -> dict:
             logging.warning(
                 f"[LINE][CHARGE_COMPLETED][SENT] tx_id={tx_id} | idTag={id_tag} | line_user_id={line_user_id}"
             )
-            return {
-                "ok": True,
-                "status": "sent",
-                "transactionId": tx_id,
-                "idTag": id_tag,
-                "lineResult": line_result,
-            }
+            return finalize_charge_completed_line_result(
+                {
+                    "ok": True,
+                    "status": "sent",
+                    "reason": "ok",
+                    "transactionId": tx_id,
+                    "idTag": id_tag,
+                    "lineUserId": line_user_id,
+                    "lineResult": line_result,
+                },
+                message=message,
+                line_user_id=line_user_id,
+            )
 
         logging.error(
             f"[LINE][CHARGE_COMPLETED][FAILED] tx_id={tx_id} | idTag={id_tag} | line_result={line_result}"
         )
-        return {
-            "ok": False,
-            "status": "failed",
-            "reason": "line_api_failed",
-            "transactionId": tx_id,
-            "idTag": id_tag,
-            "lineResult": line_result,
-        }
+        return finalize_charge_completed_line_result(
+            {
+                "ok": False,
+                "status": "failed",
+                "reason": "line_api_failed",
+                "transactionId": tx_id,
+                "idTag": id_tag,
+                "lineUserId": line_user_id,
+                "lineResult": line_result,
+            },
+            message=message,
+            line_user_id=line_user_id,
+        )
 
     except HTTPException as e:
         logging.warning(
             f"[LINE][CHARGE_COMPLETED][FAILED] tx_id={tx_id} | http_detail={e.detail}"
         )
-        return {
-            "ok": False,
-            "status": "failed",
-            "reason": "message_build_http_exception",
-            "transactionId": tx_id,
-            "detail": e.detail,
-        }
+        return finalize_charge_completed_line_result(
+            {
+                "ok": False,
+                "status": "failed",
+                "reason": "message_build_http_exception",
+                "transactionId": tx_id,
+                "detail": e.detail,
+            }
+        )
 
     except Exception as e:
         logging.exception(
             f"[LINE][CHARGE_COMPLETED][ERR] tx_id={tx_id} | err={e}"
         )
-        return {
-            "ok": False,
-            "status": "failed",
-            "reason": "unexpected_error",
-            "transactionId": tx_id,
-            "error": str(e),
-        }
+        return finalize_charge_completed_line_result(
+            {
+                "ok": False,
+                "status": "failed",
+                "reason": "unexpected_error",
+                "transactionId": tx_id,
+                "error": str(e),
+            }
+        )
 
 
 def schedule_charge_completed_line_notification(transaction_id: int) -> None:
@@ -7017,6 +7278,180 @@ def schedule_charge_completed_line_notification(transaction_id: int) -> None:
             logging.exception(
                 f"[LINE][CHARGE_COMPLETED][SYNC_ERR] tx_id={tx_id} | err={e}"
             )
+
+
+
+@app.get("/api/line/message-logs")
+def get_line_message_logs(
+    limit: int = Query(default=50, ge=1, le=200),
+    transaction_id: int | None = Query(default=None),
+    id_tag: str | None = Query(default=None),
+    status: str | None = Query(default=None),
+):
+    """
+    查詢 LINE 推播紀錄。
+
+    可用查詢參數：
+    - limit：筆數，預設 50，最多 200
+    - transaction_id：指定交易編號
+    - id_tag：指定卡號
+    - status：sent / skipped / failed
+    """
+
+    try:
+        where_parts = []
+        params = []
+
+        if transaction_id is not None:
+            where_parts.append("transaction_id = ?")
+            params.append(int(transaction_id))
+
+        if id_tag:
+            where_parts.append("id_tag = ?")
+            params.append(str(id_tag).strip())
+
+        if status:
+            where_parts.append("status = ?")
+            params.append(str(status).strip())
+
+        where_sql = ""
+        if where_parts:
+            where_sql = "WHERE " + " AND ".join(where_parts)
+
+        params.append(int(limit))
+
+        with get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                f"""
+                SELECT
+                    id,
+                    event_type,
+                    transaction_id,
+                    id_tag,
+                    line_user_id,
+                    status,
+                    reason,
+                    message,
+                    line_status_code,
+                    line_response,
+                    created_at
+                FROM line_message_logs
+                {where_sql}
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                params,
+            )
+            rows = cur.fetchall()
+
+        items = []
+
+        for row in rows:
+            message_text = row[7] or ""
+
+            items.append(
+                {
+                    "id": row[0],
+                    "eventType": row[1],
+                    "transactionId": row[2],
+                    "idTag": row[3],
+                    "lineUserId": row[4],
+                    "status": row[5],
+                    "reason": row[6],
+                    "message": message_text,
+                    "messagePreview": (
+                        message_text[:80] + "..."
+                        if len(message_text) > 80
+                        else message_text
+                    ),
+                    "lineStatusCode": row[8],
+                    "lineResponse": row[9],
+                    "createdAt": row[10],
+                }
+            )
+
+        return {
+            "ok": True,
+            "count": len(items),
+            "items": items,
+        }
+
+    except Exception as e:
+        logging.exception(f"[LINE][MESSAGE_LOGS][QUERY_ERR] err={e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/line/message-logs/transaction/{transaction_id}")
+def get_line_message_logs_by_transaction(transaction_id: int = Path(...)):
+    """
+    查詢單一交易的 LINE 推播紀錄。
+    """
+
+    try:
+        with get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT
+                    id,
+                    event_type,
+                    transaction_id,
+                    id_tag,
+                    line_user_id,
+                    status,
+                    reason,
+                    message,
+                    line_status_code,
+                    line_response,
+                    created_at
+                FROM line_message_logs
+                WHERE transaction_id = ?
+                ORDER BY id DESC
+                """,
+                (int(transaction_id),),
+            )
+            rows = cur.fetchall()
+
+        items = []
+
+        for row in rows:
+            message_text = row[7] or ""
+
+            items.append(
+                {
+                    "id": row[0],
+                    "eventType": row[1],
+                    "transactionId": row[2],
+                    "idTag": row[3],
+                    "lineUserId": row[4],
+                    "status": row[5],
+                    "reason": row[6],
+                    "message": message_text,
+                    "messagePreview": (
+                        message_text[:80] + "..."
+                        if len(message_text) > 80
+                        else message_text
+                    ),
+                    "lineStatusCode": row[8],
+                    "lineResponse": row[9],
+                    "createdAt": row[10],
+                }
+            )
+
+        return {
+            "ok": True,
+            "transactionId": transaction_id,
+            "count": len(items),
+            "items": items,
+        }
+
+    except Exception as e:
+        logging.exception(
+            f"[LINE][MESSAGE_LOGS][QUERY_BY_TX_ERR] transaction_id={transaction_id} | err={e}"
+        )
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 
 @app.get("/api/transactions/{transaction_id}/cost")
