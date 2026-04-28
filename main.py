@@ -6591,19 +6591,134 @@ def _build_line_duration_text(start_timestamp, stop_timestamp) -> str:
         return "--"
 
 
-def _build_line_price_summary_lines(details: list, max_items: int = 5) -> list[str]:
+def _build_line_price_summary_lines(
+    details: list,
+    max_items: int = 5,
+    tx_start=None,
+    tx_stop=None,
+) -> list[str]:
     """
     將 compute_transaction_cost() 回傳的 details 轉成 LINE 文字摘要。
-    為避免 LINE 訊息過長，最多顯示 max_items 筆。
+
+    顯示邏輯：
+    - 金額、度數、單價仍完全沿用 compute_transaction_cost() 的結果
+    - 只調整 LINE 顯示用的時間範圍
+    - 顯示時間 = 電價區間與實際交易時間的交集
+      例如：
+      電價區間 00:00~24:00
+      實際充電 21:42~22:10
+      LINE 顯示 21:42~22:10
+
+    注意：
+    - 不修改費用計算
+    - 不修改扣款
+    - 不修改 StopTransaction
+    - 不修改 SmartCharging
     """
     if not details:
         return []
 
+    def _parse_tx_time_as_taipei(value):
+        """
+        交易 start_timestamp / stop_timestamp 使用既有 LINE 顯示邏輯：
+        - 若沒有 timezone，視為 UTC
+        - 再轉成 Asia/Taipei
+        """
+        if not value:
+            return None
+
+        try:
+            dt = parse_date(str(value).replace("T", " "))
+
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+
+            return dt.astimezone(TZ_TAIPEI)
+
+        except Exception:
+            return None
+
+    def _parse_segment_time_as_taipei(value):
+        """
+        compute_transaction_cost() details 的 from / to 多半已是台灣本地時間。
+        這裡只轉成可比較的 datetime。
+
+        特別處理：
+        - 2026-04-27 24:00 不是標準 datetime
+        - 顯示 / 比較時轉成隔天 00:00
+        """
+        if not value:
+            return None
+
+        raw = str(value or "").strip().replace("T", " ")
+        if not raw:
+            return None
+
+        try:
+            if " 24:" in raw:
+                fixed_raw = raw.replace(" 24:", " 00:", 1)
+                dt = parse_date(fixed_raw) + timedelta(days=1)
+            else:
+                dt = parse_date(raw)
+
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=TZ_TAIPEI)
+            else:
+                dt = dt.astimezone(TZ_TAIPEI)
+
+            return dt
+
+        except Exception:
+            return None
+
+    def _format_segment_dt(dt) -> str:
+        if not dt:
+            return "--"
+
+        try:
+            return dt.astimezone(TZ_TAIPEI).strftime("%m/%d %H:%M")
+        except Exception:
+            return "--"
+
+    tx_start_dt = _parse_tx_time_as_taipei(tx_start)
+    tx_stop_dt = _parse_tx_time_as_taipei(tx_stop)
+
     lines = ["電價摘要："]
 
     for seg in details[:max_items]:
-        start_text = _format_line_segment_time(seg.get("from"))
-        end_text = _format_line_segment_time(seg.get("to"))
+        seg_start_dt = _parse_segment_time_as_taipei(seg.get("from"))
+        seg_end_dt = _parse_segment_time_as_taipei(seg.get("to"))
+
+        # ==================================================
+        # 顯示時間：優先取「實際交易時間」與「電價區間」的交集
+        # ==================================================
+        display_start_dt = None
+        display_end_dt = None
+
+        if tx_start_dt and tx_stop_dt and seg_start_dt and seg_end_dt:
+            display_start_dt = max(tx_start_dt, seg_start_dt)
+            display_end_dt = min(tx_stop_dt, seg_end_dt)
+
+            # 若沒有交集，退回原本電價區間，避免顯示錯亂
+            if display_end_dt < display_start_dt:
+                display_start_dt = seg_start_dt
+                display_end_dt = seg_end_dt
+
+        elif seg_start_dt and seg_end_dt:
+            display_start_dt = seg_start_dt
+            display_end_dt = seg_end_dt
+
+        start_text = (
+            _format_segment_dt(display_start_dt)
+            if display_start_dt
+            else _format_line_segment_time(seg.get("from"))
+        )
+        end_text = (
+            _format_segment_dt(display_end_dt)
+            if display_end_dt
+            else _format_line_segment_time(seg.get("to"))
+        )
+
         kwh_text = _format_line_number(seg.get("kWh"), 3)
         price_text = _format_line_number(seg.get("price"), 2)
         cost_text = _format_line_amount(seg.get("cost"))
@@ -6617,6 +6732,7 @@ def _build_line_price_summary_lines(details: list, max_items: int = 5) -> list[s
         lines.append(f"- 其餘 {remaining_count} 個時段略")
 
     return lines
+
 
 
 def build_charge_completed_line_message(transaction_id: int) -> dict:
@@ -6750,7 +6866,11 @@ def build_charge_completed_line_message(transaction_id: int) -> dict:
         ]
     )
 
-    price_summary_lines = _build_line_price_summary_lines(details)
+    price_summary_lines = _build_line_price_summary_lines(
+        details,
+        tx_start=start_timestamp,
+        tx_stop=stop_timestamp,
+    )
     if price_summary_lines:
         message_lines.append("")
         message_lines.extend(price_summary_lines)
