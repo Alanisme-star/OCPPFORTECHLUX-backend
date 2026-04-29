@@ -7560,19 +7560,30 @@ async def get_transaction_detail(transaction_id: int):
     cursor.execute(
         """
         SELECT
-            transaction_id,
-            charge_point_id,
-            connector_id,
-            id_tag,
-            meter_start,
-            start_timestamp,
-            meter_stop,
-            stop_timestamp,
-            reason,
-            balance_before,
-            balance_after
-        FROM transactions
-        WHERE transaction_id = ?
+            t.transaction_id,
+            t.charge_point_id,
+            t.connector_id,
+            t.id_tag,
+            t.meter_start,
+            t.start_timestamp,
+            t.meter_stop,
+            t.stop_timestamp,
+            t.reason,
+            t.balance_before,
+            t.balance_after,
+            COALESCE(
+                NULLIF(TRIM(u.name), ''),
+                NULLIF(TRIM(co.name), '')
+            ) AS resident_name,
+            NULLIF(TRIM(u.department), '') AS department,
+            NULLIF(TRIM(u.card_number), '') AS card_number
+        FROM transactions t
+        LEFT JOIN users u
+            ON UPPER(TRIM(u.id_tag)) = UPPER(TRIM(t.id_tag))
+            OR UPPER(TRIM(u.card_number)) = UPPER(TRIM(t.id_tag))
+        LEFT JOIN card_owners co
+            ON UPPER(TRIM(co.card_id)) = UPPER(TRIM(t.id_tag))
+        WHERE t.transaction_id = ?
         """,
         (transaction_id,),
     )
@@ -7593,6 +7604,9 @@ async def get_transaction_detail(transaction_id: int):
         reason,
         balance_before,
         balance_after,
+        resident_name,
+        department,
+        card_number,
     ) = row
 
     energy_kwh = None
