@@ -6098,7 +6098,29 @@ async def get_transactions(
     chargePointId: str = Query(None),
     start: str = Query(None),
     end: str = Query(None),
+    startDate: str = Query(None),
+    endDate: str = Query(None),
+    includeSummary: bool = Query(False),
 ):
+    """
+    充電紀錄查詢 API
+
+    本次調整重點：
+    1. 充電紀錄連結 users 資料，帶出住戶與樓號/部門欄位。
+    2. 支援日期範圍查詢。
+       - start / end：保留舊參數相容。
+       - startDate / endDate：提供新版前端使用。
+    3. 日期範圍以充電結束時間 stop_timestamp 為主要判斷。
+       - 若 stop_timestamp 為 NULL，則退回 start_timestamp，避免進行中交易完全查不到。
+    4. 排序以 stop_timestamp DESC 為主，越新的完成紀錄越上面。
+    5. includeSummary=true 時，回傳統計摘要與 items。
+       - includeSummary=false 時，維持舊版陣列格式，避免舊前端壞掉。
+    """
+
+    # 讓新版 startDate/endDate 與舊版 start/end 都可以使用
+    date_start = startDate or start
+    date_end = endDate or end
+
     query = """
         SELECT
             t.transaction_id,
@@ -6113,6 +6135,7 @@ async def get_transactions(
             t.balance_before,
             t.balance_after,
             u.name,
+            u.department,
             u.card_number,
             (
                 SELECT p.total_amount
@@ -6124,6 +6147,7 @@ async def get_transactions(
         FROM transactions t
         LEFT JOIN users u
             ON u.id_tag = t.id_tag
+            OR u.card_number = t.id_tag
         WHERE 1=1
     """
     params = []
@@ -6131,17 +6155,33 @@ async def get_transactions(
     if idTag:
         query += " AND t.id_tag = ?"
         params.append(idTag)
+
     if chargePointId:
         query += " AND t.charge_point_id = ?"
         params.append(chargePointId)
-    if start:
-        query += " AND t.start_timestamp >= ?"
-        params.append(start)
-    if end:
-        query += " AND t.start_timestamp <= ?"
-        params.append(end)
 
-    query += " ORDER BY t.start_timestamp DESC, t.transaction_id DESC"
+    if date_start:
+        query += """
+            AND COALESCE(t.stop_timestamp, t.start_timestamp) >= ?
+        """
+        params.append(date_start)
+
+    if date_end:
+        query += """
+            AND COALESCE(t.stop_timestamp, t.start_timestamp) <= ?
+        """
+        params.append(date_end)
+
+    query += """
+        ORDER BY
+            CASE
+                WHEN t.stop_timestamp IS NULL THEN 1
+                ELSE 0
+            END ASC,
+            t.stop_timestamp DESC,
+            t.start_timestamp DESC,
+            t.transaction_id DESC
+    """
 
     with get_conn() as conn:
         cur = conn.cursor()
@@ -6164,6 +6204,7 @@ async def get_transactions(
             balance_before,
             balance_after,
             resident_name,
+            department,
             card_number,
             total_amount,
         ) = row
@@ -6193,20 +6234,40 @@ async def get_transactions(
                 duration_minutes = None
                 duration_text = "--"
 
+        # 目前 users 表只有 department 欄位可作為樓號/戶別管理欄位。
+        # 因此前端可優先顯示 householdDisplay / floorNo / department。
+        household_display = department or "--"
+
         result.append(
             {
                 "transactionId": transaction_id,
                 "chargePointId": cp_id,
                 "connectorId": connector_id,
                 "residentName": resident_name or "--",
+
+                # 卡片資訊
                 "cardId": card_number or id_tag,
                 "idTag": id_tag,
                 "cardNumber": card_number or id_tag,
+
+                # 樓號 / 戶別資訊
+                # 先用 users.department 承接，避免前端樓號欄位繼續顯示 --
+                "department": department or "--",
+                "householdDisplay": household_display,
+                "floorNo": household_display,
+                "buildingNo": household_display,
+                "roomNo": household_display,
+
+                # 時間資訊
                 "startTimestamp": start_timestamp,
                 "stopTimestamp": stop_timestamp,
+
+                # 充電資訊
                 "durationMinutes": duration_minutes,
                 "durationText": duration_text,
                 "energyKwh": energy_kwh,
+
+                # 金額資訊
                 "balanceBefore": (
                     round(float(balance_before), 2)
                     if balance_before is not None
@@ -6222,152 +6283,57 @@ async def get_transactions(
                     if balance_after is not None
                     else None
                 ),
+
+                # 原始資料
                 "meterStart": meter_start,
                 "meterStop": meter_stop,
                 "reason": reason,
             }
         )
 
-    return JSONResponse(content=result)
-
-
-@app.get("/api/transactions")
-async def get_transactions(
-    idTag: str = Query(None),
-    chargePointId: str = Query(None),
-    start: str = Query(None),
-    end: str = Query(None),
-):
-    query = """
-        SELECT
-            t.transaction_id,
-            t.charge_point_id,
-            t.connector_id,
-            t.id_tag,
-            t.meter_start,
-            t.start_timestamp,
-            t.meter_stop,
-            t.stop_timestamp,
-            t.reason,
-            t.balance_before,
-            t.balance_after,
-            u.name,
-            u.card_number,
-            (
-                SELECT p.total_amount
-                FROM payments p
-                WHERE p.transaction_id = t.transaction_id
-                ORDER BY p.id DESC
-                LIMIT 1
-            ) AS total_amount
-        FROM transactions t
-        LEFT JOIN users u
-            ON u.id_tag = t.id_tag
-        WHERE 1=1
-    """
-    params = []
-
-    if idTag:
-        query += " AND t.id_tag = ?"
-        params.append(idTag)
-    if chargePointId:
-        query += " AND t.charge_point_id = ?"
-        params.append(chargePointId)
-    if start:
-        query += " AND t.start_timestamp >= ?"
-        params.append(start)
-    if end:
-        query += " AND t.start_timestamp <= ?"
-        params.append(end)
-
-    query += " ORDER BY t.start_timestamp DESC, t.transaction_id DESC"
-
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute(query, params)
-        rows = cur.fetchall()
-
-    result = []
-
-    for row in rows:
-        (
-            transaction_id,
-            cp_id,
-            connector_id,
-            id_tag,
-            meter_start,
-            start_timestamp,
-            meter_stop,
-            stop_timestamp,
-            reason,
-            balance_before,
-            balance_after,
-            resident_name,
-            card_number,
-            total_amount,
-        ) = row
-
-        energy_kwh = None
-        if meter_start is not None and meter_stop is not None:
-            try:
-                energy_kwh = round(
-                    max(0.0, (float(meter_stop) - float(meter_start)) / 1000.0), 2
-                )
-            except Exception:
-                energy_kwh = None
-
-        duration_minutes = None
-        duration_text = "--"
-        if start_timestamp and stop_timestamp:
-            try:
-                dt_start = parse_date(start_timestamp)
-                dt_stop = parse_date(stop_timestamp)
-                diff_seconds = max(0, int((dt_stop - dt_start).total_seconds()))
-                duration_minutes = diff_seconds // 60
-
-                hours = diff_seconds // 3600
-                minutes = (diff_seconds % 3600) // 60
-                duration_text = f"{hours}小時{minutes}分"
-            except Exception:
-                duration_minutes = None
-                duration_text = "--"
-
-        result.append(
+    if includeSummary:
+        active_charge_point_ids = sorted(
             {
-                "transactionId": transaction_id,
-                "chargePointId": cp_id,
-                "connectorId": connector_id,
-                "residentName": resident_name or "--",
-                "cardId": card_number or id_tag,
-                "idTag": id_tag,
-                "cardNumber": card_number or id_tag,
-                "startTimestamp": start_timestamp,
-                "stopTimestamp": stop_timestamp,
-                "durationMinutes": duration_minutes,
-                "durationText": duration_text,
-                "energyKwh": energy_kwh,
-                "balanceBefore": (
-                    round(float(balance_before), 2)
-                    if balance_before is not None
-                    else None
-                ),
-                "cost": (
-                    round(float(total_amount), 2)
-                    if total_amount is not None
-                    else None
-                ),
-                "balanceAfter": (
-                    round(float(balance_after), 2)
-                    if balance_after is not None
-                    else None
-                ),
-                "meterStart": meter_start,
-                "meterStop": meter_stop,
-                "reason": reason,
+                str(item.get("chargePointId"))
+                for item in result
+                if item.get("chargePointId")
+            }
+        )
+
+        total_energy_kwh = 0.0
+        total_cost = 0.0
+
+        for item in result:
+            try:
+                if item.get("energyKwh") is not None:
+                    total_energy_kwh += float(item.get("energyKwh") or 0)
+            except Exception:
+                pass
+
+            try:
+                if item.get("cost") is not None:
+                    total_cost += float(item.get("cost") or 0)
+            except Exception:
+                pass
+
+        return JSONResponse(
+            content={
+                "summary": {
+                    "startDate": date_start,
+                    "endDate": date_end,
+                    "activeChargePointCount": len(active_charge_point_ids),
+                    "activeChargePointIds": active_charge_point_ids,
+                    "totalTransactions": len(result),
+                    "totalEnergyKwh": round(total_energy_kwh, 2),
+                    "totalCost": round(total_cost, 2),
+                },
+                "items": result,
             }
         )
 
     return JSONResponse(content=result)
+
+
 
 def compute_transaction_cost(transaction_id: int):
     with get_conn() as conn:
