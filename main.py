@@ -6134,9 +6134,12 @@ async def get_transactions(
             t.reason,
             t.balance_before,
             t.balance_after,
-            u.name,
-            u.department,
-            u.card_number,
+            COALESCE(
+                NULLIF(TRIM(u.name), ''),
+                NULLIF(TRIM(co.name), '')
+            ) AS resident_name,
+            NULLIF(TRIM(u.department), '') AS department,
+            NULLIF(TRIM(u.card_number), '') AS card_number,
             (
                 SELECT p.total_amount
                 FROM payments p
@@ -6146,8 +6149,10 @@ async def get_transactions(
             ) AS total_amount
         FROM transactions t
         LEFT JOIN users u
-            ON u.id_tag = t.id_tag
-            OR u.card_number = t.id_tag
+            ON UPPER(TRIM(u.id_tag)) = UPPER(TRIM(t.id_tag))
+            OR UPPER(TRIM(u.card_number)) = UPPER(TRIM(t.id_tag))
+        LEFT JOIN card_owners co
+            ON UPPER(TRIM(co.card_id)) = UPPER(TRIM(t.id_tag))
         WHERE 1=1
     """
     params = []
