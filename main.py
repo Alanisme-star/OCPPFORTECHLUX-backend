@@ -6999,19 +6999,17 @@ def build_charge_completed_line_message(transaction_id: int) -> dict:
     if not is_completed:
         message_lines.append("提醒：此交易目前尚未有結束時間，以下為預覽內容。")
 
-    message_lines.extend(
-        [
-            f"住戶：{resident_name}",
-            f"卡號：{display_card}",
-            f"充電樁：{charge_point_id or '--'}",
-            f"交易編號：{tx_id}",
-            f"開始時間：{_format_line_taipei_time(start_timestamp)}",
-            f"結束時間：{_format_line_taipei_time(stop_timestamp)}",
-            f"充電時間：{duration_text}",
-            f"使用度數：{_format_line_kwh(energy_kwh)}",
-            f"本次費用：{_format_line_amount(cost_value)}",
-            f"扣款後餘額：{_format_line_amount(balance_after_value)}",
-        ]
+    message_lines = [
+        "餘額提醒",
+        f"住戶：{resident_name}",
+        f"卡號：{display_card}",
+        f"充電樁：{charge_point_id or '--'}",
+        f"交易編號：{tx_id}",
+        f"交易完成時間：{_format_line_taipei_time(stop_timestamp)}",
+        f"扣款後餘額：{balance_after_text}",
+        "",
+        "餘額已經低於 1000 元，請盡速儲值。",
+    ]
     )
 
     price_summary_lines = _build_line_price_summary_lines(
