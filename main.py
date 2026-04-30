@@ -581,6 +581,18 @@ SINGLE_CP_MAX_POWER_KW = 7.0
 
 
 # ===============================
+# LINE 低餘額提醒門檻
+# ===============================
+LOW_BALANCE_LINE_THRESHOLD = 1000.0
+
+
+# ===============================
+# 自動停充原因標記
+# ===============================
+AUTO_STOP_REASON_BALANCE_INSUFFICIENT = "balance_insufficient"
+
+
+# ===============================
 # 🔌 OCPP 電流限制（TxProfile）
 # ===============================
 async def query_smart_charging_capability(cp):
@@ -2720,7 +2732,11 @@ CREATE TABLE IF NOT EXISTS transactions (
     stop_timestamp TEXT,
     reason TEXT,
     balance_before REAL,
-    balance_after REAL
+    balance_after REAL,
+    auto_stop_reason TEXT,
+    auto_stop_triggered_at TEXT,
+    auto_stop_balance REAL,
+    auto_stop_estimated_amount REAL
 )
 """
 )
@@ -2734,8 +2750,19 @@ if "balance_before" not in _tx_cols:
 if "balance_after" not in _tx_cols:
     cursor.execute("ALTER TABLE transactions ADD COLUMN balance_after REAL")
 
-conn.commit()
+if "auto_stop_reason" not in _tx_cols:
+    cursor.execute("ALTER TABLE transactions ADD COLUMN auto_stop_reason TEXT")
 
+if "auto_stop_triggered_at" not in _tx_cols:
+    cursor.execute("ALTER TABLE transactions ADD COLUMN auto_stop_triggered_at TEXT")
+
+if "auto_stop_balance" not in _tx_cols:
+    cursor.execute("ALTER TABLE transactions ADD COLUMN auto_stop_balance REAL")
+
+if "auto_stop_estimated_amount" not in _tx_cols:
+    cursor.execute("ALTER TABLE transactions ADD COLUMN auto_stop_estimated_amount REAL")
+
+conn.commit()
 
 cursor.execute(
     """
@@ -2881,6 +2908,70 @@ conn.commit()
 from ocpp.v16 import call
 
 
+def mark_transaction_auto_stop_balance_insufficient(
+    transaction_id: int,
+    balance: float,
+    estimated_amount: float,
+) -> bool:
+    """
+    第二階段：標記交易是因「餘額不足」觸發系統自動停充。
+
+    注意：
+    - 這裡只做原因標記，不做 LINE 推播
+    - 實際 LINE 推播留到第三階段
+    - 使用獨立欄位，不覆蓋 OCPP StopTransaction 原本 reason
+    """
+
+    try:
+        tx_id = int(transaction_id)
+        balance_value = float(balance)
+        estimated_value = float(estimated_amount)
+        triggered_at = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
+
+        with sqlite3.connect(DB_FILE, check_same_thread=False, timeout=15) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                UPDATE transactions
+                SET
+                    auto_stop_reason = ?,
+                    auto_stop_triggered_at = ?,
+                    auto_stop_balance = ?,
+                    auto_stop_estimated_amount = ?
+                WHERE transaction_id = ?
+                """,
+                (
+                    AUTO_STOP_REASON_BALANCE_INSUFFICIENT,
+                    triggered_at,
+                    balance_value,
+                    estimated_value,
+                    tx_id,
+                ),
+            )
+            conn.commit()
+
+        logger.warning(
+            f"[AUTO-STOP][MARK] "
+            f"tx_id={tx_id} | "
+            f"reason={AUTO_STOP_REASON_BALANCE_INSUFFICIENT} | "
+            f"balance={balance_value} | "
+            f"estimated={estimated_value} | "
+            f"triggered_at={triggered_at}"
+        )
+
+        return True
+
+    except Exception as e:
+        logger.exception(
+            f"[AUTO-STOP][MARK_ERR] "
+            f"tx_id={transaction_id} | "
+            f"balance={balance} | "
+            f"estimated={estimated_amount} | "
+            f"err={e}"
+        )
+        return False
+
+
 async def _auto_stop_if_balance_insufficient(
     cp_id: str,
     transaction_id: int,
@@ -2932,6 +3023,14 @@ async def _auto_stop_if_balance_insufficient(
         logger.error(f"[AUTO-STOP] CP not connected | cp_id={cp_id}")
         return
 
+    # 第二階段：先標記本交易是「餘額不足」觸發系統自動停充
+    # 第三階段會依此標記，在 StopTransaction 完成後發送 LINE。
+    mark_transaction_auto_stop_balance_insufficient(
+        transaction_id=int(transaction_id),
+        balance=float(balance),
+        estimated_amount=float(estimated_amount),
+    )
+
     # 建立等待 StopTransaction 的 future（沿用你原本機制）
     loop = asyncio.get_running_loop()
     fut = loop.create_future()
@@ -2951,7 +3050,6 @@ async def _auto_stop_if_balance_insufficient(
             f"[AUTO-STOP][ERR] RemoteStop failed "
             f"| cp_id={cp_id} | tx_id={transaction_id} | err={e}"
         )
-
 
 class ChargePoint(OcppChargePoint):
     # ...（你的其他方法，例如 on_status_notification, on_meter_values, ...）
@@ -3798,6 +3896,85 @@ class ChargePoint(OcppChargePoint):
                         f"tx_id={transaction_id} | err={e}"
                     )
 
+                # ==================================================
+                # LINE 階段 1：交易完成後低餘額提醒
+                # 規則：
+                # - 每一筆交易完成後都重新判斷一次
+                # - 不使用永久 already_warned_low_balance 旗標
+                # - LINE 發送失敗不得影響 StopTransaction 回覆
+                # ==================================================
+                try:
+                    balance_after_for_low_balance = locals().get("balance_after")
+
+                    if (
+                        balance_after_for_low_balance is not None
+                        and float(balance_after_for_low_balance) < float(LOW_BALANCE_LINE_THRESHOLD)
+                    ):
+                        schedule_low_balance_line_notification(transaction_id)
+                        logger.warning(
+                            f"[LINE][LOW_BALANCE][TRIGGERED] "
+                            f"tx_id={transaction_id} | "
+                            f"balance_after={balance_after_for_low_balance} | "
+                            f"threshold={LOW_BALANCE_LINE_THRESHOLD}"
+                        )
+                    else:
+                        logger.warning(
+                            f"[LINE][LOW_BALANCE][SKIP_TRIGGER] "
+                            f"tx_id={transaction_id} | "
+                            f"balance_after={balance_after_for_low_balance} | "
+                            f"threshold={LOW_BALANCE_LINE_THRESHOLD}"
+                        )
+
+                except Exception as e:
+                    logger.exception(
+                        f"[LINE][LOW_BALANCE][SCHEDULE_CALL_ERR] "
+                        f"tx_id={transaction_id} | err={e}"
+                    )
+
+                # ==================================================
+                # LINE 第三階段：餘額不足自動停充後推播
+                # 規則：
+                # - 第二階段已在 auto_stop_reason 標記 balance_insufficient
+                # - StopTransaction 完成、扣款與 DB commit 後才判斷
+                # - LINE 發送失敗不得影響 StopTransaction 回覆
+                # ==================================================
+                try:
+                    auto_stop_reason_for_line = None
+
+                    with sqlite3.connect(DB_FILE, check_same_thread=False, timeout=15) as _line_conn:
+                        _line_cur = _line_conn.cursor()
+                        _line_cur.execute(
+                            """
+                            SELECT auto_stop_reason
+                            FROM transactions
+                            WHERE transaction_id = ?
+                            """,
+                            (transaction_id,),
+                        )
+                        _line_row = _line_cur.fetchone()
+
+                    if _line_row:
+                        auto_stop_reason_for_line = _line_row[0]
+
+                    if auto_stop_reason_for_line == AUTO_STOP_REASON_BALANCE_INSUFFICIENT:
+                        schedule_auto_stop_balance_insufficient_line_notification(transaction_id)
+                        logger.warning(
+                            f"[LINE][AUTO_STOP_BALANCE][TRIGGERED] "
+                            f"tx_id={transaction_id} | "
+                            f"auto_stop_reason={auto_stop_reason_for_line}"
+                        )
+                    else:
+                        logger.warning(
+                            f"[LINE][AUTO_STOP_BALANCE][SKIP_TRIGGER] "
+                            f"tx_id={transaction_id} | "
+                            f"auto_stop_reason={auto_stop_reason_for_line}"
+                        )
+
+                except Exception as e:
+                    logger.exception(
+                        f"[LINE][AUTO_STOP_BALANCE][SCHEDULE_CALL_ERR] "
+                        f"tx_id={transaction_id} | err={e}"
+                    )
         except Exception as e:
             logger.exception(f"🔴 StopTransaction DB/計算發生錯誤：{e}")
 
@@ -7371,9 +7548,923 @@ def schedule_charge_completed_line_notification(transaction_id: int) -> None:
             )
 
 
+# =====================================================
+# LINE：交易完成後低餘額提醒
+# 階段 1：
+# - 每一筆 StopTransaction 完成後重新判斷 balance_after
+# - 不使用永久 already_warned_low_balance 旗標
+# - LINE 發送失敗不得影響 StopTransaction 回覆
+# =====================================================
+
+def build_low_balance_line_message(transaction_id: int) -> dict:
+    """
+    建立交易完成後低餘額 LINE 提醒訊息。
+    只負責組訊息，不發送 LINE。
+    """
+
+    try:
+        tx_id_param = int(transaction_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid transaction_id")
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT
+                t.transaction_id,
+                t.charge_point_id,
+                t.id_tag,
+                t.stop_timestamp,
+                t.balance_after,
+                co.name AS card_owner_name,
+                u.name AS user_name,
+                u.card_number,
+                c.balance AS current_card_balance
+            FROM transactions t
+            LEFT JOIN card_owners co
+                ON co.card_id = t.id_tag
+            LEFT JOIN users u
+                ON u.id_tag = t.id_tag
+            LEFT JOIN cards c
+                ON c.card_id = t.id_tag
+            WHERE t.transaction_id = ?
+            """,
+            (tx_id_param,),
+        )
+        row = cur.fetchone()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+
+    (
+        tx_id,
+        charge_point_id,
+        id_tag,
+        stop_timestamp,
+        balance_after,
+        card_owner_name,
+        user_name,
+        card_number,
+        current_card_balance,
+    ) = row
+
+    resident_name = card_owner_name or user_name or "--"
+    display_card = id_tag or card_number or "--"
+
+    balance_after_value = balance_after
+    if balance_after_value is None:
+        balance_after_value = current_card_balance
+
+    balance_after_text = _format_line_amount(balance_after_value)
+
+    message_lines = [
+        "餘額提醒",
+        f"住戶：{resident_name}",
+        f"卡號：{display_card}",
+        f"充電樁：{charge_point_id or '--'}",
+        f"交易編號：{tx_id}",
+        f"交易完成時間：{_format_line_taipei_time(stop_timestamp)}",
+        f"扣款後餘額：{balance_after_text}",
+        "",
+        f"餘額已經低於 {_format_line_number(LOW_BALANCE_LINE_THRESHOLD, 0)} 元，請盡速儲值。",
+    ]
+
+    message = "\n".join(message_lines)
+
+    return {
+        "ok": True,
+        "previewOnly": True,
+        "willSend": False,
+        "transactionId": tx_id,
+        "idTag": id_tag,
+        "chargePointId": charge_point_id,
+        "message": message,
+        "data": {
+            "residentName": resident_name,
+            "cardId": display_card,
+            "idTag": id_tag,
+            "chargePointId": charge_point_id,
+            "transactionId": tx_id,
+            "stopTimestamp": stop_timestamp,
+            "stopTimeText": _format_line_taipei_time(stop_timestamp),
+            "balanceAfter": (
+                round(float(balance_after_value), 2)
+                if balance_after_value is not None
+                else None
+            ),
+            "threshold": LOW_BALANCE_LINE_THRESHOLD,
+        },
+    }
+
+
+def finalize_low_balance_line_result(
+    result: dict,
+    message: str | None = None,
+    line_user_id: str | None = None,
+) -> dict:
+    """
+    將低餘額 LINE 推播結果寫入 line_message_logs。
+    """
+
+    try:
+        if not isinstance(result, dict):
+            result = {
+                "ok": False,
+                "status": "failed",
+                "reason": "invalid_result",
+                "rawResult": str(result),
+            }
+
+        status = result.get("status")
+        reason = result.get("reason")
+
+        if status == "sent" and not reason:
+            reason = "ok"
+
+        line_result = result.get("lineResult")
+
+        log_result = insert_line_message_log(
+            event_type="low_balance_after_transaction",
+            transaction_id=result.get("transactionId"),
+            id_tag=result.get("idTag"),
+            line_user_id=result.get("lineUserId") or line_user_id,
+            status=status,
+            reason=reason,
+            message=message,
+            line_result=line_result,
+        )
+
+        result["messageLog"] = log_result
+        return result
+
+    except Exception as e:
+        logging.exception(
+            f"[LINE][LOW_BALANCE][LOG_FINALIZE_ERR] result={result} | err={e}"
+        )
+
+        if isinstance(result, dict):
+            result["messageLog"] = {
+                "ok": False,
+                "error": str(e),
+            }
+
+        return result
+
+
+def send_low_balance_line_notification(transaction_id: int) -> dict:
+    """
+    交易完成後，扣款後餘額低於門檻時發送 LINE 提醒。
+
+    注意：
+    - 每筆交易完成後都可重新觸發
+    - 不使用永久 already_warned_low_balance 旗標
+    - sent / skipped / failed 都會寫入 line_message_logs
+    """
+
+    try:
+        tx_id = int(transaction_id)
+    except Exception:
+        logging.warning(
+            f"[LINE][LOW_BALANCE][SKIP] invalid transaction_id={transaction_id}"
+        )
+        return finalize_low_balance_line_result(
+            {
+                "ok": False,
+                "status": "skipped",
+                "reason": "invalid_transaction_id",
+                "transactionId": None,
+            }
+        )
+
+    try:
+        message_info = build_low_balance_line_message(tx_id)
+
+        id_tag = str(
+            message_info.get("idTag")
+            or (message_info.get("data") or {}).get("idTag")
+            or ""
+        ).strip()
+
+        message = str(message_info.get("message") or "").strip()
+        balance_after = (message_info.get("data") or {}).get("balanceAfter")
+
+        if balance_after is None:
+            logging.warning(
+                f"[LINE][LOW_BALANCE][SKIP] tx_id={tx_id} | reason=no_balance_after"
+            )
+            return finalize_low_balance_line_result(
+                {
+                    "ok": True,
+                    "status": "skipped",
+                    "reason": "no_balance_after",
+                    "transactionId": tx_id,
+                    "idTag": id_tag,
+                },
+                message=message,
+            )
+
+        try:
+            balance_after_float = float(balance_after)
+        except Exception:
+            balance_after_float = None
+
+        if balance_after_float is None:
+            logging.warning(
+                f"[LINE][LOW_BALANCE][SKIP] tx_id={tx_id} | reason=invalid_balance_after | value={balance_after}"
+            )
+            return finalize_low_balance_line_result(
+                {
+                    "ok": True,
+                    "status": "skipped",
+                    "reason": "invalid_balance_after",
+                    "transactionId": tx_id,
+                    "idTag": id_tag,
+                },
+                message=message,
+            )
+
+        if balance_after_float >= float(LOW_BALANCE_LINE_THRESHOLD):
+            logging.warning(
+                f"[LINE][LOW_BALANCE][SKIP] tx_id={tx_id} | balance_after={balance_after_float} | threshold={LOW_BALANCE_LINE_THRESHOLD}"
+            )
+            return finalize_low_balance_line_result(
+                {
+                    "ok": True,
+                    "status": "skipped",
+                    "reason": "balance_not_low",
+                    "transactionId": tx_id,
+                    "idTag": id_tag,
+                },
+                message=message,
+            )
+
+        if not id_tag:
+            logging.warning(
+                f"[LINE][LOW_BALANCE][SKIP] tx_id={tx_id} | reason=no_id_tag"
+            )
+            return finalize_low_balance_line_result(
+                {
+                    "ok": False,
+                    "status": "skipped",
+                    "reason": "no_id_tag",
+                    "transactionId": tx_id,
+                },
+                message=message,
+            )
+
+        if not message:
+            logging.warning(
+                f"[LINE][LOW_BALANCE][SKIP] tx_id={tx_id} | idTag={id_tag} | reason=empty_message"
+            )
+            return finalize_low_balance_line_result(
+                {
+                    "ok": False,
+                    "status": "skipped",
+                    "reason": "empty_message",
+                    "transactionId": tx_id,
+                    "idTag": id_tag,
+                },
+                message=message,
+            )
+
+        binding = get_line_binding_by_id_tag(id_tag)
+
+        if not binding:
+            logging.warning(
+                f"[LINE][LOW_BALANCE][SKIP] tx_id={tx_id} | idTag={id_tag} | reason=no_binding"
+            )
+            return finalize_low_balance_line_result(
+                {
+                    "ok": True,
+                    "status": "skipped",
+                    "reason": "no_binding",
+                    "transactionId": tx_id,
+                    "idTag": id_tag,
+                },
+                message=message,
+            )
+
+        if not binding.get("enabled"):
+            logging.warning(
+                f"[LINE][LOW_BALANCE][SKIP] tx_id={tx_id} | idTag={id_tag} | reason=binding_disabled"
+            )
+            return finalize_low_balance_line_result(
+                {
+                    "ok": True,
+                    "status": "skipped",
+                    "reason": "binding_disabled",
+                    "transactionId": tx_id,
+                    "idTag": id_tag,
+                    "lineUserId": binding.get("lineUserId"),
+                },
+                message=message,
+                line_user_id=binding.get("lineUserId"),
+            )
+
+        line_user_id = str(binding.get("lineUserId") or "").strip()
+
+        if not line_user_id:
+            logging.warning(
+                f"[LINE][LOW_BALANCE][SKIP] tx_id={tx_id} | idTag={id_tag} | reason=empty_line_user_id"
+            )
+            return finalize_low_balance_line_result(
+                {
+                    "ok": True,
+                    "status": "skipped",
+                    "reason": "empty_line_user_id",
+                    "transactionId": tx_id,
+                    "idTag": id_tag,
+                },
+                message=message,
+            )
+
+        line_result = send_line_message(
+            line_user_id=line_user_id,
+            message=message,
+        )
+
+        if line_result.get("ok"):
+            logging.warning(
+                f"[LINE][LOW_BALANCE][SENT] tx_id={tx_id} | idTag={id_tag} | balance_after={balance_after_float} | line_user_id={line_user_id}"
+            )
+            return finalize_low_balance_line_result(
+                {
+                    "ok": True,
+                    "status": "sent",
+                    "reason": "ok",
+                    "transactionId": tx_id,
+                    "idTag": id_tag,
+                    "lineUserId": line_user_id,
+                    "lineResult": line_result,
+                },
+                message=message,
+                line_user_id=line_user_id,
+            )
+
+        logging.error(
+            f"[LINE][LOW_BALANCE][FAILED] tx_id={tx_id} | idTag={id_tag} | line_result={line_result}"
+        )
+        return finalize_low_balance_line_result(
+            {
+                "ok": False,
+                "status": "failed",
+                "reason": "line_api_failed",
+                "transactionId": tx_id,
+                "idTag": id_tag,
+                "lineUserId": line_user_id,
+                "lineResult": line_result,
+            },
+            message=message,
+            line_user_id=line_user_id,
+        )
+
+    except HTTPException as e:
+        logging.warning(
+            f"[LINE][LOW_BALANCE][FAILED] tx_id={tx_id} | http_detail={e.detail}"
+        )
+        return finalize_low_balance_line_result(
+            {
+                "ok": False,
+                "status": "failed",
+                "reason": "message_build_http_exception",
+                "transactionId": tx_id,
+                "detail": e.detail,
+            }
+        )
+
+    except Exception as e:
+        logging.exception(
+            f"[LINE][LOW_BALANCE][ERR] tx_id={tx_id} | err={e}"
+        )
+        return finalize_low_balance_line_result(
+            {
+                "ok": False,
+                "status": "failed",
+                "reason": "unexpected_error",
+                "transactionId": tx_id,
+                "error": str(e),
+            }
+        )
+
+
+def schedule_low_balance_line_notification(transaction_id: int) -> None:
+    """
+    排程執行低餘額 LINE 推播。
+
+    重點：
+    - StopTransaction 不等待 LINE API 回應
+    - send_line_message 內部使用 urllib，放到 thread 避免阻塞 OCPP handler
+    - 任何錯誤只 log，不影響 StopTransaction 回覆
+    """
+
+    try:
+        tx_id = int(transaction_id)
+    except Exception:
+        logging.warning(
+            f"[LINE][LOW_BALANCE][SCHEDULE_SKIP] invalid transaction_id={transaction_id}"
+        )
+        return
+
+    async def _runner():
+        try:
+            result = await asyncio.to_thread(
+                send_low_balance_line_notification,
+                tx_id,
+            )
+            logging.warning(
+                f"[LINE][LOW_BALANCE][SCHEDULE_DONE] tx_id={tx_id} | result={result}"
+            )
+        except Exception as e:
+            logging.exception(
+                f"[LINE][LOW_BALANCE][SCHEDULE_ERR] tx_id={tx_id} | err={e}"
+            )
+
+    try:
+        asyncio.create_task(_runner())
+        logging.warning(
+            f"[LINE][LOW_BALANCE][SCHEDULED] tx_id={tx_id}"
+        )
+
+    except RuntimeError:
+        try:
+            result = send_low_balance_line_notification(tx_id)
+            logging.warning(
+                f"[LINE][LOW_BALANCE][SYNC_DONE] tx_id={tx_id} | result={result}"
+            )
+        except Exception as e:
+            logging.exception(
+                f"[LINE][LOW_BALANCE][SYNC_ERR] tx_id={tx_id} | err={e}"
+            )
+
+
+# =====================================================
+# LINE：餘額不足自動停充提醒
+# 第三階段：
+# - 第二階段已先在 transactions 寫入 auto_stop_reason
+# - StopTransaction 完成、扣款與 DB commit 後，再依標記發送 LINE
+# - LINE 發送失敗不得影響 StopTransaction 回覆
+# =====================================================
+
+def build_auto_stop_balance_insufficient_line_message(transaction_id: int) -> dict:
+    """
+    建立「餘額不足，系統已自動停止充電」LINE 訊息。
+    只負責組訊息，不發送 LINE。
+    """
+
+    try:
+        tx_id_param = int(transaction_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid transaction_id")
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT
+                t.transaction_id,
+                t.charge_point_id,
+                t.id_tag,
+                t.stop_timestamp,
+                t.balance_before,
+                t.balance_after,
+                t.auto_stop_reason,
+                t.auto_stop_triggered_at,
+                t.auto_stop_balance,
+                t.auto_stop_estimated_amount,
+                co.name AS card_owner_name,
+                u.name AS user_name,
+                u.card_number,
+                c.balance AS current_card_balance
+            FROM transactions t
+            LEFT JOIN card_owners co
+                ON co.card_id = t.id_tag
+            LEFT JOIN users u
+                ON u.id_tag = t.id_tag
+            LEFT JOIN cards c
+                ON c.card_id = t.id_tag
+            WHERE t.transaction_id = ?
+            """,
+            (tx_id_param,),
+        )
+        row = cur.fetchone()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+
+    (
+        tx_id,
+        charge_point_id,
+        id_tag,
+        stop_timestamp,
+        balance_before,
+        balance_after,
+        auto_stop_reason,
+        auto_stop_triggered_at,
+        auto_stop_balance,
+        auto_stop_estimated_amount,
+        card_owner_name,
+        user_name,
+        card_number,
+        current_card_balance,
+    ) = row
+
+    if auto_stop_reason != AUTO_STOP_REASON_BALANCE_INSUFFICIENT:
+        return {
+            "ok": True,
+            "previewOnly": True,
+            "willSend": False,
+            "transactionId": tx_id,
+            "idTag": id_tag,
+            "chargePointId": charge_point_id,
+            "message": "",
+            "reason": "not_auto_stop_balance_insufficient",
+            "data": {
+                "autoStopReason": auto_stop_reason,
+            },
+        }
+
+    resident_name = card_owner_name or user_name or "--"
+    display_card = id_tag or card_number or "--"
+
+    final_balance_value = balance_after
+    if final_balance_value is None:
+        final_balance_value = current_card_balance
+
+    message_lines = [
+        "餘額不足自動停充通知",
+        f"住戶：{resident_name}",
+        f"卡號：{display_card}",
+        f"充電樁：{charge_point_id or '--'}",
+        f"交易編號：{tx_id}",
+        f"系統判斷時間：{_format_line_taipei_time(auto_stop_triggered_at)}",
+        f"交易結束時間：{_format_line_taipei_time(stop_timestamp)}",
+        f"自動停充時餘額：{_format_line_amount(auto_stop_balance)}",
+        f"當時預估費用：{_format_line_amount(auto_stop_estimated_amount)}",
+        f"扣款後餘額：{_format_line_amount(final_balance_value)}",
+        "",
+        "餘額已經歸零／餘額不足，因此系統已自動停止充電，請儘速儲值。",
+    ]
+
+    message = "\n".join(message_lines)
+
+    return {
+        "ok": True,
+        "previewOnly": True,
+        "willSend": False,
+        "transactionId": tx_id,
+        "idTag": id_tag,
+        "chargePointId": charge_point_id,
+        "message": message,
+        "data": {
+            "residentName": resident_name,
+            "cardId": display_card,
+            "idTag": id_tag,
+            "chargePointId": charge_point_id,
+            "transactionId": tx_id,
+            "stopTimestamp": stop_timestamp,
+            "stopTimeText": _format_line_taipei_time(stop_timestamp),
+            "autoStopReason": auto_stop_reason,
+            "autoStopTriggeredAt": auto_stop_triggered_at,
+            "autoStopTriggeredAtText": _format_line_taipei_time(auto_stop_triggered_at),
+            "autoStopBalance": (
+                round(float(auto_stop_balance), 2)
+                if auto_stop_balance is not None
+                else None
+            ),
+            "autoStopEstimatedAmount": (
+                round(float(auto_stop_estimated_amount), 2)
+                if auto_stop_estimated_amount is not None
+                else None
+            ),
+            "balanceBefore": (
+                round(float(balance_before), 2)
+                if balance_before is not None
+                else None
+            ),
+            "balanceAfter": (
+                round(float(final_balance_value), 2)
+                if final_balance_value is not None
+                else None
+            ),
+        },
+    }
+
+
+def finalize_auto_stop_balance_insufficient_line_result(
+    result: dict,
+    message: str | None = None,
+    line_user_id: str | None = None,
+) -> dict:
+    """
+    將餘額不足自動停充 LINE 推播結果寫入 line_message_logs。
+    """
+
+    try:
+        if not isinstance(result, dict):
+            result = {
+                "ok": False,
+                "status": "failed",
+                "reason": "invalid_result",
+                "rawResult": str(result),
+            }
+
+        status = result.get("status")
+        reason = result.get("reason")
+
+        if status == "sent" and not reason:
+            reason = "ok"
+
+        line_result = result.get("lineResult")
+
+        log_result = insert_line_message_log(
+            event_type="auto_stop_balance_insufficient",
+            transaction_id=result.get("transactionId"),
+            id_tag=result.get("idTag"),
+            line_user_id=result.get("lineUserId") or line_user_id,
+            status=status,
+            reason=reason,
+            message=message,
+            line_result=line_result,
+        )
+
+        result["messageLog"] = log_result
+        return result
+
+    except Exception as e:
+        logging.exception(
+            f"[LINE][AUTO_STOP_BALANCE][LOG_FINALIZE_ERR] result={result} | err={e}"
+        )
+
+        if isinstance(result, dict):
+            result["messageLog"] = {
+                "ok": False,
+                "error": str(e),
+            }
+
+        return result
+
+
+def send_auto_stop_balance_insufficient_line_notification(transaction_id: int) -> dict:
+    """
+    StopTransaction 完成後，如果該交易是因餘額不足自動停充，
+    則發送 LINE 通知。
+
+    注意：
+    - 是否發送完全依 transactions.auto_stop_reason 判斷
+    - 不影響 StopTransaction 回覆
+    - sent / skipped / failed 都會寫入 line_message_logs
+    """
+
+    try:
+        tx_id = int(transaction_id)
+    except Exception:
+        logging.warning(
+            f"[LINE][AUTO_STOP_BALANCE][SKIP] invalid transaction_id={transaction_id}"
+        )
+        return finalize_auto_stop_balance_insufficient_line_result(
+            {
+                "ok": False,
+                "status": "skipped",
+                "reason": "invalid_transaction_id",
+                "transactionId": None,
+            }
+        )
+
+    try:
+        message_info = build_auto_stop_balance_insufficient_line_message(tx_id)
+
+        id_tag = str(
+            message_info.get("idTag")
+            or (message_info.get("data") or {}).get("idTag")
+            or ""
+        ).strip()
+
+        message = str(message_info.get("message") or "").strip()
+        auto_stop_reason = (message_info.get("data") or {}).get("autoStopReason")
+
+        if auto_stop_reason != AUTO_STOP_REASON_BALANCE_INSUFFICIENT:
+            logging.warning(
+                f"[LINE][AUTO_STOP_BALANCE][SKIP] "
+                f"tx_id={tx_id} | reason=not_auto_stop_balance_insufficient | "
+                f"auto_stop_reason={auto_stop_reason}"
+            )
+            return finalize_auto_stop_balance_insufficient_line_result(
+                {
+                    "ok": True,
+                    "status": "skipped",
+                    "reason": "not_auto_stop_balance_insufficient",
+                    "transactionId": tx_id,
+                    "idTag": id_tag,
+                },
+                message=message,
+            )
+
+        if not id_tag:
+            logging.warning(
+                f"[LINE][AUTO_STOP_BALANCE][SKIP] tx_id={tx_id} | reason=no_id_tag"
+            )
+            return finalize_auto_stop_balance_insufficient_line_result(
+                {
+                    "ok": False,
+                    "status": "skipped",
+                    "reason": "no_id_tag",
+                    "transactionId": tx_id,
+                },
+                message=message,
+            )
+
+        if not message:
+            logging.warning(
+                f"[LINE][AUTO_STOP_BALANCE][SKIP] tx_id={tx_id} | idTag={id_tag} | reason=empty_message"
+            )
+            return finalize_auto_stop_balance_insufficient_line_result(
+                {
+                    "ok": False,
+                    "status": "skipped",
+                    "reason": "empty_message",
+                    "transactionId": tx_id,
+                    "idTag": id_tag,
+                },
+                message=message,
+            )
+
+        binding = get_line_binding_by_id_tag(id_tag)
+
+        if not binding:
+            logging.warning(
+                f"[LINE][AUTO_STOP_BALANCE][SKIP] tx_id={tx_id} | idTag={id_tag} | reason=no_binding"
+            )
+            return finalize_auto_stop_balance_insufficient_line_result(
+                {
+                    "ok": True,
+                    "status": "skipped",
+                    "reason": "no_binding",
+                    "transactionId": tx_id,
+                    "idTag": id_tag,
+                },
+                message=message,
+            )
+
+        if not binding.get("enabled"):
+            logging.warning(
+                f"[LINE][AUTO_STOP_BALANCE][SKIP] tx_id={tx_id} | idTag={id_tag} | reason=binding_disabled"
+            )
+            return finalize_auto_stop_balance_insufficient_line_result(
+                {
+                    "ok": True,
+                    "status": "skipped",
+                    "reason": "binding_disabled",
+                    "transactionId": tx_id,
+                    "idTag": id_tag,
+                    "lineUserId": binding.get("lineUserId"),
+                },
+                message=message,
+                line_user_id=binding.get("lineUserId"),
+            )
+
+        line_user_id = str(binding.get("lineUserId") or "").strip()
+
+        if not line_user_id:
+            logging.warning(
+                f"[LINE][AUTO_STOP_BALANCE][SKIP] tx_id={tx_id} | idTag={id_tag} | reason=empty_line_user_id"
+            )
+            return finalize_auto_stop_balance_insufficient_line_result(
+                {
+                    "ok": True,
+                    "status": "skipped",
+                    "reason": "empty_line_user_id",
+                    "transactionId": tx_id,
+                    "idTag": id_tag,
+                },
+                message=message,
+            )
+
+        line_result = send_line_message(
+            line_user_id=line_user_id,
+            message=message,
+        )
+
+        if line_result.get("ok"):
+            logging.warning(
+                f"[LINE][AUTO_STOP_BALANCE][SENT] "
+                f"tx_id={tx_id} | idTag={id_tag} | line_user_id={line_user_id}"
+            )
+            return finalize_auto_stop_balance_insufficient_line_result(
+                {
+                    "ok": True,
+                    "status": "sent",
+                    "reason": "ok",
+                    "transactionId": tx_id,
+                    "idTag": id_tag,
+                    "lineUserId": line_user_id,
+                    "lineResult": line_result,
+                },
+                message=message,
+                line_user_id=line_user_id,
+            )
+
+        logging.error(
+            f"[LINE][AUTO_STOP_BALANCE][FAILED] tx_id={tx_id} | idTag={id_tag} | line_result={line_result}"
+        )
+        return finalize_auto_stop_balance_insufficient_line_result(
+            {
+                "ok": False,
+                "status": "failed",
+                "reason": "line_api_failed",
+                "transactionId": tx_id,
+                "idTag": id_tag,
+                "lineUserId": line_user_id,
+                "lineResult": line_result,
+            },
+            message=message,
+            line_user_id=line_user_id,
+        )
+
+    except HTTPException as e:
+        logging.warning(
+            f"[LINE][AUTO_STOP_BALANCE][FAILED] tx_id={tx_id} | http_detail={e.detail}"
+        )
+        return finalize_auto_stop_balance_insufficient_line_result(
+            {
+                "ok": False,
+                "status": "failed",
+                "reason": "message_build_http_exception",
+                "transactionId": tx_id,
+                "detail": e.detail,
+            }
+        )
+
+    except Exception as e:
+        logging.exception(
+            f"[LINE][AUTO_STOP_BALANCE][ERR] tx_id={tx_id} | err={e}"
+        )
+        return finalize_auto_stop_balance_insufficient_line_result(
+            {
+                "ok": False,
+                "status": "failed",
+                "reason": "unexpected_error",
+                "transactionId": tx_id,
+                "error": str(e),
+            }
+        )
+
+
+def schedule_auto_stop_balance_insufficient_line_notification(transaction_id: int) -> None:
+    """
+    排程執行餘額不足自動停充 LINE 推播。
+
+    重點：
+    - StopTransaction 不等待 LINE API 回應
+    - send_line_message 內部使用 urllib，放到 thread 避免阻塞 OCPP handler
+    - 任何錯誤只 log，不影響 StopTransaction 回覆
+    """
+
+    try:
+        tx_id = int(transaction_id)
+    except Exception:
+        logging.warning(
+            f"[LINE][AUTO_STOP_BALANCE][SCHEDULE_SKIP] invalid transaction_id={transaction_id}"
+        )
+        return
+
+    async def _runner():
+        try:
+            result = await asyncio.to_thread(
+                send_auto_stop_balance_insufficient_line_notification,
+                tx_id,
+            )
+            logging.warning(
+                f"[LINE][AUTO_STOP_BALANCE][SCHEDULE_DONE] tx_id={tx_id} | result={result}"
+            )
+        except Exception as e:
+            logging.exception(
+                f"[LINE][AUTO_STOP_BALANCE][SCHEDULE_ERR] tx_id={tx_id} | err={e}"
+            )
+
+    try:
+        asyncio.create_task(_runner())
+        logging.warning(
+            f"[LINE][AUTO_STOP_BALANCE][SCHEDULED] tx_id={tx_id}"
+        )
+
+    except RuntimeError:
+        try:
+            result = send_auto_stop_balance_insufficient_line_notification(tx_id)
+            logging.warning(
+                f"[LINE][AUTO_STOP_BALANCE][SYNC_DONE] tx_id={tx_id} | result={result}"
+            )
+        except Exception as e:
+            logging.exception(
+                f"[LINE][AUTO_STOP_BALANCE][SYNC_ERR] tx_id={tx_id} | err={e}"
+            )
+
+
 
 @app.get("/api/line/message-logs")
 def get_line_message_logs(
+
+
     limit: int = Query(default=50, ge=1, le=200),
     transaction_id: int | None = Query(default=None),
     id_tag: str | None = Query(default=None),
