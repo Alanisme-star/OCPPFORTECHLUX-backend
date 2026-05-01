@@ -6344,13 +6344,13 @@ async def get_transactions(
 
     if date_start:
         query += """
-            AND COALESCE(t.stop_timestamp, t.start_timestamp) >= ?
+            AND date(COALESCE(t.stop_timestamp, t.start_timestamp), '+8 hours') >= ?
         """
         params.append(date_start)
 
     if date_end:
         query += """
-            AND COALESCE(t.stop_timestamp, t.start_timestamp) <= ?
+            AND date(COALESCE(t.stop_timestamp, t.start_timestamp), '+8 hours') <= ?
         """
         params.append(date_end)
 
@@ -7625,10 +7625,6 @@ def build_low_balance_line_message(transaction_id: int) -> dict:
 
     message_lines = [
         "餘額提醒",
-        f"住戶：{resident_name}",
-        f"卡號：{display_card}",
-        f"充電樁：{charge_point_id or '--'}",
-        f"交易編號：{tx_id}",
         f"交易完成時間：{_format_line_taipei_time(stop_timestamp)}",
         f"扣款後餘額：{balance_after_text}",
         "",
