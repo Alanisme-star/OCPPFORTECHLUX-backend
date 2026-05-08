@@ -11900,6 +11900,8 @@ def get_community_dashboard():
             tx_columns = _get_table_columns(cur, "transactions")
             card_columns = _get_table_columns(cur, "cards")
             id_tag_columns = _get_table_columns(cur, "id_tags")
+            user_columns = _get_table_columns(cur, "users")
+            card_owner_columns = _get_table_columns(cur, "card_owners")
 
             cp_id_col = _pick_col(cp_columns, ["charge_point_id", "cp_id", "id"])
             cp_name_col = _pick_col(cp_columns, ["name", "charge_point_name", "display_name", "parking_space", "parkingSpace"])
@@ -11929,6 +11931,14 @@ def get_community_dashboard():
             id_tag_id_col = _pick_col(id_tag_columns, ["id_tag", "idTag", "card_id", "id"])
             id_tag_resident_col = _pick_col(id_tag_columns, ["resident_name", "residentName", "name", "user_name", "userName"])
             id_tag_balance_col = _pick_col(id_tag_columns, ["balance", "remaining_balance", "remainingBalance"])
+
+            user_id_tag_col = _pick_col(user_columns, ["id_tag", "idTag", "card_id", "id"])
+            user_name_col = _pick_col(user_columns, ["name", "resident_name", "residentName", "user_name", "userName"])
+            user_department_col = _pick_col(user_columns, ["department", "household", "householdDisplay", "room_no", "roomNo"])
+            user_card_number_col = _pick_col(user_columns, ["card_number", "cardNumber", "card_id", "cardId"])
+
+            card_owner_id_col = _pick_col(card_owner_columns, ["card_id", "cardId", "id_tag", "idTag", "id"])
+            card_owner_name_col = _pick_col(card_owner_columns, ["name", "resident_name", "residentName", "user_name", "userName"])
 
             # ==================================================
             # 1) 充電樁清單
@@ -12223,6 +12233,66 @@ def get_community_dashboard():
                         except Exception:
                             pass
 
+                    # 若 cards / id_tags 都沒有住戶名稱，再從 users 找
+                    # users 表目前常見欄位為：id_tag、name、department、card_number
+                    if card_id and not resident_name and user_id_tag_col:
+                        try:
+                            select_cols = [user_id_tag_col]
+                            if user_name_col and user_name_col not in select_cols:
+                                select_cols.append(user_name_col)
+                            if user_department_col and user_department_col not in select_cols:
+                                select_cols.append(user_department_col)
+                            if user_card_number_col and user_card_number_col not in select_cols:
+                                select_cols.append(user_card_number_col)
+
+                            where_clauses = [f"UPPER(TRIM({user_id_tag_col})) = UPPER(TRIM(?))"]
+                            params = [card_id]
+
+                            if user_card_number_col:
+                                where_clauses.append(f"UPPER(TRIM({user_card_number_col})) = UPPER(TRIM(?))")
+                                params.append(card_id)
+
+                            cur.execute(f"""
+                                SELECT {", ".join(select_cols)}
+                                FROM users
+                                WHERE {" OR ".join(where_clauses)}
+                                LIMIT 1
+                            """, params)
+                            user_row = cur.fetchone()
+
+                            if user_row:
+                                user_name = _row_get(user_row, user_name_col, "") if user_name_col else ""
+                                user_department = _row_get(user_row, user_department_col, "") if user_department_col else ""
+
+                                if user_name and user_department:
+                                    resident_name = f"{user_department} {user_name}"
+                                elif user_name:
+                                    resident_name = user_name
+                                elif user_department:
+                                    resident_name = user_department
+                        except Exception as e:
+                            logging.warning(f"[DASHBOARD][CHARGING_NOW][USER_LOOKUP_ERR] card_id={card_id} | err={e}")
+
+                    # 若 users 也沒有，再從 card_owners 找
+                    if card_id and not resident_name and card_owner_id_col:
+                        try:
+                            select_cols = [card_owner_id_col]
+                            if card_owner_name_col and card_owner_name_col not in select_cols:
+                                select_cols.append(card_owner_name_col)
+
+                            cur.execute(f"""
+                                SELECT {", ".join(select_cols)}
+                                FROM card_owners
+                                WHERE UPPER(TRIM({card_owner_id_col})) = UPPER(TRIM(?))
+                                LIMIT 1
+                            """, (card_id,))
+                            owner_row = cur.fetchone()
+
+                            if owner_row and card_owner_name_col:
+                                resident_name = _row_get(owner_row, card_owner_name_col, "")
+                        except Exception as e:
+                            logging.warning(f"[DASHBOARD][CHARGING_NOW][CARD_OWNER_LOOKUP_ERR] card_id={card_id} | err={e}")
+
                     energy_kwh = 0.0
                     if tx_energy_col:
                         energy_kwh = _round2(_row_get(row, tx_energy_col, 0))
@@ -12240,14 +12310,26 @@ def get_community_dashboard():
                     if estimated_amount <= 0 and tx_cost_col:
                         estimated_amount = _round2(_row_get(row, tx_cost_col, 0))
 
+                    live_power_kw = _get_live_power_kw(cp_id)
+
+                    # 進行中交易如果 DB 還沒有 meter_stop，
+                    # energyKwh 可能暫時為 0，這是正常的；
+                    # 這裡同時回傳 currentEnergyKwh，讓前端有一致欄位可讀。
                     charging_now.append({
                         "chargePointId": cp_id,
                         "chargePointName": cp_info.get("chargePointName") or cp_id,
                         "residentName": resident_name or "",
                         "cardId": card_id,
                         "status": _get_current_status(cp_id),
-                        "powerKw": _get_live_power_kw(cp_id),
+
+                        # 相容不同前端命名
+                        "powerKw": live_power_kw,
+                        "currentPowerKw": live_power_kw,
+
+                        # 相容不同前端命名
                         "energyKwh": energy_kwh,
+                        "currentEnergyKwh": energy_kwh,
+
                         "estimatedAmount": estimated_amount,
                         "balance": _round2(balance),
                         "startTimestamp": _row_get(row, tx_start_col, "") if tx_start_col else "",
