@@ -12277,15 +12277,6 @@ def api_get_community_settings():
     try:
         cfg = get_community_settings()
 
-
-
-
-
-@app.get("/api/community-settings")
-def api_get_community_settings():
-    try:
-        cfg = get_community_settings()
-
         # ✅ 改用真實有效 active CP 清單
         active_cp_ids = get_effective_active_cp_ids()
         active_count = len(active_cp_ids)
