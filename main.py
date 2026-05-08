@@ -4124,6 +4124,8 @@ class ChargePoint(OcppChargePoint):
             batch_voltage = None
             batch_current = None
             batch_power_kw = None
+            batch_energy_kwh = None
+            batch_estimated_amount = None
             batch_voltage_rank = 999
             batch_current_rank = 999
             batch_power_rank = 999
@@ -4255,6 +4257,60 @@ class ChargePoint(OcppChargePoint):
                                     else _price_for_timestamp(ts)
                                 )
 
+                                # =====================================================
+                                # ✅ 即時累積度數：
+                                # 進行中交易的 meter_stop 尚未產生，因此不能只靠
+                                # transactions.meter_stop - meter_start。
+                                # 這裡改用最新 Energy.Active.Import.Register
+                                # 減去 transactions.meter_start，寫入 live_status_cache。
+                                # =====================================================
+                                try:
+                                    energy_value_kwh = _energy_to_kwh(val, unit)
+
+                                    tx_meter_start = 0.0
+                                    try:
+                                        _cur.execute(
+                                            """
+                                            SELECT meter_start
+                                            FROM transactions
+                                            WHERE transaction_id = ?
+                                            LIMIT 1
+                                            """,
+                                            (transaction_id,),
+                                        )
+                                        tx_row = _cur.fetchone()
+                                        if tx_row:
+                                            tx_meter_start = float(tx_row[0] or 0)
+                                    except Exception:
+                                        tx_meter_start = 0.0
+
+                                    unit_lower = str(unit or "").lower()
+
+                                    if unit_lower in ("wh", "w*h", "w_h"):
+                                        session_energy_kwh = max(
+                                            0.0,
+                                            (float(val) - float(tx_meter_start)) / 1000.0,
+                                        )
+                                    else:
+                                        start_kwh = (
+                                            float(tx_meter_start) / 1000.0
+                                            if float(tx_meter_start or 0) > 100
+                                            else float(tx_meter_start or 0)
+                                        )
+                                        session_energy_kwh = max(
+                                            0.0,
+                                            float(energy_value_kwh or 0) - start_kwh,
+                                        )
+
+                                    batch_energy_kwh = round(float(session_energy_kwh), 3)
+                                    batch_estimated_amount = float(total or 0)
+
+                                except Exception as e:
+                                    logging.warning(
+                                        f"[LIVE][ENERGY_PATCH_ERR] "
+                                        f"cp_id={cp_id} | tx_id={transaction_id} | err={e}"
+                                    )
+
                                 live_patch = {}
 
                                 if batch_voltage is not None:
@@ -4268,6 +4324,17 @@ class ChargePoint(OcppChargePoint):
 
                                 if last_ts is not None:
                                     live_patch["timestamp"] = last_ts
+
+                                if batch_energy_kwh is not None:
+                                    live_patch["energy_kwh"] = batch_energy_kwh
+                                    live_patch["estimated_energy"] = batch_energy_kwh
+                                    live_patch["energyKwh"] = batch_energy_kwh
+                                    live_patch["currentEnergyKwh"] = batch_energy_kwh
+
+                                if batch_estimated_amount is not None:
+                                    live_patch["estimated_amount"] = batch_estimated_amount
+                                    live_patch["estimatedAmount"] = batch_estimated_amount
+                                    live_patch["summaryEstimatedAmount"] = batch_estimated_amount
 
                                 _upsert_live(cp_id, **live_patch)
 
@@ -4350,6 +4417,13 @@ class ChargePoint(OcppChargePoint):
                 current=batch_current,
                 power=batch_power_kw,
                 timestamp=last_ts,
+                energy_kwh=batch_energy_kwh,
+                estimated_energy=batch_energy_kwh,
+                energyKwh=batch_energy_kwh,
+                currentEnergyKwh=batch_energy_kwh,
+                estimated_amount=batch_estimated_amount,
+                estimatedAmount=batch_estimated_amount,
+                summaryEstimatedAmount=batch_estimated_amount,
                 allocated_power_kw=allocated_kw_for_live,
                 preview_current_a=preview_current_a_for_live,
             )
