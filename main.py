@@ -11914,6 +11914,13 @@ def get_community_dashboard():
             tx_meter_stop_col = _pick_col(tx_columns, ["meter_stop", "meterStop"])
             tx_cost_col = _pick_col(tx_columns, ["cost", "total_cost", "amount", "fee"])
             tx_resident_col = _pick_col(tx_columns, ["resident_name", "residentName", "user_name", "userName"])
+            tx_balance_before_col = _pick_col(tx_columns, ["balance_before", "balanceBefore"])
+            tx_balance_after_col = _pick_col(tx_columns, ["balance_after", "balanceAfter"])
+
+            payment_columns = _get_table_columns(cur, "payments")
+            payment_tx_id_col = _pick_col(payment_columns, ["transaction_id", "transactionId", "tx_id", "txId"])
+            payment_amount_col = _pick_col(payment_columns, ["total_amount", "totalAmount", "amount", "fee", "cost"])
+            payment_paid_at_col = _pick_col(payment_columns, ["paid_at", "paidAt", "created_at", "createdAt", "timestamp"])
 
             card_id_col = _pick_col(card_columns, ["card_id", "id_tag", "idTag", "id"])
             card_resident_col = _pick_col(card_columns, ["resident_name", "residentName", "name", "user_name", "userName"])
@@ -12062,13 +12069,71 @@ def get_community_dashboard():
                     summary["monthlyEnergyKwh"] = _round2(_row_get(cur.fetchone(), "total_energy", 0))
 
                 # 本月收費
+                # --------------------------------------------------
+                # 優先順序：
+                # 1) transactions.cost / total_cost / amount / fee
+                # 2) transactions.balance_before - balance_after
+                # 3) payments.total_amount
+                #
+                # 原因：
+                # StopTransaction 目前會扣 cards.balance，
+                # 並寫入 transactions.balance_before / balance_after，
+                # 同時也會 INSERT payments.total_amount。
+                # 但部分版本 transactions 不一定有 cost 欄位，
+                # 或 cost 欄位沒有被寫入，因此 Dashboard 需要 fallback。
+                # --------------------------------------------------
+                monthly_revenue = 0.0
+
                 if tx_cost_col:
                     cur.execute(f"""
                         SELECT COALESCE(SUM({tx_cost_col}), 0) AS total_revenue
                         FROM transactions
                         WHERE {tx_start_col} >= ?
                     """, (month_start,))
-                    summary["monthlyRevenue"] = _round2(_row_get(cur.fetchone(), "total_revenue", 0))
+                    monthly_revenue = _safe_float(_row_get(cur.fetchone(), "total_revenue", 0), 0.0)
+
+                if monthly_revenue <= 0 and tx_balance_before_col and tx_balance_after_col:
+                    cur.execute(f"""
+                        SELECT COALESCE(
+                            SUM(
+                                CASE
+                                    WHEN {tx_balance_before_col} IS NOT NULL
+                                     AND {tx_balance_after_col} IS NOT NULL
+                                     AND {tx_balance_before_col} > {tx_balance_after_col}
+                                    THEN {tx_balance_before_col} - {tx_balance_after_col}
+                                    ELSE 0
+                                END
+                            ),
+                            0
+                        ) AS total_revenue
+                        FROM transactions
+                        WHERE {tx_start_col} >= ?
+                    """, (month_start,))
+                    monthly_revenue = _safe_float(_row_get(cur.fetchone(), "total_revenue", 0), 0.0)
+
+                if monthly_revenue <= 0 and payment_amount_col:
+                    try:
+                        if payment_paid_at_col:
+                            cur.execute(f"""
+                                SELECT COALESCE(SUM({payment_amount_col}), 0) AS total_revenue
+                                FROM payments
+                                WHERE {payment_paid_at_col} >= ?
+                            """, (month_start,))
+                            monthly_revenue = _safe_float(_row_get(cur.fetchone(), "total_revenue", 0), 0.0)
+
+                        elif payment_tx_id_col and tx_id_col:
+                            cur.execute(f"""
+                                SELECT COALESCE(SUM(p.{payment_amount_col}), 0) AS total_revenue
+                                FROM payments p
+                                INNER JOIN transactions t
+                                    ON t.{tx_id_col} = p.{payment_tx_id_col}
+                                WHERE t.{tx_start_col} >= ?
+                            """, (month_start,))
+                            monthly_revenue = _safe_float(_row_get(cur.fetchone(), "total_revenue", 0), 0.0)
+                    except Exception as e:
+                        logging.warning(f"[DASHBOARD][MONTHLY_REVENUE][PAYMENTS_FALLBACK_ERR] err={e}")
+
+                summary["monthlyRevenue"] = _round2(monthly_revenue)
 
             # ==================================================
             # 4) 目前正在充電清單
