@@ -11827,7 +11827,6 @@ def debug_current_limit_state(cp_id: str | None = Query(default=None)):
 
     return {"server_time": server_time, "items": items}
 
-
 @app.get("/api/dashboard/community")
 def get_community_dashboard():
     """
@@ -11967,7 +11966,7 @@ def get_community_dashboard():
 
     generated_at = datetime.now(TZ_TAIPEI).isoformat()
 
-summary = {
+    summary = {
         "totalChargePoints": 0,
         "chargingCount": 0,
         "availableCount": 0,
@@ -11983,7 +11982,244 @@ summary = {
         "activeChargePointCount": 0,
     }
 
-# ...(中間略過不用改的部分)...
+    charging_now = []
+    alerts = []
+
+    try:
+        community_settings = get_community_settings() or {}
+        summary["contractKw"] = _round2(community_settings.get("contract_kw", 0))
+    except Exception:
+        summary["contractKw"] = 0
+
+    try:
+        with get_conn() as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+
+            cp_columns = _get_table_columns(cur, "charge_points")
+            tx_columns = _get_table_columns(cur, "transactions")
+            card_columns = _get_table_columns(cur, "cards")
+            id_tag_columns = _get_table_columns(cur, "id_tags")
+            user_columns = _get_table_columns(cur, "users")
+            card_owner_columns = _get_table_columns(cur, "card_owners")
+
+            cp_id_col = _pick_col(cp_columns, ["charge_point_id", "cp_id", "id"])
+            cp_name_col = _pick_col(cp_columns, ["name", "charge_point_name", "display_name", "parking_space", "parkingSpace"])
+
+            tx_id_col = _pick_col(tx_columns, ["transaction_id", "id"])
+            tx_cp_col = _pick_col(tx_columns, ["charge_point_id", "cp_id"])
+            tx_card_col = _pick_col(tx_columns, ["card_id", "id_tag", "idTag"])
+            tx_start_col = _pick_col(tx_columns, ["start_timestamp", "start_time", "started_at"])
+            tx_stop_col = _pick_col(tx_columns, ["stop_timestamp", "stop_time", "stopped_at"])
+            tx_energy_col = _pick_col(tx_columns, ["energy_kwh", "energyKwh", "total_energy_kwh"])
+            tx_meter_start_col = _pick_col(tx_columns, ["meter_start", "meterStart"])
+            tx_meter_stop_col = _pick_col(tx_columns, ["meter_stop", "meterStop"])
+            tx_cost_col = _pick_col(tx_columns, ["cost", "total_cost", "amount", "fee"])
+            tx_resident_col = _pick_col(tx_columns, ["resident_name", "residentName", "user_name", "userName"])
+            tx_balance_before_col = _pick_col(tx_columns, ["balance_before", "balanceBefore"])
+            tx_balance_after_col = _pick_col(tx_columns, ["balance_after", "balanceAfter"])
+
+            payment_columns = _get_table_columns(cur, "payments")
+            payment_tx_id_col = _pick_col(payment_columns, ["transaction_id", "transactionId", "tx_id", "txId"])
+            payment_amount_col = _pick_col(payment_columns, ["total_amount", "totalAmount", "amount", "fee", "cost"])
+            payment_paid_at_col = _pick_col(payment_columns, ["paid_at", "paidAt", "created_at", "createdAt", "timestamp"])
+
+            card_id_col = _pick_col(card_columns, ["card_id", "id_tag", "idTag", "id"])
+            card_resident_col = _pick_col(card_columns, ["resident_name", "residentName", "name", "user_name", "userName"])
+            card_balance_col = _pick_col(card_columns, ["balance", "remaining_balance", "remainingBalance"])
+
+            id_tag_id_col = _pick_col(id_tag_columns, ["id_tag", "idTag", "card_id", "id"])
+            id_tag_resident_col = _pick_col(id_tag_columns, ["resident_name", "residentName", "name", "user_name", "userName"])
+            id_tag_balance_col = _pick_col(id_tag_columns, ["balance", "remaining_balance", "remainingBalance"])
+
+            user_id_tag_col = _pick_col(user_columns, ["id_tag", "idTag", "card_id", "id"])
+            user_name_col = _pick_col(user_columns, ["name", "resident_name", "residentName", "user_name", "userName"])
+            user_department_col = _pick_col(user_columns, ["department", "household", "householdDisplay", "room_no", "roomNo"])
+            user_card_number_col = _pick_col(user_columns, ["card_number", "cardNumber", "card_id", "cardId"])
+
+            card_owner_id_col = _pick_col(card_owner_columns, ["card_id", "cardId", "id_tag", "idTag", "id"])
+            card_owner_name_col = _pick_col(card_owner_columns, ["name", "resident_name", "residentName", "user_name", "userName"])
+
+            # ==================================================
+            # 1) 充電樁清單
+            # ==================================================
+            cp_map = {}
+
+            if cp_id_col:
+                select_cols = [cp_id_col]
+                if cp_name_col and cp_name_col != cp_id_col:
+                    select_cols.append(cp_name_col)
+
+                cur.execute(f"""
+                    SELECT {", ".join(select_cols)}
+                    FROM charge_points
+                """)
+                rows = cur.fetchall()
+
+                for row in rows:
+                    cp_id = str(_row_get(row, cp_id_col, "") or "")
+                    cp_id = _normalize_cp_id(cp_id)
+                    if not cp_id:
+                        continue
+
+                    cp_name = _row_get(row, cp_name_col, None) if cp_name_col else None
+                    cp_map[cp_id] = {
+                        "chargePointId": cp_id,
+                        "chargePointName": cp_name or cp_id,
+                    }
+
+            # 記憶體裡有，但 DB 尚未登錄的 CP，也納入總覽避免漏看
+            for cp_id in list(connected_charge_points.keys()):
+                cp_norm = _normalize_cp_id(cp_id)
+                cp_map.setdefault(cp_norm, {
+                    "chargePointId": cp_norm,
+                    "chargePointName": cp_norm,
+                })
+
+            for cp_id in list(charging_point_status.keys()):
+                cp_norm = _normalize_cp_id(cp_id)
+                cp_map.setdefault(cp_norm, {
+                    "chargePointId": cp_norm,
+                    "chargePointName": cp_norm,
+                })
+
+            summary["totalChargePoints"] = len(cp_map)
+
+            # ==================================================
+            # 2) 狀態統計
+            # ==================================================
+            current_total_power_kw = 0.0
+
+            for cp_id, cp_info in cp_map.items():
+                status = _get_current_status(cp_id)
+                status_lower = status.lower()
+
+                if status_lower == "charging":
+                    summary["chargingCount"] += 1
+                elif status_lower == "available":
+                    summary["availableCount"] += 1
+                elif status_lower == "preparing":
+                    summary["preparingCount"] += 1
+                elif _is_abnormal_status(status):
+                    summary["offlineCount"] += 1
+                elif cp_id not in connected_charge_points and status_lower not in {"charging", "preparing"}:
+                    summary["offlineCount"] += 1
+
+                current_total_power_kw += _get_live_power_kw(cp_id)
+
+            summary["currentTotalPowerKw"] = round(current_total_power_kw, 3)
+
+            # ==================================================
+            # 3) 本月統計
+            # ==================================================
+            month_start = datetime.now(TZ_TAIPEI).replace(
+                day=1,
+                hour=0,
+                minute=0,
+                second=0,
+                microsecond=0,
+            ).isoformat()
+
+            if tx_start_col:
+                # 本月交易筆數
+                cur.execute(f"""
+                    SELECT COUNT(*) AS cnt
+                    FROM transactions
+                    WHERE {tx_start_col} >= ?
+                """, (month_start,))
+                summary["monthlyTransactions"] = _safe_int(_row_get(cur.fetchone(), "cnt", 0))
+
+                # 本月使用充電樁數
+                if tx_cp_col:
+                    cur.execute(f"""
+                        SELECT COUNT(DISTINCT {tx_cp_col}) AS cnt
+                        FROM transactions
+                        WHERE {tx_start_col} >= ?
+                          AND {tx_cp_col} IS NOT NULL
+                          AND {tx_cp_col} != ''
+                    """, (month_start,))
+                    summary["activeChargePointCount"] = _safe_int(_row_get(cur.fetchone(), "cnt", 0))
+
+                # 本月使用住戶數：優先 resident_name，其次 card/id_tag
+                if tx_resident_col:
+                    cur.execute(f"""
+                        SELECT COUNT(DISTINCT {tx_resident_col}) AS cnt
+                        FROM transactions
+                        WHERE {tx_start_col} >= ?
+                          AND {tx_resident_col} IS NOT NULL
+                          AND {tx_resident_col} != ''
+                    """, (month_start,))
+                    summary["activeResidentCount"] = _safe_int(_row_get(cur.fetchone(), "cnt", 0))
+                elif tx_card_col:
+                    cur.execute(f"""
+                        SELECT COUNT(DISTINCT {tx_card_col}) AS cnt
+                        FROM transactions
+                        WHERE {tx_start_col} >= ?
+                          AND {tx_card_col} IS NOT NULL
+                          AND {tx_card_col} != ''
+                    """, (month_start,))
+                    summary["activeResidentCount"] = _safe_int(_row_get(cur.fetchone(), "cnt", 0))
+
+                # 本月度數
+                if tx_energy_col:
+                    cur.execute(f"""
+                        SELECT COALESCE(SUM({tx_energy_col}), 0) AS total_energy
+                        FROM transactions
+                        WHERE {tx_start_col} >= ?
+                    """, (month_start,))
+                    summary["monthlyEnergyKwh"] = _round2(_row_get(cur.fetchone(), "total_energy", 0))
+                elif tx_meter_start_col and tx_meter_stop_col:
+                    cur.execute(f"""
+                        SELECT COALESCE(SUM(({tx_meter_stop_col} - {tx_meter_start_col}) / 1000.0), 0) AS total_energy
+                        FROM transactions
+                        WHERE {tx_start_col} >= ?
+                          AND {tx_meter_stop_col} IS NOT NULL
+                          AND {tx_meter_start_col} IS NOT NULL
+                    """, (month_start,))
+                    summary["monthlyEnergyKwh"] = _round2(_row_get(cur.fetchone(), "total_energy", 0))
+
+                # 本月收費
+                # --------------------------------------------------
+                # 優先順序：
+                # 1) transactions.cost / total_cost / amount / fee
+                # 2) transactions.balance_before - balance_after
+                # 3) payments.total_amount
+                #
+                # 原因：
+                # StopTransaction 目前會扣 cards.balance，
+                # 並寫入 transactions.balance_before / balance_after，
+                # 同時也會 INSERT payments.total_amount。
+                # 但部分版本 transactions 不一定有 cost 欄位，
+                # 或 cost 欄位沒有被寫入，因此 Dashboard 需要 fallback。
+                # --------------------------------------------------
+                monthly_revenue = 0.0
+
+                if tx_cost_col:
+                    cur.execute(f"""
+                        SELECT COALESCE(SUM({tx_cost_col}), 0) AS total_revenue
+                        FROM transactions
+                        WHERE {tx_start_col} >= ?
+                    """, (month_start,))
+                    monthly_revenue = _safe_float(_row_get(cur.fetchone(), "total_revenue", 0), 0.0)
+
+                if monthly_revenue <= 0 and tx_balance_before_col and tx_balance_after_col:
+                    cur.execute(f"""
+                        SELECT COALESCE(
+                            SUM(
+                                CASE
+                                    WHEN {tx_balance_before_col} IS NOT NULL
+                                     AND {tx_balance_after_col} IS NOT NULL
+                                     AND {tx_balance_before_col} > {tx_balance_after_col}
+                                    THEN {tx_balance_before_col} - {tx_balance_after_col}
+                                    ELSE 0
+                                END
+                            ),
+                            0
+                        ) AS total_revenue
+                        FROM transactions
+                        WHERE {tx_start_col} >= ?
+                    """, (month_start,))
+                    monthly_revenue = _safe_float(_row_get(cur.fetchone(), "total_revenue", 0), 0.0)
 
                 if monthly_revenue <= 0 and payment_amount_col:
                     try:
@@ -12025,7 +12261,6 @@ summary = {
             # ==================================================
             # 4) 目前正在充電清單
             # ==================================================
-
             if tx_cp_col and tx_stop_col:
                 active_select_cols = []
 
@@ -12295,6 +12530,7 @@ summary = {
         "alerts": alerts,
         "generatedAt": generated_at,
     }
+
 
 
 @app.get("/api/community-settings")
