@@ -12317,11 +12317,10 @@ def api_get_community_settings():
             max_cars_by_min = int(total_current_a // cfg["min_current_a"])
 
             try:
-                # ✅ 改用真實 active cp_id 清單，不再用假的 ACTIVE_CP_1...
+                # ✅ 改用真實 active cp_id 清單
                 allocated_power_kw = calculate_allocated_power_kw_by_cp_ids(active_cp_ids)
 
                 # ✅ 社區總覽維持用 community 電壓做 preview
-                #    這代表它是「社區平均預估值」，不是單樁即時值
                 preview_current_a = (
                     convert_power_kw_to_current_a(allocated_power_kw, None)
                     if allocated_power_kw is not None
@@ -12334,7 +12333,7 @@ def api_get_community_settings():
             except Exception as e:
                 logging.exception(f"[COMMUNITY_SETTINGS][ALLOC_ERR] {e}")
 
-        # ⭐ 縮排已經修正，對齊 try 區塊內部
+        # ⭐ 這裡的 return 必須在 try 區塊內（縮排 8 個空格）
         return {
             "enabled": bool(cfg["enabled"]),
             "contract_kw": float(cfg["contract_kw"]),
@@ -12346,7 +12345,7 @@ def api_get_community_settings():
             "managed_by": "power",
             "single_cp_max_power_kw": float(SINGLE_CP_MAX_POWER_KW),
             "active_charging_count": int(active_count),
-            "active_cp_ids": active_cp_ids,   # ✅ 新增，方便前端或 debug 確認
+            "active_cp_ids": active_cp_ids,
             "total_current_a": round(float(total_current_a), 2),
             "max_cars_by_min": int(max_cars_by_min),
             "allocated_power_kw": allocated_power_kw,
@@ -12356,7 +12355,6 @@ def api_get_community_settings():
     except Exception as e:
         logging.exception(f"[COMMUNITY_SETTINGS][ERR] {e}")
         raise HTTPException(status_code=500, detail=str(e))
-
 
 
 @app.post("/api/community-settings")
