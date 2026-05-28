@@ -6083,6 +6083,359 @@ def save_default_pricing_rules(data: dict):
     return {"status": "ok"}
 
 
+# =====================================================
+# 📅 萬年曆批次匯入每日電價（STEP 1：後端）
+# =====================================================
+def _to_minutes_for_pricing(t: str):
+    """
+    將 HH:MM 轉為分鐘數；24:00 視為 1440。
+    用於檢查時段是否完整覆蓋 00:00~24:00。
+    """
+    if not t:
+        return None
+
+    t = str(t).strip()
+    if t == "24:00":
+        return 1440
+
+    try:
+        hh, mm = t.split(":")
+        hh = int(hh)
+        mm = int(mm)
+    except Exception:
+        return None
+
+    if hh < 0 or hh > 23 or mm < 0 or mm > 59:
+        return None
+
+    return hh * 60 + mm
+
+
+def _is_full_day_pricing_rules(rules: list) -> bool:
+    """
+    檢查一組規則是否完整覆蓋 00:00~24:00，避免匯入後某些時段查不到電價。
+    """
+    if not isinstance(rules, list) or not rules:
+        return False
+
+    segments = []
+    for rule in rules:
+        start_min = _to_minutes_for_pricing(rule.get("startTime"))
+        end_min = _to_minutes_for_pricing(rule.get("endTime"))
+
+        if start_min is None or end_min is None:
+            return False
+
+        if end_min <= start_min:
+            return False
+
+        if rule.get("price") is None:
+            return False
+
+        segments.append((start_min, end_min))
+
+    segments.sort(key=lambda x: x[0])
+
+    if segments[0][0] != 0:
+        return False
+
+    if segments[-1][1] != 1440:
+        return False
+
+    for i in range(len(segments) - 1):
+        if segments[i][1] != segments[i + 1][0]:
+            return False
+
+    return True
+
+
+def _load_default_pricing_rules_for_import():
+    """
+    從 default_pricing_rules 讀取目前前端設定的三種模板：
+    - weekday：週一～週五 / 補班日
+    - saturday：一般星期六
+    - sunday：星期日 / 國定假日 / 例假日
+    """
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT weekday_rules, saturday_rules, sunday_rules
+            FROM default_pricing_rules
+            WHERE id = 1
+            """
+        )
+        row = cur.fetchone()
+
+    if not row:
+        raise HTTPException(
+            status_code=400,
+            detail="尚未設定預設電價規則，請先在前端設定工作日、星期六、星期日規則。",
+        )
+
+    try:
+        weekday_rules = json.loads(row[0]) if row[0] else []
+        saturday_rules = json.loads(row[1]) if row[1] else []
+        sunday_rules = json.loads(row[2]) if row[2] else []
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"預設電價規則 JSON 格式錯誤：{e}",
+        )
+
+    if not _is_full_day_pricing_rules(weekday_rules):
+        raise HTTPException(status_code=400, detail="工作日規則尚未完整覆蓋 00:00~24:00。")
+
+    if not _is_full_day_pricing_rules(saturday_rules):
+        raise HTTPException(status_code=400, detail="星期六規則尚未完整覆蓋 00:00~24:00。")
+
+    if not _is_full_day_pricing_rules(sunday_rules):
+        raise HTTPException(status_code=400, detail="星期日/例假日規則尚未完整覆蓋 00:00~24:00。")
+
+    return {
+        "weekday": weekday_rules,
+        "saturday": saturday_rules,
+        "sunday": sunday_rules,
+    }
+
+
+def _normalize_calendar_day_type(value):
+    """
+    支援 holidays/YYYY.json 內的簡單格式與擴充格式：
+    1) "2026-01-01": "holiday"
+    2) "2026-01-01": {"type": "holiday", "name": "元旦"}
+    """
+    if isinstance(value, dict):
+        value = value.get("type") or value.get("dayType") or value.get("status")
+
+    value = str(value or "").strip().lower()
+
+    if value in ("holiday", "off", "dayoff", "national_holiday"):
+        return "holiday"
+
+    if value in ("workday", "makeup_workday", "makeup", "working_day"):
+        return "workday"
+
+    return None
+
+
+def _load_holiday_calendar_for_year(year: int) -> dict:
+    """
+    讀取 holidays/YYYY.json。
+    若檔案不存在，回傳空 dict，代表該年度只依星期六/日判斷。
+    """
+    holiday_file = os.path.join(BASE_DIR, "holidays", f"{year}.json")
+
+    if not os.path.exists(holiday_file):
+        logging.warning(f"[PRICING_IMPORT][HOLIDAY_FILE_NOT_FOUND] year={year} | path={holiday_file}")
+        return {}
+
+    try:
+        with open(holiday_file, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"讀取萬年曆檔案失敗：holidays/{year}.json，錯誤：{e}",
+        )
+
+    if not isinstance(raw, dict):
+        raise HTTPException(
+            status_code=400,
+            detail=f"萬年曆檔案格式錯誤：holidays/{year}.json 必須是 JSON object。",
+        )
+
+    calendar = {}
+    for date_str, value in raw.items():
+        day_type = _normalize_calendar_day_type(value)
+        if day_type:
+            calendar[str(date_str)] = day_type
+
+    return calendar
+
+
+def _pricing_day_type_for_date(target_date, holiday_map: dict) -> str:
+    """
+    判斷某一天要套用哪一種模板。
+    優先順序：
+    1. holidays JSON 標記 workday → weekday
+    2. holidays JSON 標記 holiday → holiday（沿用 sunday 規則）
+    3. 星期日 → sunday
+    4. 星期六 → saturday
+    5. 其他 → weekday
+    """
+    date_str = target_date.strftime("%Y-%m-%d")
+    override = holiday_map.get(date_str)
+
+    if override == "workday":
+        return "weekday"
+
+    if override == "holiday":
+        return "holiday"
+
+    # Python weekday(): Monday=0, Sunday=6
+    wd = target_date.weekday()
+    if wd == 6:
+        return "sunday"
+    if wd == 5:
+        return "saturday"
+    return "weekday"
+
+
+@app.post("/api/daily-pricing/import-calendar")
+def import_daily_pricing_calendar(data: dict = Body(...)):
+    """
+    批次建立多年每日電價資料。
+
+    請求範例：
+    {
+        "startYear": 2026,
+        "endYear": 2035,
+        "mode": "fill_missing"
+    }
+
+    mode:
+    - fill_missing：只補沒有資料的日期（預設，較安全）
+    - overwrite：覆蓋指定年份範圍內既有每日電價
+    """
+    try:
+        start_year = int(data.get("startYear"))
+        end_year = int(data.get("endYear"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="startYear / endYear 必須是西元年份數字。")
+
+    mode = str(data.get("mode") or "fill_missing").strip()
+
+    if mode not in ("fill_missing", "overwrite"):
+        raise HTTPException(status_code=400, detail="mode 只允許 fill_missing 或 overwrite。")
+
+    if start_year < 2024 or end_year < 2024:
+        raise HTTPException(status_code=400, detail="年份不可小於 2024。")
+
+    if end_year < start_year:
+        raise HTTPException(status_code=400, detail="endYear 不可小於 startYear。")
+
+    if (end_year - start_year + 1) > 15:
+        raise HTTPException(status_code=400, detail="一次最多允許匯入 15 年，避免誤操作。")
+
+    templates = _load_default_pricing_rules_for_import()
+
+    holiday_maps = {
+        year: _load_holiday_calendar_for_year(year)
+        for year in range(start_year, end_year + 1)
+    }
+
+    start_date = datetime(start_year, 1, 1).date()
+    end_date = datetime(end_year, 12, 31).date()
+
+    rows_to_insert = []
+    days_created = 0
+    days_skipped = 0
+    day_type_counts = {
+        "weekday": 0,
+        "saturday": 0,
+        "sunday": 0,
+        "holiday": 0,
+    }
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+
+        if mode == "overwrite":
+            cur.execute(
+                """
+                DELETE FROM daily_pricing_rules
+                WHERE date BETWEEN ? AND ?
+                """,
+                (start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d")),
+            )
+            deleted_rows = cur.rowcount if cur.rowcount is not None else 0
+            existing_dates = set()
+        else:
+            deleted_rows = 0
+            cur.execute(
+                """
+                SELECT DISTINCT date
+                FROM daily_pricing_rules
+                WHERE date BETWEEN ? AND ?
+                """,
+                (start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d")),
+            )
+            existing_dates = {r[0] for r in cur.fetchall()}
+
+        current_date = start_date
+        while current_date <= end_date:
+            date_str = current_date.strftime("%Y-%m-%d")
+
+            if mode == "fill_missing" and date_str in existing_dates:
+                days_skipped += 1
+                current_date += timedelta(days=1)
+                continue
+
+            holiday_map = holiday_maps.get(current_date.year, {})
+            day_type = _pricing_day_type_for_date(current_date, holiday_map)
+
+            if day_type == "holiday":
+                rules = templates["sunday"]
+                insert_label_override = "holiday"
+            elif day_type == "sunday":
+                rules = templates["sunday"]
+                insert_label_override = None
+            elif day_type == "saturday":
+                rules = templates["saturday"]
+                insert_label_override = None
+            else:
+                rules = templates["weekday"]
+                insert_label_override = None
+
+            for rule in rules:
+                rows_to_insert.append(
+                    (
+                        date_str,
+                        rule.get("startTime"),
+                        rule.get("endTime"),
+                        float(rule.get("price")),
+                        insert_label_override or rule.get("label", ""),
+                    )
+                )
+
+            day_type_counts[day_type] = day_type_counts.get(day_type, 0) + 1
+            days_created += 1
+            current_date += timedelta(days=1)
+
+        if rows_to_insert:
+            cur.executemany(
+                """
+                INSERT INTO daily_pricing_rules
+                (date, start_time, end_time, price, label)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                rows_to_insert,
+            )
+
+        conn.commit()
+
+    logging.warning(
+        f"[PRICING_IMPORT][DONE] "
+        f"start_year={start_year} | end_year={end_year} | mode={mode} | "
+        f"days_created={days_created} | days_skipped={days_skipped} | "
+        f"rules_inserted={len(rows_to_insert)} | deleted_rows={deleted_rows} | "
+        f"day_type_counts={day_type_counts}"
+    )
+
+    return {
+        "message": "✅ 萬年曆每日電價匯入完成",
+        "startYear": start_year,
+        "endYear": end_year,
+        "mode": mode,
+        "daysCreated": days_created,
+        "daysSkipped": days_skipped,
+        "rulesInserted": len(rows_to_insert),
+        "deletedRows": deleted_rows,
+        "dayTypeCounts": day_type_counts,
+    }
+
+
 # === 刪除卡片（完整刪除：card_whitelist + card_owners + cards + id_tags） ===
 @app.delete("/api/cards/{id_tag}")
 async def delete_card(id_tag: str):
