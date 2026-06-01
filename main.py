@@ -6254,6 +6254,108 @@ def _load_holiday_calendar_for_year(year: int) -> dict:
     return calendar
 
 
+def _load_special_days_for_apply(year: int):
+    """
+    讀取 holidays/YYYY.json，供 Special Days 多年批次套用使用。
+
+    支援兩種格式：
+
+    1) 純日期陣列：
+       [
+           "2026-01-01",
+           "2026-02-16"
+       ]
+
+    2) 物件格式：
+       {
+           "2026-01-01": "holiday",
+           "2026-02-07": "workday",
+           "2026-02-16": {
+               "type": "holiday",
+               "name": "春節"
+           }
+       }
+
+    回傳：
+    - special_days: ["YYYY-MM-DD", ...]
+    - missing_file: "holidays/YYYY.json" 或 None
+    """
+    holiday_file = os.path.join(BASE_DIR, "holidays", f"{year}.json")
+
+    if not os.path.exists(holiday_file):
+        logging.warning(
+            f"[SPECIAL_DAYS][HOLIDAY_FILE_NOT_FOUND] year={year} | path={holiday_file}"
+        )
+        return [], f"holidays/{year}.json"
+
+    try:
+        with open(holiday_file, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"讀取特殊節日檔案失敗：holidays/{year}.json，錯誤：{e}",
+        )
+
+    special_days = []
+
+    if isinstance(raw, list):
+        for item in raw:
+            date_str = str(item or "").strip()
+            if not date_str:
+                continue
+
+            try:
+                parsed = datetime.strptime(date_str, "%Y-%m-%d").date()
+            except ValueError:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"特殊節日日期格式錯誤：holidays/{year}.json 內的 {date_str} 不是 YYYY-MM-DD。",
+                )
+
+            if parsed.year != year:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"特殊節日年份錯誤：{date_str} 不屬於 {year} 年。",
+                )
+
+            special_days.append(date_str)
+
+        return sorted(set(special_days)), None
+
+    if isinstance(raw, dict):
+        for date_str, value in raw.items():
+            date_str = str(date_str or "").strip()
+            if not date_str:
+                continue
+
+            try:
+                parsed = datetime.strptime(date_str, "%Y-%m-%d").date()
+            except ValueError:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"特殊節日日期格式錯誤：holidays/{year}.json 內的 {date_str} 不是 YYYY-MM-DD。",
+                )
+
+            if parsed.year != year:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"特殊節日年份錯誤：{date_str} 不屬於 {year} 年。",
+                )
+
+            day_type = _normalize_calendar_day_type(value)
+
+            if day_type == "holiday":
+                special_days.append(date_str)
+
+        return sorted(set(special_days)), None
+
+    raise HTTPException(
+        status_code=400,
+        detail=f"特殊節日檔案格式錯誤：holidays/{year}.json 必須是 JSON array 或 JSON object。",
+    )
+
+
 def _pricing_day_type_for_date(target_date, holiday_map: dict) -> str:
     """
     判斷某一天要套用哪一種模板。
@@ -6433,6 +6535,229 @@ def import_daily_pricing_calendar(data: dict = Body(...)):
         "rulesInserted": len(rows_to_insert),
         "deletedRows": deleted_rows,
         "dayTypeCounts": day_type_counts,
+    }
+
+
+@app.post("/api/daily-pricing/apply-special-days")
+def apply_special_days_pricing(data: dict = Body(...)):
+    """
+    Special Days 多年批次套用。
+
+    建議操作順序：
+    1. 先設定工作日 / 星期六 / 星期日預設電價模板
+    2. 先執行 /api/daily-pricing/import-calendar 建立萬年曆每日電價
+    3. 再執行本 API，將 holidays/YYYY.json 中 type=holiday 的日期覆蓋為星期日/例假日電價
+
+    請求範例：
+    {
+        "startYear": 2026,
+        "endYear": 2035,
+        "mode": "overwrite",
+        "requireExistingCalendar": true
+    }
+
+    mode:
+    - overwrite：只覆蓋 Special Days 日期，不會覆蓋整個年份
+    """
+    try:
+        start_year = int(data.get("startYear"))
+        end_year = int(data.get("endYear"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="startYear / endYear 必須是西元年份數字。")
+
+    mode = str(data.get("mode") or "overwrite").strip()
+    require_existing_calendar = bool(data.get("requireExistingCalendar", True))
+
+    if mode != "overwrite":
+        raise HTTPException(status_code=400, detail="Special Days 目前只支援 overwrite 模式。")
+
+    if start_year < 2024 or end_year < 2024:
+        raise HTTPException(status_code=400, detail="年份不可小於 2024。")
+
+    if end_year < start_year:
+        raise HTTPException(status_code=400, detail="endYear 不可小於 startYear。")
+
+    if (end_year - start_year + 1) > 15:
+        raise HTTPException(status_code=400, detail="一次最多允許套用 15 年，避免誤操作。")
+
+    # 讀取目前前端設定的三種模板，並確認皆完整覆蓋 00:00~24:00
+    templates = _load_default_pricing_rules_for_import()
+    sunday_rules = templates.get("sunday") or []
+
+    if not sunday_rules:
+        raise HTTPException(
+            status_code=400,
+            detail="星期日/例假日規則不存在，請先在前端設定星期日規則。",
+        )
+
+    all_special_dates = []
+    year_results = []
+    missing_years = []
+
+    for year in range(start_year, end_year + 1):
+        special_days, missing_file = _load_special_days_for_apply(year)
+
+        if missing_file:
+            missing_years.append(year)
+
+        year_results.append(
+            {
+                "year": year,
+                "file": f"holidays/{year}.json",
+                "missingFile": missing_file is not None,
+                "specialDayCount": len(special_days),
+                "appliedDayCount": 0,
+                "rulesInserted": 0,
+            }
+        )
+
+        for date_str in special_days:
+            all_special_dates.append((year, date_str))
+
+    total_special_day_count = len(all_special_dates)
+
+    if total_special_day_count == 0:
+        return {
+            "message": "⚠️ 未找到可套用的 Special Days。請確認 holidays/YYYY.json 是否存在，且日期是否標記為 holiday。",
+            "startYear": start_year,
+            "endYear": end_year,
+            "mode": mode,
+            "requireExistingCalendar": require_existing_calendar,
+            "totalSpecialDayCount": 0,
+            "totalAppliedDayCount": 0,
+            "totalRulesInserted": 0,
+            "missingYears": missing_years,
+            "years": year_results,
+        }
+
+    special_date_values = sorted(set(date_str for _, date_str in all_special_dates))
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+
+        # =====================================================
+        # 防呆檢查：
+        # 若 requireExistingCalendar=true，Special Days 套用前，
+        # 必須確認這些特殊節日日期已經存在每日電價資料。
+        # 這可避免使用者還沒執行萬年曆匯入，就直接套用 Special Days。
+        # =====================================================
+        if require_existing_calendar:
+            placeholders = ",".join(["?"] * len(special_date_values))
+            cur.execute(
+                f"""
+                SELECT DISTINCT date
+                FROM daily_pricing_rules
+                WHERE date IN ({placeholders})
+                """,
+                special_date_values,
+            )
+            existing_dates = {row[0] for row in cur.fetchall()}
+
+            missing_pricing_dates = [
+                date_str for date_str in special_date_values
+                if date_str not in existing_dates
+            ]
+
+            if missing_pricing_dates:
+                preview = missing_pricing_dates[:20]
+                more_count = max(0, len(missing_pricing_dates) - len(preview))
+
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "message": "尚有 Special Days 日期未找到既有每日電價資料。請先執行萬年曆批次匯入，再套用 Special Days。",
+                        "missingPricingDatesPreview": preview,
+                        "missingPricingDatesCount": len(missing_pricing_dates),
+                        "moreCount": more_count,
+                    },
+                )
+
+        total_applied_day_count = 0
+        total_rules_inserted = 0
+        total_deleted_rows = 0
+
+        # 依年份逐筆套用，方便統計每一年結果
+        for year_result in year_results:
+            year = year_result["year"]
+            year_special_dates = [
+                date_str for item_year, date_str in all_special_dates
+                if item_year == year
+            ]
+
+            if not year_special_dates:
+                continue
+
+            year_applied_day_count = 0
+            year_rules_inserted = 0
+            year_deleted_rows = 0
+
+            for date_str in year_special_dates:
+                cur.execute(
+                    """
+                    DELETE FROM daily_pricing_rules
+                    WHERE date = ?
+                    """,
+                    (date_str,),
+                )
+                deleted_rows = cur.rowcount if cur.rowcount is not None else 0
+                year_deleted_rows += deleted_rows
+
+                rows_to_insert = []
+                for rule in sunday_rules:
+                    rows_to_insert.append(
+                        (
+                            date_str,
+                            rule.get("startTime"),
+                            rule.get("endTime"),
+                            float(rule.get("price")),
+                            "holiday",
+                        )
+                    )
+
+                cur.executemany(
+                    """
+                    INSERT INTO daily_pricing_rules
+                    (date, start_time, end_time, price, label)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    rows_to_insert,
+                )
+
+                year_applied_day_count += 1
+                year_rules_inserted += len(rows_to_insert)
+
+            year_result["appliedDayCount"] = year_applied_day_count
+            year_result["rulesInserted"] = year_rules_inserted
+            year_result["deletedRows"] = year_deleted_rows
+
+            total_applied_day_count += year_applied_day_count
+            total_rules_inserted += year_rules_inserted
+            total_deleted_rows += year_deleted_rows
+
+        conn.commit()
+
+    logging.warning(
+        f"[SPECIAL_DAYS][APPLY_DONE] "
+        f"start_year={start_year} | end_year={end_year} | mode={mode} | "
+        f"total_special_days={total_special_day_count} | "
+        f"total_applied_days={total_applied_day_count} | "
+        f"total_rules_inserted={total_rules_inserted} | "
+        f"total_deleted_rows={total_deleted_rows} | "
+        f"missing_years={missing_years}"
+    )
+
+    return {
+        "message": "✅ Special Days 多年批次套用完成",
+        "startYear": start_year,
+        "endYear": end_year,
+        "mode": mode,
+        "requireExistingCalendar": require_existing_calendar,
+        "totalSpecialDayCount": total_special_day_count,
+        "totalAppliedDayCount": total_applied_day_count,
+        "totalRulesInserted": total_rules_inserted,
+        "totalDeletedRows": total_deleted_rows,
+        "missingYears": missing_years,
+        "years": year_results,
     }
 
 
