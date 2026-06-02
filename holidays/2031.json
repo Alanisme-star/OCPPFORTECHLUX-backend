@@ -1,0 +1,102 @@
+[
+  {
+    "date": "2031-01-01",
+    "name": "中華民國開國紀念日",
+    "type": "holiday"
+  },
+  {
+    "date": "2031-01-20",
+    "name": "春節初三補假",
+    "type": "holiday"
+  },
+  {
+    "date": "2031-01-21",
+    "name": "小年夜",
+    "type": "holiday"
+  },
+  {
+    "date": "2031-01-22",
+    "name": "除夕",
+    "type": "holiday"
+  },
+  {
+    "date": "2031-01-23",
+    "name": "春節初一",
+    "type": "holiday"
+  },
+  {
+    "date": "2031-01-24",
+    "name": "春節初二",
+    "type": "holiday"
+  },
+  {
+    "date": "2031-01-25",
+    "name": "春節初三",
+    "type": "holiday"
+  },
+  {
+    "date": "2031-02-28",
+    "name": "和平紀念日",
+    "type": "holiday"
+  },
+  {
+    "date": "2031-04-03",
+    "name": "清明節補假",
+    "type": "holiday"
+  },
+  {
+    "date": "2031-04-04",
+    "name": "兒童節",
+    "type": "holiday"
+  },
+  {
+    "date": "2031-04-05",
+    "name": "清明節",
+    "type": "holiday"
+  },
+  {
+    "date": "2031-05-01",
+    "name": "勞動節",
+    "type": "holiday"
+  },
+  {
+    "date": "2031-06-24",
+    "name": "端午節",
+    "type": "holiday"
+  },
+  {
+    "date": "2031-09-28",
+    "name": "教師節",
+    "type": "holiday"
+  },
+  {
+    "date": "2031-09-29",
+    "name": "教師節補假",
+    "type": "holiday"
+  },
+  {
+    "date": "2031-10-01",
+    "name": "中秋節",
+    "type": "holiday"
+  },
+  {
+    "date": "2031-10-10",
+    "name": "國慶日",
+    "type": "holiday"
+  },
+  {
+    "date": "2031-10-24",
+    "name": "臺灣光復暨金門古寧頭大捷紀念日補假",
+    "type": "holiday"
+  },
+  {
+    "date": "2031-10-25",
+    "name": "臺灣光復暨金門古寧頭大捷紀念日",
+    "type": "holiday"
+  },
+  {
+    "date": "2031-12-25",
+    "name": "行憲紀念日",
+    "type": "holiday"
+  }
+]

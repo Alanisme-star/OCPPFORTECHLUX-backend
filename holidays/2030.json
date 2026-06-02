@@ -1,0 +1,97 @@
+[
+  {
+    "date": "2030-01-01",
+    "name": "中華民國開國紀念日",
+    "type": "holiday"
+  },
+  {
+    "date": "2030-01-31",
+    "name": "除夕補假",
+    "type": "holiday"
+  },
+  {
+    "date": "2030-02-01",
+    "name": "小年夜",
+    "type": "holiday"
+  },
+  {
+    "date": "2030-02-02",
+    "name": "除夕",
+    "type": "holiday"
+  },
+  {
+    "date": "2030-02-03",
+    "name": "春節初一",
+    "type": "holiday"
+  },
+  {
+    "date": "2030-02-04",
+    "name": "春節初二",
+    "type": "holiday"
+  },
+  {
+    "date": "2030-02-05",
+    "name": "春節初三",
+    "type": "holiday"
+  },
+  {
+    "date": "2030-02-06",
+    "name": "春節初一補假",
+    "type": "holiday"
+  },
+  {
+    "date": "2030-02-28",
+    "name": "和平紀念日",
+    "type": "holiday"
+  },
+  {
+    "date": "2030-04-04",
+    "name": "兒童節",
+    "type": "holiday"
+  },
+  {
+    "date": "2030-04-05",
+    "name": "清明節",
+    "type": "holiday"
+  },
+  {
+    "date": "2030-05-01",
+    "name": "勞動節",
+    "type": "holiday"
+  },
+  {
+    "date": "2030-06-05",
+    "name": "端午節",
+    "type": "holiday"
+  },
+  {
+    "date": "2030-09-12",
+    "name": "中秋節",
+    "type": "holiday"
+  },
+  {
+    "date": "2030-09-27",
+    "name": "教師節補假",
+    "type": "holiday"
+  },
+  {
+    "date": "2030-09-28",
+    "name": "教師節",
+    "type": "holiday"
+  },
+  {
+    "date": "2030-10-10",
+    "name": "國慶日",
+    "type": "holiday"
+  },
+  {
+    "date": "2030-10-25",
+    "name": "臺灣光復暨金門古寧頭大捷紀念日",
+    "type": "holiday"
+  },
+  {
+    "date": "2030-12-25",
+    "name": "行憲紀念日",
+    "type": "holiday"
+  }
+]
