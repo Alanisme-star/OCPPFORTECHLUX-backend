@@ -6031,6 +6031,121 @@ def delete_daily_pricing(date: str = Query(..., description="要刪除的日期 
     return {"message": f"✅ 已刪除 {date} 的所有規則"}
 
 
+def _json_load_default_rules_cell(raw):
+    """
+    default_pricing_rules 欄位相容解析：
+    - 舊格式：欄位內容直接是 list
+    - 新格式：欄位內容是 {"summer": [...], "non_summer": [...]}
+    """
+    if not raw:
+        return []
+
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        return []
+
+    return parsed
+
+
+def _rules_cell_get_season_rules(cell, season: str):
+    """
+    從單一欄位取出指定 season 的規則。
+    若資料仍是舊格式 list，代表 summer / non_summer 共用同一組規則。
+    """
+    if isinstance(cell, list):
+        return cell
+
+    if isinstance(cell, dict):
+        rules = cell.get(season)
+        return rules if isinstance(rules, list) else []
+
+    return []
+
+
+def _build_default_pricing_rules_response(row):
+    """
+    將 DB 三欄資料轉成 API 回傳格式。
+    回傳同時保留：
+    1. 舊前端使用的 weekday / saturday / sunday
+    2. 新前端使用的 summer / non_summer
+    """
+    if not row:
+        summer = {"weekday": [], "saturday": [], "sunday": []}
+        non_summer = {"weekday": [], "saturday": [], "sunday": []}
+    else:
+        weekday_cell = _json_load_default_rules_cell(row[0])
+        saturday_cell = _json_load_default_rules_cell(row[1])
+        sunday_cell = _json_load_default_rules_cell(row[2])
+
+        summer = {
+            "weekday": _rules_cell_get_season_rules(weekday_cell, "summer"),
+            "saturday": _rules_cell_get_season_rules(saturday_cell, "summer"),
+            "sunday": _rules_cell_get_season_rules(sunday_cell, "summer"),
+        }
+        non_summer = {
+            "weekday": _rules_cell_get_season_rules(weekday_cell, "non_summer"),
+            "saturday": _rules_cell_get_season_rules(saturday_cell, "non_summer"),
+            "sunday": _rules_cell_get_season_rules(sunday_cell, "non_summer"),
+        }
+
+    return {
+        # 舊格式相容：前端尚未修改前，仍可讀取這三個 key
+        "weekday": non_summer.get("weekday", []),
+        "saturday": non_summer.get("saturday", []),
+        "sunday": non_summer.get("sunday", []),
+
+        # 新格式：前端完成 STEP 2 後會改讀這兩組
+        "summer": summer,
+        "non_summer": non_summer,
+    }
+
+
+def _normalize_default_pricing_rules_for_storage(data: dict):
+    """
+    將前端送來的資料轉成 DB 三欄可儲存格式。
+
+    支援：
+    A. 舊格式：
+       {"weekday": [], "saturday": [], "sunday": []}
+
+    B. 新格式：
+       {
+         "summer": {"weekday": [], "saturday": [], "sunday": []},
+         "non_summer": {"weekday": [], "saturday": [], "sunday": []}
+       }
+    """
+    data = data or {}
+
+    has_new_format = isinstance(data.get("summer"), dict) or isinstance(data.get("non_summer"), dict)
+
+    if has_new_format:
+        summer = data.get("summer") if isinstance(data.get("summer"), dict) else {}
+        non_summer = data.get("non_summer") if isinstance(data.get("non_summer"), dict) else {}
+
+        weekday = {
+            "summer": summer.get("weekday", []),
+            "non_summer": non_summer.get("weekday", []),
+        }
+        saturday = {
+            "summer": summer.get("saturday", []),
+            "non_summer": non_summer.get("saturday", []),
+        }
+        sunday = {
+            "summer": summer.get("sunday", []),
+            "non_summer": non_summer.get("sunday", []),
+        }
+
+        return weekday, saturday, sunday
+
+    # 舊前端相容：舊格式送入時，維持原本三欄 list 寫法
+    return (
+        data.get("weekday", []),
+        data.get("saturday", []),
+        data.get("sunday", []),
+    )
+
+
 @app.get("/api/default-pricing-rules")
 def get_default_pricing_rules():
     c = conn.cursor()
@@ -6039,21 +6154,12 @@ def get_default_pricing_rules():
     )
     row = c.fetchone()
 
-    if not row:
-        return {"weekday": [], "saturday": [], "sunday": []}
-
-    return {
-        "weekday": json.loads(row[0]) if row[0] else [],
-        "saturday": json.loads(row[1]) if row[1] else [],
-        "sunday": json.loads(row[2]) if row[2] else [],
-    }
+    return _build_default_pricing_rules_response(row)
 
 
 @app.post("/api/default-pricing-rules")
 def save_default_pricing_rules(data: dict):
-    weekday = data.get("weekday", [])
-    saturday = data.get("saturday", [])
-    sunday = data.get("sunday", [])
+    weekday, saturday, sunday = _normalize_default_pricing_rules_for_storage(data)
 
     c = conn.cursor()
 
@@ -6068,7 +6174,11 @@ def save_default_pricing_rules(data: dict):
             SET weekday_rules = ?, saturday_rules = ?, sunday_rules = ?
             WHERE id = 1
         """,
-            (json.dumps(weekday), json.dumps(saturday), json.dumps(sunday)),
+            (
+                json.dumps(weekday, ensure_ascii=False),
+                json.dumps(saturday, ensure_ascii=False),
+                json.dumps(sunday, ensure_ascii=False),
+            ),
         )
     else:
         c.execute(
@@ -6076,7 +6186,11 @@ def save_default_pricing_rules(data: dict):
             INSERT INTO default_pricing_rules (id, weekday_rules, saturday_rules, sunday_rules)
             VALUES (1, ?, ?, ?)
         """,
-            (json.dumps(weekday), json.dumps(saturday), json.dumps(sunday)),
+            (
+                json.dumps(weekday, ensure_ascii=False),
+                json.dumps(saturday, ensure_ascii=False),
+                json.dumps(sunday, ensure_ascii=False),
+            ),
         )
 
     conn.commit()
@@ -6148,13 +6262,33 @@ def _is_full_day_pricing_rules(rules: list) -> bool:
 
     return True
 
+def _taipower_season_for_date(target_date) -> str:
+    """
+    台電季節判斷：
+    - 5/16 ～ 10/15：summer
+    - 其他日期：non_summer
+    """
+    month_day = (target_date.month, target_date.day)
+
+    if (5, 16) <= month_day <= (10, 15):
+        return "summer"
+
+    return "non_summer"
+
 
 def _load_default_pricing_rules_for_import():
     """
-    從 default_pricing_rules 讀取目前前端設定的三種模板：
-    - weekday：週一～週五 / 補班日
-    - saturday：一般星期六
-    - sunday：星期日 / 國定假日 / 例假日
+    從 default_pricing_rules 讀取目前前端設定的模板。
+
+    支援：
+    1. 舊格式：
+       {"weekday": [], "saturday": [], "sunday": []}
+
+    2. 新格式：
+       {
+         "summer": {"weekday": [], "saturday": [], "sunday": []},
+         "non_summer": {"weekday": [], "saturday": [], "sunday": []}
+       }
     """
     with get_conn() as conn:
         cur = conn.cursor()
@@ -6174,29 +6308,40 @@ def _load_default_pricing_rules_for_import():
         )
 
     try:
-        weekday_rules = json.loads(row[0]) if row[0] else []
-        saturday_rules = json.loads(row[1]) if row[1] else []
-        sunday_rules = json.loads(row[2]) if row[2] else []
+        response_data = _build_default_pricing_rules_response(row)
     except Exception as e:
         raise HTTPException(
             status_code=400,
             detail=f"預設電價規則 JSON 格式錯誤：{e}",
         )
 
-    if not _is_full_day_pricing_rules(weekday_rules):
-        raise HTTPException(status_code=400, detail="工作日規則尚未完整覆蓋 00:00~24:00。")
-
-    if not _is_full_day_pricing_rules(saturday_rules):
-        raise HTTPException(status_code=400, detail="星期六規則尚未完整覆蓋 00:00~24:00。")
-
-    if not _is_full_day_pricing_rules(sunday_rules):
-        raise HTTPException(status_code=400, detail="星期日/例假日規則尚未完整覆蓋 00:00~24:00。")
-
-    return {
-        "weekday": weekday_rules,
-        "saturday": saturday_rules,
-        "sunday": sunday_rules,
+    templates = {
+        "summer": response_data.get("summer") or {},
+        "non_summer": response_data.get("non_summer") or {},
     }
+
+    for season_key, season_name in (
+        ("summer", "夏月"),
+        ("non_summer", "非夏月"),
+    ):
+        season_templates = templates.get(season_key) or {}
+
+        checks = (
+            ("weekday", "工作日"),
+            ("saturday", "星期六"),
+            ("sunday", "星期日/例假日"),
+        )
+
+        for day_key, day_name in checks:
+            rules = season_templates.get(day_key) or []
+
+            if not _is_full_day_pricing_rules(rules):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{season_name}{day_name}規則尚未完整覆蓋 00:00~24:00。",
+                )
+
+    return templates
 
 
 def _normalize_calendar_day_type(value):
@@ -6433,11 +6578,16 @@ def import_daily_pricing_calendar(data: dict = Body(...)):
     rows_to_insert = []
     days_created = 0
     days_skipped = 0
+
     day_type_counts = {
         "weekday": 0,
         "saturday": 0,
         "sunday": 0,
         "holiday": 0,
+    }
+    season_counts = {
+        "summer": 0,
+        "non_summer": 0,
     }
 
     with get_conn() as conn:
@@ -6476,20 +6626,21 @@ def import_daily_pricing_calendar(data: dict = Body(...)):
 
             holiday_map = holiday_maps.get(current_date.year, {})
             day_type = _pricing_day_type_for_date(current_date, holiday_map)
+            season = _taipower_season_for_date(current_date)
+            season_templates = templates.get(season) or {}
 
             if day_type == "holiday":
-                rules = templates["sunday"]
+                rules = season_templates["sunday"]
                 insert_label_override = "holiday"
             elif day_type == "sunday":
-                rules = templates["sunday"]
+                rules = season_templates["sunday"]
                 insert_label_override = None
             elif day_type == "saturday":
-                rules = templates["saturday"]
+                rules = season_templates["saturday"]
                 insert_label_override = None
             else:
-                rules = templates["weekday"]
+                rules = season_templates["weekday"]
                 insert_label_override = None
-
             for rule in rules:
                 rows_to_insert.append(
                     (
@@ -6502,6 +6653,7 @@ def import_daily_pricing_calendar(data: dict = Body(...)):
                 )
 
             day_type_counts[day_type] = day_type_counts.get(day_type, 0) + 1
+            season_counts[season] = season_counts.get(season, 0) + 1
             days_created += 1
             current_date += timedelta(days=1)
 
@@ -6522,7 +6674,7 @@ def import_daily_pricing_calendar(data: dict = Body(...)):
         f"start_year={start_year} | end_year={end_year} | mode={mode} | "
         f"days_created={days_created} | days_skipped={days_skipped} | "
         f"rules_inserted={len(rows_to_insert)} | deleted_rows={deleted_rows} | "
-        f"day_type_counts={day_type_counts}"
+        f"day_type_counts={day_type_counts} | season_counts={season_counts}"
     )
 
     return {
@@ -6535,6 +6687,7 @@ def import_daily_pricing_calendar(data: dict = Body(...)):
         "rulesInserted": len(rows_to_insert),
         "deletedRows": deleted_rows,
         "dayTypeCounts": day_type_counts,
+        "seasonCounts": season_counts,
     }
 
 
@@ -6580,15 +6733,8 @@ def apply_special_days_pricing(data: dict = Body(...)):
     if (end_year - start_year + 1) > 15:
         raise HTTPException(status_code=400, detail="一次最多允許套用 15 年，避免誤操作。")
 
-    # 讀取目前前端設定的三種模板，並確認皆完整覆蓋 00:00~24:00
+    # 讀取目前前端設定的模板，並確認 summer / non_summer 的三種日型皆完整覆蓋 00:00~24:00
     templates = _load_default_pricing_rules_for_import()
-    sunday_rules = templates.get("sunday") or []
-
-    if not sunday_rules:
-        raise HTTPException(
-            status_code=400,
-            detail="星期日/例假日規則不存在，請先在前端設定星期日規則。",
-        )
 
     all_special_dates = []
     year_results = []
@@ -6675,6 +6821,10 @@ def apply_special_days_pricing(data: dict = Body(...)):
         total_applied_day_count = 0
         total_rules_inserted = 0
         total_deleted_rows = 0
+        season_counts = {
+            "summer": 0,
+            "non_summer": 0,
+        }
 
         # 依年份逐筆套用，方便統計每一年結果
         for year_result in year_results:
@@ -6702,6 +6852,10 @@ def apply_special_days_pricing(data: dict = Body(...)):
                 deleted_rows = cur.rowcount if cur.rowcount is not None else 0
                 year_deleted_rows += deleted_rows
 
+                target_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+                season = _taipower_season_for_date(target_date)
+                sunday_rules = (templates.get(season) or {}).get("sunday") or []
+
                 rows_to_insert = []
                 for rule in sunday_rules:
                     rows_to_insert.append(
@@ -6713,7 +6867,6 @@ def apply_special_days_pricing(data: dict = Body(...)):
                             "holiday",
                         )
                     )
-
                 cur.executemany(
                     """
                     INSERT INTO daily_pricing_rules
@@ -6723,6 +6876,7 @@ def apply_special_days_pricing(data: dict = Body(...)):
                     rows_to_insert,
                 )
 
+                season_counts[season] = season_counts.get(season, 0) + 1
                 year_applied_day_count += 1
                 year_rules_inserted += len(rows_to_insert)
 
@@ -6743,6 +6897,7 @@ def apply_special_days_pricing(data: dict = Body(...)):
         f"total_applied_days={total_applied_day_count} | "
         f"total_rules_inserted={total_rules_inserted} | "
         f"total_deleted_rows={total_deleted_rows} | "
+        f"season_counts={season_counts} | "
         f"missing_years={missing_years}"
     )
 
@@ -6756,6 +6911,7 @@ def apply_special_days_pricing(data: dict = Body(...)):
         "totalAppliedDayCount": total_applied_day_count,
         "totalRulesInserted": total_rules_inserted,
         "totalDeletedRows": total_deleted_rows,
+        "seasonCounts": season_counts,
         "missingYears": missing_years,
         "years": year_results,
     }
