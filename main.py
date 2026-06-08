@@ -11322,27 +11322,57 @@ async def webhook(request: Request):
 
             bind_command = parse_line_bind_command(text)
 
-            # 不是綁定指令：先回覆簡單提示，方便現場測試
+            # 不是正式綁定指令時，不要一律回覆提示
+            # 只有使用者明確表示想綁定 / 查詢說明時，才回覆綁定教學
             if not bind_command:
-                reply_text = (
-                    "您好，若要綁定充電卡，請輸入：\n"
-                    "綁定 卡號\n\n"
-                    "例如：\n"
-                    "綁定 TEST_CARD_001"
-                )
+                normalized_text = str(text or "").replace("\u3000", " ").strip().lower()
 
-                reply_result = None
-                if reply_token:
-                    reply_result = reply_line_message(reply_token, reply_text)
+                help_keywords = {
+                    "綁定",
+                    "绑定",
+                    "我要綁定",
+                    "我要绑定",
+                    "綁定卡號",
+                    "绑定卡号",
+                    "綁定充電卡",
+                    "綁定電卡",
+                    "绑定充电卡",
+                    "bind",
+                    "help",
+                    "說明",
+                    "说明",
+                }
 
-                processed_results.append(
-                    {
-                        "ok": True,
-                        "action": "help_replied",
-                        "text": text,
-                        "replyResult": reply_result,
-                    }
-                )
+                if normalized_text in help_keywords:
+                    reply_text = (
+                        "您好，若要綁定充電卡，請輸入：\n"
+                        "綁定 卡號\n\n"
+                        "例如：\n"
+                        "綁定 TEST_CARD_001"
+                    )
+
+                    reply_result = None
+                    if reply_token:
+                        reply_result = reply_line_message(reply_token, reply_text)
+
+                    processed_results.append(
+                        {
+                            "ok": True,
+                            "action": "help_replied",
+                            "text": text,
+                            "replyResult": reply_result,
+                        }
+                    )
+                else:
+                    # 一般聊天內容不回覆，避免官方帳號對每一句話都跳綁定提示
+                    processed_results.append(
+                        {
+                            "ok": True,
+                            "action": "ignored_unrecognized_text",
+                            "text": text,
+                        }
+                    )
+
                 continue
 
             id_tag = bind_command["id_tag"]
