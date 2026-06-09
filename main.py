@@ -591,6 +591,52 @@ LOW_BALANCE_LINE_THRESHOLD = 1000.0
 # ===============================
 AUTO_STOP_REASON_BALANCE_INSUFFICIENT = "balance_insufficient"
 
+# ===============================
+# 金額計算工具：統一四捨五入策略
+# ===============================
+from decimal import Decimal, ROUND_HALF_UP
+
+MONEY_ZERO = Decimal("0.00")
+MONEY_QUANT = Decimal("0.01")
+
+
+def _to_decimal(value, default="0"):
+    """
+    將數值安全轉成 Decimal，避免 float 二進位誤差影響金額。
+    """
+    try:
+        if value is None:
+            return Decimal(str(default))
+        return Decimal(str(value))
+    except Exception:
+        return Decimal(str(default))
+
+
+def _money_dec(value) -> Decimal:
+    """
+    金額統一四捨五入到小數第 2 位。
+    使用 ROUND_HALF_UP，較符合一般帳務習慣。
+    """
+    return _to_decimal(value).quantize(MONEY_QUANT, rounding=ROUND_HALF_UP)
+
+
+def _money_float(value) -> float:
+    """
+    回傳 float，方便既有 SQLite REAL 欄位與 JSON 使用。
+    """
+    return float(_money_dec(value))
+
+
+def _money_sum_float(values) -> float:
+    """
+    將多個已四捨五入金額加總，再保持 2 位小數。
+    用於：分段費用加總 = 本次費用。
+    """
+    total = MONEY_ZERO
+    for value in values:
+        total += _money_dec(value)
+    return float(total.quantize(MONEY_QUANT, rounding=ROUND_HALF_UP))
+
 
 # ===============================
 # 🔌 OCPP 電流限制（TxProfile）
@@ -2461,44 +2507,25 @@ conn.commit()
 # 多時段電價分段計算（依據每筆 meter_values 分段累加）
 # ============================================================
 def _calculate_multi_period_cost(transaction_id: int) -> float:
-    import sqlite3
+    """
+    多時段電價總額。
 
-    cfg = get_community_settings()
-    surcharge = float(cfg.get("surcharge_per_kwh", 0))
+    重要：
+    - 不再用未四捨五入原始金額直接加總。
+    - 改為沿用 _calculate_multi_period_cost_detailed()。
+    - total = 各分段 subtotal 已四捨五入後的加總。
+    - 確保 LINE 電價摘要加總 = 本次費用。
+    """
+    breakdown = _calculate_multi_period_cost_detailed(transaction_id)
+    return _money_float(breakdown.get("total", 0.0))
 
-    with sqlite3.connect(DB_FILE) as conn:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT timestamp, value FROM meter_values
-            WHERE transaction_id=? AND measurand LIKE 'Energy.Active.Import%'
-            ORDER BY timestamp ASC
-        """,
-            (transaction_id,),
-        )
-        rows = cur.fetchall()
-
-    if len(rows) < 2:
-        return 0.0
-
-    total = 0.0
-    for i in range(1, len(rows)):
-        ts_prev, val_prev = rows[i - 1]
-        ts_curr, val_curr = rows[i]
-
-        diff_kwh = max(0.0, (float(val_curr) - float(val_prev)) / 1000.0)
-        # 加上社區盈餘
-        price = _price_for_timestamp(ts_curr) + surcharge
-        total += diff_kwh * price
-
-    return round(total, 2)
 
 def _calculate_multi_period_cost_detailed(transaction_id: int):
     import sqlite3
     from datetime import datetime
 
     cfg = get_community_settings()
-    surcharge = float(cfg.get("surcharge_per_kwh", 0))
+    surcharge_dec = _to_decimal(cfg.get("surcharge_per_kwh", 0))
 
     with sqlite3.connect(DB_FILE) as conn:
         cur = conn.cursor()
@@ -2507,7 +2534,7 @@ def _calculate_multi_period_cost_detailed(transaction_id: int):
             SELECT timestamp, value FROM meter_values
             WHERE transaction_id=? AND measurand LIKE 'Energy.Active.Import%'
             ORDER BY timestamp ASC
-        """,
+            """,
             (transaction_id,),
         )
         rows = cur.fetchall()
@@ -2527,16 +2554,22 @@ def _calculate_multi_period_cost_detailed(transaction_id: int):
         rules_dict[r_date].append((r_start, r_end, r_price))
 
     segments_map = {}
-    total = 0.0
 
     for i in range(1, len(rows)):
         ts_prev, val_prev = rows[i - 1]
         ts_curr, val_curr = rows[i]
 
-        diff_kwh = max(0.0, (float(val_curr) - float(val_prev)) / 1000.0)
+        val_prev_dec = _to_decimal(val_prev)
+        val_curr_dec = _to_decimal(val_curr)
+        diff_wh_dec = val_curr_dec - val_prev_dec
+
+        if diff_wh_dec < 0:
+            diff_wh_dec = Decimal("0")
+
+        diff_kwh_dec = diff_wh_dec / Decimal("1000")
 
         # 正規化 UTC timestamp → 轉換為台北時間
-        ts_norm = ts_curr.replace("Z", "+00:00")
+        ts_norm = str(ts_curr).replace("Z", "+00:00")
         dt_parsed = datetime.fromisoformat(ts_norm)
 
         if dt_parsed.tzinfo is None:
@@ -2567,37 +2600,67 @@ def _calculate_multi_period_cost_detailed(transaction_id: int):
                     start_t, end_t, base_price = r_start, r_end, r_price
                     break
 
-        final_price = base_price + surcharge
-        key = (date_key, start_t, end_t, final_price)
+        base_price_dec = _to_decimal(base_price)
+        final_price_dec = base_price_dec + surcharge_dec
+
+        # 用字串當 key，避免 Decimal / float 混用造成 key 不穩定
+        key = (date_key, start_t, end_t, str(final_price_dec))
 
         if key not in segments_map:
             segments_map[key] = {
                 "start": f"{date_key}T{start_t}:00",
                 "end": f"{date_key}T{end_t}:00",
-                "kwh": 0.0,
-                "price": final_price,
-                "base_price": base_price,
-                "surcharge": surcharge,
-                "subtotal": 0.0,
+                "kwh_dec": Decimal("0"),
+                "price_dec": final_price_dec,
+                "base_price_dec": base_price_dec,
+                "surcharge_dec": surcharge_dec,
+                "subtotal_raw_dec": Decimal("0"),
             }
 
         seg = segments_map[key]
-        seg["kwh"] += diff_kwh
-        seg["subtotal"] += diff_kwh * final_price
-        total += diff_kwh * final_price
+        seg["kwh_dec"] += diff_kwh_dec
+        seg["subtotal_raw_dec"] += diff_kwh_dec * final_price_dec
 
     # 轉格式：按時間排序
-    segments = sorted(segments_map.values(), key=lambda s: s["start"])
+    raw_segments = sorted(segments_map.values(), key=lambda s: s["start"])
 
-    # 🔧 延後 round，避免四捨五入誤差
-    for seg in segments:
-        seg["kwh"] = round(seg["kwh"], 6)
-        seg["subtotal"] = round(seg["kwh"] * seg["price"], 2)
+    segments = []
+    rounded_subtotals = []
+
+    for seg in raw_segments:
+        subtotal_dec = _money_dec(seg["subtotal_raw_dec"])
+        rounded_subtotals.append(subtotal_dec)
+
+        kwh_dec = seg["kwh_dec"].quantize(
+            Decimal("0.000001"),
+            rounding=ROUND_HALF_UP,
+        )
+
+        segments.append(
+            {
+                "start": seg["start"],
+                "end": seg["end"],
+                "kwh": float(kwh_dec),
+                "price": float(seg["price_dec"]),
+                "base_price": float(seg["base_price_dec"]),
+                "surcharge": float(seg["surcharge_dec"]),
+                "subtotal": float(subtotal_dec),
+            }
+        )
+
+    # 關鍵：
+    # total 必須等於「各分段已顯示金額」加總。
+    total_dec = MONEY_ZERO
+    for subtotal_dec in rounded_subtotals:
+        total_dec += subtotal_dec
+
+    total_dec = total_dec.quantize(MONEY_QUANT, rounding=ROUND_HALF_UP)
 
     return {
-        "total": float(round(sum(seg["subtotal"] for seg in segments), 2)),
+        "total": float(total_dec),
         "segments": segments,
     }
+
 
 @app.get("/api/cards/{card_id}/whitelist")
 async def get_card_whitelist(card_id: str):
@@ -3813,16 +3876,29 @@ class ChargePoint(OcppChargePoint):
                         used_kwh = 0.0
 
                     unit_price = float(_price_for_timestamp(stop_ts))
-                    total_amount = round(used_kwh * unit_price, 2)
+
+                    # 預設單一電價金額
+                    total_amount = _money_float(
+                        _to_decimal(used_kwh) * _to_decimal(unit_price)
+                    )
 
                     # ==================================================
                     # 多時段電價（若有）
                     # ==================================================
                     try:
-                        mp_amount = _calculate_multi_period_cost(transaction_id)
+                        breakdown = _calculate_multi_period_cost_detailed(transaction_id)
+                        mp_amount = _money_float(breakdown.get("total", 0.0))
+
                         if mp_amount > 0:
-                            total_amount = round(mp_amount, 2)
-                            logger.info(f"🧮 多時段電價計算結果：{total_amount}")
+                            # 關鍵：
+                            # 正式扣款金額 = 各分段 subtotal 已四捨五入後的加總
+                            # 這樣 LINE 電價摘要加總會等於本次費用
+                            total_amount = mp_amount
+                            logger.info(
+                                f"🧮 多時段電價計算結果：{total_amount} "
+                                f"| segments={len(breakdown.get('segments') or [])}"
+                            )
+
                     except Exception as e:
                         logger.warning(f"⚠️ 多時段電價計算失敗：{e}")
 
@@ -3837,7 +3913,7 @@ class ChargePoint(OcppChargePoint):
 
 
 
-# ==================================================
+                    # ==================================================
                     # 卡片扣款（正式結算）＋ 寫入交易前後餘額快照與社區盈餘
                     # ==================================================
                     balance_before = None
@@ -3852,8 +3928,18 @@ class ChargePoint(OcppChargePoint):
                     if not card:
                         logger.error(f"[STOP][ERR] card not found | card_id={id_tag}")
                     else:
-                        balance_before = round(float(card[0] or 0), 2)
-                        balance_after = round(max(0.0, balance_before - total_amount), 2)
+                        balance_before = _money_float(card[0] or 0)
+
+                        balance_after_dec = _money_dec(balance_before) - _money_dec(total_amount)
+                        if balance_after_dec < MONEY_ZERO:
+                            balance_after_dec = MONEY_ZERO
+
+                        balance_after = float(
+                            balance_after_dec.quantize(
+                                MONEY_QUANT,
+                                rounding=ROUND_HALF_UP,
+                            )
+                        )
 
                         _cur.execute(
                             "UPDATE cards SET balance = ? WHERE card_id = ?",
@@ -3862,7 +3948,9 @@ class ChargePoint(OcppChargePoint):
 
                         # 計算本次社區總盈餘
                         surcharge_rate = float(get_community_settings().get("surcharge_per_kwh", 0))
-                        surplus_amount = round(used_kwh * surcharge_rate, 2)
+                        surplus_amount = _money_float(
+                            _to_decimal(used_kwh) * _to_decimal(surcharge_rate)
+                        )
 
                         _cur.execute(
                             """
