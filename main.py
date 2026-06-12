@@ -6352,13 +6352,13 @@ def _is_full_day_pricing_rules(rules: list) -> bool:
 
 def _taipower_season_for_date(target_date) -> str:
     """
-    台電季節判斷：
-    - 5/16 ～ 10/15：summer
-    - 其他日期：non_summer
+    台電低壓/一般社區電動車專用電價季節判斷：
+    - 6/1 ～ 9/30：summer (夏月)
+    - 其他日期：non_summer (非夏月)
     """
     month_day = (target_date.month, target_date.day)
 
-    if (5, 16) <= month_day <= (10, 15):
+    if (6, 1) <= month_day <= (9, 30):
         return "summer"
 
     return "non_summer"
