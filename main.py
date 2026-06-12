@@ -6779,6 +6779,32 @@ def import_daily_pricing_calendar(data: dict = Body(...)):
     }
 
 
+def _body_bool(value, default: bool = False) -> bool:
+    """
+    將前端 Body 內的布林值安全轉換。
+    避免 requireExistingCalendar 若被送成字串 "false" 時，
+    Python bool("false") 仍會變成 True。
+    """
+    if value is None:
+        return default
+
+    if isinstance(value, bool):
+        return value
+
+    if isinstance(value, (int, float)):
+        return value != 0
+
+    text = str(value).strip().lower()
+
+    if text in ("1", "true", "yes", "y", "on"):
+        return True
+
+    if text in ("0", "false", "no", "n", "off", ""):
+        return False
+
+    return default
+
+
 @app.post("/api/daily-pricing/apply-special-days")
 def apply_special_days_pricing(data: dict = Body(...)):
     """
@@ -6807,7 +6833,7 @@ def apply_special_days_pricing(data: dict = Body(...)):
         raise HTTPException(status_code=400, detail="startYear / endYear 必須是西元年份數字。")
 
     mode = str(data.get("mode") or "overwrite").strip()
-    require_existing_calendar = bool(data.get("requireExistingCalendar", True))
+    require_existing_calendar = _body_bool(data.get("requireExistingCalendar"), True)
 
     if mode != "overwrite":
         raise HTTPException(status_code=400, detail="Special Days 目前只支援 overwrite 模式。")
@@ -6903,6 +6929,7 @@ def apply_special_days_pricing(data: dict = Body(...)):
                         "missingPricingDatesPreview": preview,
                         "missingPricingDatesCount": len(missing_pricing_dates),
                         "moreCount": more_count,
+                        "hint": "請先執行 /api/daily-pricing/import-calendar，或使用新版前端按鈕；新版前端會先自動補齊萬年曆，再套用 Special Days。",
                     },
                 )
 
