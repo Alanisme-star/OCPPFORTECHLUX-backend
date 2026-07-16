@@ -1827,7 +1827,9 @@ async def get_status(cp_id: str):
 # 初始化 SQLite 資料庫（順序修正）
 # ===============================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_FILE = os.path.join(BASE_DIR, "ocpp_data.db")  # ✅ 固定資料庫絕對路徑
+from db_config import get_database_path
+
+DB_FILE = get_database_path()
 
 
 def get_conn():
@@ -1838,6 +1840,8 @@ def get_conn():
     # 🚀 效能救星 2：開啟 WAL 模式與 NORMAL 同步，允許並發讀寫！
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.execute("PRAGMA busy_timeout=15000;")
+    conn.execute("PRAGMA foreign_keys=ON;")
     return conn
 
 
@@ -13914,6 +13918,7 @@ async def monitor_balance_and_auto_stop():
 # 啟動背景任務
 @app.on_event("startup")
 async def startup_event():
+    logger.warning("[STARTUP] SQLite database path: %s", DB_FILE)
     asyncio.create_task(monitor_balance_and_auto_stop())
 
 
