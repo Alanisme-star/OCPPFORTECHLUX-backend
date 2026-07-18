@@ -9,6 +9,7 @@ def _normalize_cp_id(cp_id: str) -> str:
 
 connected_charge_points = {}
 live_status_cache = {}
+cp_connection_seq = {}
 
 
 
@@ -386,7 +387,7 @@ import asyncio
 import urllib.request
 import urllib.error
 
-pending_stop_transactions = {}
+pending_stop_transactions: dict[int, "StopContext"] = {}
 # 針對每筆交易做「已送停充」去重，避免前端/後端重複送
 
 
@@ -410,6 +411,13 @@ from websockets.exceptions import ConnectionClosedOK
 from ocpp.v16 import call, call_result, ChargePoint as OcppChargePoint
 from ocpp.v16.enums import Action, RegistrationStatus
 from ocpp.routing import on
+from stop_flow import (
+    StopContext,
+    StopRegistry,
+    execute_stop_request,
+    sqlite_write_with_retry,
+)
+stop_registry = StopRegistry(pending_stop_transactions)
 from urllib.parse import urlparse, parse_qsl
 from reportlab.pdfgen import canvas
 
@@ -1592,6 +1600,16 @@ async def websocket_endpoint(websocket: WebSocket, charge_point_id: str):
         # 2) 啟動 OCPP handler
         cp = ChargePoint(cp_id, FastAPIWebSocketAdapter(websocket))
         cp.supports_smart_charging = True
+        connection_seq = int(cp_connection_seq.get(cp_id, 0) or 0) + 1
+        connection_instance_id = str(uuid.uuid4())
+        cp_connection_seq[cp_id] = connection_seq
+        cp.connection_seq = connection_seq
+        cp.connection_instance_id = connection_instance_id
+        logger.warning(
+            f"[WS_CONNECT][INSTANCE] cp_id={cp_id} | "
+            f"connection_seq={connection_seq} | "
+            f"connection_instance_id={connection_instance_id}"
+        )
         connected_charge_points[cp_id] = cp
         cancel_ws_disconnect_cleanup(cp_id)
         await cp.start()
@@ -1832,15 +1850,19 @@ from db_config import get_database_path
 DB_FILE = get_database_path()
 
 
-def get_conn():
+def get_conn(timeout_seconds: float = 15, busy_timeout_ms: int = 15000):
     """
     為每次查詢建立新的連線與游標，避免共用全域 cursor 造成並發問題
     """
-    conn = sqlite3.connect(DB_FILE, check_same_thread=False, timeout=15)
+    conn = sqlite3.connect(
+        DB_FILE,
+        check_same_thread=False,
+        timeout=float(timeout_seconds),
+    )
     # 🚀 效能救星 2：開啟 WAL 模式與 NORMAL 同步，允許並發讀寫！
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
-    conn.execute("PRAGMA busy_timeout=15000;")
+    conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)};")
     conn.execute("PRAGMA foreign_keys=ON;")
     return conn
 
@@ -3010,7 +3032,7 @@ def mark_transaction_auto_stop_balance_insufficient(
         estimated_value = float(estimated_amount)
         triggered_at = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
 
-        with sqlite3.connect(DB_FILE, check_same_thread=False, timeout=15) as conn:
+        def _write(conn):
             cur = conn.cursor()
             cur.execute(
                 """
@@ -3030,7 +3052,22 @@ def mark_transaction_auto_stop_balance_insufficient(
                     tx_id,
                 ),
             )
-            conn.commit()
+            if cur.rowcount != 1:
+                raise RuntimeError(f"transaction not found: {tx_id}")
+
+        def _on_retry(attempt, elapsed_ms, exc):
+            logger.warning(
+                f"[DB][WRITE_RETRY] operation=mark_auto_stop | tx_id={tx_id} | "
+                f"db_retry_attempt={attempt} | db_locked_elapsed_ms={elapsed_ms:.1f} | err={exc}"
+            )
+
+        sqlite_write_with_retry(
+            lambda: get_conn(timeout_seconds=1.0, busy_timeout_ms=1000),
+            _write,
+            attempts=4,
+            backoff_seconds=(0.05, 0.15, 0.35),
+            on_retry=_on_retry,
+        )
 
         logger.warning(
             f"[AUTO-STOP][MARK] "
@@ -3054,17 +3091,224 @@ def mark_transaction_auto_stop_balance_insufficient(
         return False
 
 
+def _is_transaction_stopped(transaction_id: int) -> bool:
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT stop_timestamp FROM transactions WHERE transaction_id = ?",
+            (int(transaction_id),),
+        )
+        row = cur.fetchone()
+    return bool(row and row[0])
+
+
+def _log_stop_final(context: StopContext, result: dict):
+    logger.warning(
+        f"[STOP][FINAL] stop_request_id={context.stop_request_id} | "
+        f"cp_id={context.cp_id} | tx_id={context.transaction_id} | "
+        f"trigger={context.trigger} | final_outcome={result.get('final_outcome')} | "
+        f"ack_status={result.get('ack_status')} | "
+        f"ack_elapsed_ms={result.get('ack_elapsed_ms')} | "
+        f"stop_status={result.get('stop_status')} | "
+        f"settlement_status={result.get('settlement_status')} | "
+        f"reason={result.get('stop_reason')} | "
+        f"connection_seq={result.get('connection_seq')} | "
+        f"connection_instance_id={result.get('connection_instance_id')} | "
+        f"remote_stop_unique_id={result.get('remote_stop_unique_id')} | "
+        f"websocket_replaced={result.get('websocket_replaced')} | "
+        f"auto_stop_mark_succeeded={result.get('mark_succeeded')} | "
+        f"auto_stop_mark_error={result.get('mark_error')}"
+    )
+
+
+async def _run_transaction_stop(
+    context: StopContext,
+    *,
+    ack_timeout: float,
+    stop_timeout: float,
+    auto_stop_balance: float | None,
+    auto_stop_estimated_amount: float | None,
+) -> dict:
+    tx_id = int(context.transaction_id)
+    cp_id = _normalize_cp_id(context.cp_id)
+
+    try:
+        if context.auto_stop_reason == AUTO_STOP_REASON_BALANCE_INSUFFICIENT:
+            context.mark_succeeded = await asyncio.to_thread(
+                mark_transaction_auto_stop_balance_insufficient,
+                tx_id,
+                float(auto_stop_balance or 0),
+                float(auto_stop_estimated_amount or 0),
+            )
+            if not context.mark_succeeded:
+                context.mark_error = "mark_returned_false"
+
+        captured_cp = connected_charge_points.get(cp_id)
+        context.connection_seq = getattr(captured_cp, "connection_seq", None)
+        context.connection_instance_id = getattr(
+            captured_cp, "connection_instance_id", None
+        )
+        context.remote_stop_unique_id = str(uuid.uuid4())
+
+        async def _send_remote_stop():
+            lock = get_cp_call_lock(cp_id)
+            async with lock:
+                cp = captured_cp
+                current_cp = connected_charge_points.get(cp_id)
+                stale = cp is not current_cp
+                if stale:
+                    context.websocket_replaced = True
+                    cp = current_cp
+
+                if cp is None:
+                    raise ConnectionError(f"charge point not connected: {cp_id}")
+
+                context.connection_seq = getattr(cp, "connection_seq", None)
+                context.connection_instance_id = getattr(
+                    cp, "connection_instance_id", None
+                )
+                logger.warning(
+                    f"[STOP][SEND] stop_request_id={context.stop_request_id} | "
+                    f"cp_id={cp_id} | tx_id={tx_id} | trigger={context.trigger} | "
+                    f"connection_seq={context.connection_seq} | "
+                    f"connection_instance_id={context.connection_instance_id} | "
+                    f"captured_instance_id={getattr(captured_cp, 'connection_instance_id', None)} | "
+                    f"current_instance_id={getattr(current_cp, 'connection_instance_id', None)} | "
+                    f"stale={stale} | remote_stop_unique_id={context.remote_stop_unique_id}"
+                )
+                request = call.RemoteStopTransactionPayload(transaction_id=tx_id)
+                return await cp.call(request, unique_id=context.remote_stop_unique_id)
+
+        result = await execute_stop_request(
+            context,
+            _send_remote_stop,
+            lambda: _is_transaction_stopped(tx_id),
+            ack_timeout=ack_timeout,
+            stop_timeout=stop_timeout,
+        )
+        current_cp = connected_charge_points.get(cp_id)
+        if (
+            current_cp is not None
+            and getattr(current_cp, "connection_instance_id", None)
+            != context.connection_instance_id
+        ):
+            context.websocket_replaced = True
+            result = context.result()
+        _log_stop_final(context, result)
+        return result
+    except asyncio.CancelledError:
+        context.final_outcome = "cancelled"
+        result = context.result()
+        _log_stop_final(context, result)
+        raise
+    except Exception as exc:
+        context.final_outcome = "stop_error"
+        context.settlement_status = "not_committed"
+        logger.exception(
+            f"[STOP][SERVICE_ERR] stop_request_id={context.stop_request_id} | "
+            f"cp_id={cp_id} | tx_id={tx_id} | trigger={context.trigger} | err={exc}"
+        )
+        result = context.result()
+        _log_stop_final(context, result)
+        return result
+    finally:
+        if not context.stop_future.done():
+            context.stop_future.cancel()
+        removed = await stop_registry.remove(tx_id, context)
+        logger.warning(
+            f"[STOP][PENDING_CLEANED] stop_request_id={context.stop_request_id} | "
+            f"cp_id={cp_id} | tx_id={tx_id} | pending_cleaned={removed} | "
+            f"pending_count={len(pending_stop_transactions)}"
+        )
+
+
+async def request_transaction_stop(
+    charge_point_id: str,
+    transaction_id: int,
+    trigger: str,
+    *,
+    auto_stop_reason: str | None = None,
+    wait_for_stop: bool = True,
+    ack_timeout: float = 30.0,
+    stop_timeout: float = 45.0,
+    auto_stop_balance: float | None = None,
+    auto_stop_estimated_amount: float | None = None,
+) -> dict:
+    cp_id = _normalize_cp_id(charge_point_id)
+    tx_id = int(transaction_id)
+    context, created = await stop_registry.get_or_create(
+        tx_id,
+        cp_id,
+        trigger,
+        auto_stop_reason=auto_stop_reason,
+    )
+
+    if created:
+        captured_cp = connected_charge_points.get(cp_id)
+        context.connection_seq = getattr(captured_cp, "connection_seq", None)
+        context.connection_instance_id = getattr(
+            captured_cp, "connection_instance_id", None
+        )
+        context.task = asyncio.create_task(
+            _run_transaction_stop(
+                context,
+                ack_timeout=float(ack_timeout),
+                stop_timeout=float(stop_timeout),
+                auto_stop_balance=auto_stop_balance,
+                auto_stop_estimated_amount=auto_stop_estimated_amount,
+            )
+        )
+        logger.warning(
+            f"[STOP][PENDING_CREATED] stop_request_id={context.stop_request_id} | "
+            f"cp_id={cp_id} | tx_id={tx_id} | trigger={trigger} | "
+            f"pending_created=True | pending_count={len(pending_stop_transactions)}"
+        )
+    else:
+        logger.warning(
+            f"[STOP][PENDING_REUSED] stop_request_id={context.stop_request_id} | "
+            f"cp_id={cp_id} | tx_id={tx_id} | original_trigger={context.trigger} | "
+            f"requested_trigger={trigger} | pending_reused=True"
+        )
+
+    if not wait_for_stop:
+        return context.result()
+    if context.task is None:
+        raise RuntimeError(f"stop task missing for transaction {tx_id}")
+    return await asyncio.shield(context.task)
+
+
+def _schedule_balance_estimate_stop(
+    cp_id: str,
+    transaction_id: int,
+    estimated_amount: float,
+):
+    async def _runner():
+        try:
+            await _auto_stop_if_balance_insufficient(
+                cp_id=cp_id,
+                transaction_id=int(transaction_id),
+                estimated_amount=float(estimated_amount),
+            )
+        except Exception as exc:
+            logger.exception(
+                f"[AUTO-STOP][BACKGROUND_ERR] cp_id={cp_id} | "
+                f"tx_id={transaction_id} | err={exc}"
+            )
+
+    asyncio.create_task(_runner())
+
+
 async def _auto_stop_if_balance_insufficient(
     cp_id: str,
     transaction_id: int,
     estimated_amount: float,
 ):
     # 已送過停充的交易直接跳過（避免重複）
-    if str(transaction_id) in pending_stop_transactions:
+    if int(transaction_id) in pending_stop_transactions:
         return
 
     # 取得 id_tag 與餘額
-    with sqlite3.connect(DB_FILE) as conn:
+    with get_conn() as conn:
         cur = conn.cursor()
         cur.execute(
             """
@@ -3100,38 +3344,23 @@ async def _auto_stop_if_balance_insufficient(
         f"| estimated={estimated_amount}"
     )
 
-    cp = connected_charge_points.get(cp_id)
-    if not cp:
+    if not connected_charge_points.get(cp_id):
         logger.error(f"[AUTO-STOP] CP not connected | cp_id={cp_id}")
         return
 
     # 第二階段：先標記本交易是「餘額不足」觸發系統自動停充
     # 第三階段會依此標記，在 StopTransaction 完成後發送 LINE。
-    mark_transaction_auto_stop_balance_insufficient(
+    await request_transaction_stop(
+        charge_point_id=cp_id,
         transaction_id=int(transaction_id),
-        balance=float(balance),
-        estimated_amount=float(estimated_amount),
+        trigger="balance_estimate",
+        auto_stop_reason=AUTO_STOP_REASON_BALANCE_INSUFFICIENT,
+        wait_for_stop=False,
+        ack_timeout=30.0,
+        stop_timeout=45.0,
+        auto_stop_balance=float(balance),
+        auto_stop_estimated_amount=float(estimated_amount),
     )
-
-    # 建立等待 StopTransaction 的 future（沿用你原本機制）
-    loop = asyncio.get_running_loop()
-    fut = loop.create_future()
-    pending_stop_transactions[str(transaction_id)] = fut
-
-    # 發送 RemoteStopTransaction
-    req = call.RemoteStopTransactionPayload(transaction_id=int(transaction_id))
-
-    try:
-        await cp.call(req)
-        logger.warning(
-            f"[AUTO-STOP][SEND] RemoteStopTransaction "
-            f"| cp_id={cp_id} | tx_id={transaction_id}"
-        )
-    except Exception as e:
-        logger.error(
-            f"[AUTO-STOP][ERR] RemoteStop failed "
-            f"| cp_id={cp_id} | tx_id={transaction_id} | err={e}"
-        )
 
 class ChargePoint(OcppChargePoint):
     # ...（你的其他方法，例如 on_status_notification, on_meter_values, ...）
@@ -3803,9 +4032,35 @@ class ChargePoint(OcppChargePoint):
         except Exception:
             stop_ts = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
 
+        settlement_committed = False
+        settlement_error = None
+        already_stopped = False
+
         try:
-            with sqlite3.connect(DB_FILE) as _conn:
+            with get_conn() as _conn:
+                _conn.execute("BEGIN IMMEDIATE")
                 _cur = _conn.cursor()
+                _cur.execute(
+                    """
+                    SELECT stop_timestamp, meter_stop, reason
+                    FROM transactions
+                    WHERE transaction_id = ?
+                    """,
+                    (transaction_id,),
+                )
+                existing_stop = _cur.fetchone()
+                if existing_stop and existing_stop[0]:
+                    already_stopped = True
+                    settlement_committed = True
+                    stop_ts = existing_stop[0]
+                    meter_stop = existing_stop[1]
+                    reason = existing_stop[2]
+                    _conn.commit()
+                    logger.warning(
+                        f"[STOP][ALREADY_STOPPED] cp_id={cp_id} | "
+                        f"tx_id={transaction_id} | stop_timestamp={stop_ts} | reason={reason}"
+                    )
+                    return call_result.StopTransactionPayload()
 
                 # ==================================================
                 # 記錄 StopTransaction
@@ -3828,6 +4083,10 @@ class ChargePoint(OcppChargePoint):
                     """,
                     (meter_stop, stop_ts, reason, transaction_id),
                 )
+                if _cur.rowcount != 1:
+                    raise RuntimeError(
+                        f"StopTransaction transaction not found: {transaction_id}"
+                    )
 
                 # ==================================================
                 # 補一筆結尾能量紀錄（避免能量斷層）
@@ -3999,6 +4258,7 @@ class ChargePoint(OcppChargePoint):
                     )
 
                 _conn.commit()
+                settlement_committed = True
                 logger.error("[STOP][COMMIT] DB commit done")
 
                 # ==================================================
@@ -4169,22 +4429,27 @@ class ChargePoint(OcppChargePoint):
             # ==================================================
             # 解鎖 stop API 等待 future
             # ==================================================
-            fut = pending_stop_transactions.get(str(transaction_id))
-            logger.debug(
-                f"🧾【StopTransaction FUTURE】hit={bool(fut)} "
-                f"done={(fut.done() if fut else None)} "
-                f"keys={list(pending_stop_transactions.keys())}"
+            if not settlement_committed and settlement_error is None:
+                settlement_error = "settlement_not_committed"
+            context = stop_registry.complete_settlement(
+                int(transaction_id),
+                {
+                    "transaction_id": transaction_id,
+                    "meter_stop": meter_stop,
+                    "timestamp": stop_ts,
+                    "reason": reason,
+                },
+                committed=settlement_committed,
+                already_stopped=already_stopped,
+                error=settlement_error,
             )
-
-            if fut and not fut.done():
-                fut.set_result(
-                    {
-                        "transaction_id": transaction_id,
-                        "meter_stop": meter_stop,
-                        "timestamp": stop_ts,
-                        "reason": reason,
-                    }
-                )
+            logger.warning(
+                f"[STOP][PENDING_COMPLETED] cp_id={cp_id} | tx_id={transaction_id} | "
+                f"stop_request_id={getattr(context, 'stop_request_id', None)} | "
+                f"pending_completed={bool(context)} | "
+                f"settlement_status={'committed' if settlement_committed else 'failed'} | "
+                f"already_stopped={already_stopped}"
+            )
 
         # ==================================================
         # 🟦 Smart Charging：StopTransaction 後全場 Rebalance
@@ -4251,8 +4516,9 @@ class ChargePoint(OcppChargePoint):
             latest_live_ts = None
 
             insert_count = 0
+            auto_stop_candidates = {}
 
-            with sqlite3.connect(DB_FILE) as _c:
+            with get_conn() as _c:
                 _cur = _c.cursor()
 
                 for mv in meter_value_list:
@@ -4456,15 +4722,18 @@ class ChargePoint(OcppChargePoint):
 
                                 _upsert_live(cp_id, **live_patch)
 
-                                await _auto_stop_if_balance_insufficient(
-                                    cp_id=cp_id,
-                                    transaction_id=int(transaction_id),
-                                    estimated_amount=float(total),
-                                )
+                                auto_stop_candidates[int(transaction_id)] = float(total)
                             except Exception as e:
                                 logging.warning(f"⚠️ 能量/金額即時計算失敗：{e}")
 
                 _c.commit()
+
+            for auto_tx_id, auto_estimated_amount in auto_stop_candidates.items():
+                _schedule_balance_estimate_stop(
+                    cp_id=cp_id,
+                    transaction_id=auto_tx_id,
+                    estimated_amount=auto_estimated_amount,
+                )
 
             # === 推算功率（若樁沒送 Power）===
             power_derived_from_vi = False
@@ -4796,7 +5065,7 @@ async def stop_transaction_by_charge_point(charge_point_id: str):
         raise HTTPException(status_code=404, detail=f"⚠️ 找不到連線中的充電樁：{cp_id}")
 
     # === 找進行中交易 ===
-    with sqlite3.connect(DB_FILE) as conn:
+    with get_conn() as conn:
         cursor = conn.cursor()
         cursor.execute(
             """
@@ -4820,68 +5089,32 @@ async def stop_transaction_by_charge_point(charge_point_id: str):
         f"(type={type(transaction_id)})"
     )
 
-    # === 建立 StopTransaction 等待 future ===
-    loop = asyncio.get_running_loop()
-    fut = loop.create_future()
-    pending_stop_transactions[str(transaction_id)] = fut
-    logger.debug(
-        f"🧩【DEBUG】pending_stop_transactions add key={transaction_id} "
-        f"size={len(pending_stop_transactions)}"
+    result = await request_transaction_stop(
+        charge_point_id=cp_id,
+        transaction_id=int(transaction_id),
+        trigger="manual",
+        wait_for_stop=True,
+        ack_timeout=30.0,
+        stop_timeout=45.0,
     )
-
-    # === 發送 RemoteStopTransaction（⚠️ 不管回傳結果）===
-    req = call.RemoteStopTransactionPayload(transaction_id=int(transaction_id))
-    logger.debug(
-        f"📤【DEBUG】RemoteStopTransaction payload tx_id={int(transaction_id)}"
-    )
-
-    logger.warning(
-        f"[STOP][SEND] RemoteStopTransaction "
-        f"| cp_id={cp_id} "
-        f"| tx_id={transaction_id} "
-        f"| ws_connected={cp_id in connected_charge_points}"
-    )
-
-    try:
-        await cp.call(req)
-        logger.warning(
-            f"[STOP][ACK] RemoteStopTransaction accepted "
-            f"| cp_id={cp_id} | tx_id={transaction_id}"
-        )
-    except Exception as e:
-        logger.error(
-            f"[STOP][ERR] RemoteStopTransaction failed "
-            f"| cp_id={cp_id} | tx_id={transaction_id} | err={repr(e)}"
-        )
-
-    # === 唯一成功依據：等待 StopTransaction ===
-    try:
-        stop_result = await asyncio.wait_for(fut, timeout=15)
-        logger.info(f"🟢【API回應】StopTransaction 完成 tx={transaction_id}")
+    if result.get("final_outcome") in {"stopped", "already_stopped"}:
         return {
             "message": "充電已停止",
             "transaction_id": transaction_id,
-            "stop_result": stop_result,
+            "stop_result": result.get("stop_result") or result,
         }
-
-    except asyncio.TimeoutError:
-        logger.error(
-            f"[STOP][TIMEOUT] StopTransaction not received "
-            f"| cp_id={cp_id} "
-            f"| tx_id={transaction_id} "
-            f"| pending_keys={list(pending_stop_transactions.keys())}"
-        )
+    if result.get("final_outcome") == "settlement_failed":
         return JSONResponse(
-            status_code=504,
-            content={"message": "等待充電樁停止回覆逾時 (StopTransaction timeout)"},
+            status_code=500,
+            content={
+                "message": "StopTransaction received but settlement failed",
+                "transaction_id": transaction_id,
+            },
         )
-
-    finally:
-        pending_stop_transactions.pop(str(transaction_id), None)
-        logger.debug(
-            f"🧹【DEBUG】pending_stop_transactions pop key={transaction_id} "
-            f"size={len(pending_stop_transactions)}"
-        )
+    return JSONResponse(
+        status_code=504,
+        content={"message": "等待充電樁停止回覆逾時 (StopTransaction timeout)"},
+    )
 
 
 from fastapi import Body, HTTPException
@@ -12701,46 +12934,6 @@ async def duplicate_by_rule(data: dict = Body(...)):
 from fastapi import HTTPException
 
 
-@app.post("/api/charge-points/{charge_point_id}/stop")
-async def stop_charge_point(charge_point_id: str):
-    cp_id = _normalize_cp_id(charge_point_id)
-
-    logger.error(
-        f"🛑 [STOP API CALLED] cp_id={cp_id} | "
-        f"connected_keys={list(connected_charge_points.keys())}"
-    )
-
-    cp = connected_charge_points.get(cp_id)
-    if not cp:
-        logger.error(f"❌ [STOP API FAIL] cp_id={cp_id} NOT in connected_charge_points")
-        raise HTTPException(status_code=404, detail="Charge point not connected")
-
-    fut = asyncio.get_event_loop().create_future()
-    pending_stop_transactions[str(cp_id)] = fut
-
-    try:
-        logger.error(f"📤 [REMOTE STOP SEND] cp_id={cp_id}")
-        await cp.send_remote_stop_transaction()
-
-        logger.error(f"⏳ [WAIT StopTransaction] cp_id={cp_id} timeout=20s")
-
-        result = await asyncio.wait_for(fut, timeout=20)
-
-        logger.error(f"✅ [STOP SUCCESS] cp_id={cp_id} | result={result}")
-        return result
-
-    except asyncio.TimeoutError:
-        logger.error(f"⏰ [STOP TIMEOUT] cp_id={cp_id} | no StopTransaction received")
-        raise HTTPException(status_code=504, detail="StopTransaction timeout")
-
-    except Exception as e:
-        logger.exception(f"🔥 [STOP EXCEPTION] cp_id={cp_id} | error={e}")
-        raise
-
-    finally:
-        pending_stop_transactions.pop(str(cp_id), None)
-
-
 @app.get("/debug/charge-points")
 async def debug_ids():
     cursor.execute("SELECT charge_point_id FROM charge_points")
@@ -13606,66 +13799,6 @@ def api_update_community_settings(payload: dict = Body(...)):
 
     return {"ok": True}
 
-@app.post("/api/charge-points/{charge_point_id}/stop")
-async def stop_transaction_by_charge_point(charge_point_id: str):
-    print(f"🟢【API呼叫】收到停止充電API請求, charge_point_id = {charge_point_id}")
-    cp = connected_charge_points.get(charge_point_id)
-
-    if not cp:
-        print(f"🔴【API異常】找不到連線中的充電樁：{charge_point_id}")
-        raise HTTPException(
-            status_code=404,
-            detail=f"⚠️ 找不到連線中的充電樁：{charge_point_id}",
-            headers={"X-Connected-CPs": str(list(connected_charge_points.keys()))},
-        )
-    # 查詢進行中的 transaction_id
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            """
-            SELECT transaction_id FROM transactions
-            WHERE charge_point_id = ? AND stop_timestamp IS NULL
-            ORDER BY start_timestamp DESC LIMIT 1
-        """,
-            (charge_point_id,),
-        )
-        row = cursor.fetchone()
-        if not row:
-            print(f"🔴【API異常】無進行中交易 charge_point_id={charge_point_id}")
-            raise HTTPException(status_code=400, detail="⚠️ 無進行中交易")
-        transaction_id = row[0]
-        print(f"🟢【API呼叫】找到進行中交易 transaction_id={transaction_id}")
-
-    # 新增同步等待機制
-    loop = asyncio.get_event_loop()
-    fut = loop.create_future()
-    pending_stop_transactions[str(transaction_id)] = fut
-
-    # 發送 RemoteStopTransaction
-    print(f"🟢【API呼叫】發送 RemoteStopTransaction 給充電樁")
-    req = call.RemoteStopTransactionPayload(transaction_id=transaction_id)
-    resp = await cp.call(req)
-    print(f"🟢【API回應】呼叫 RemoteStopTransaction 完成，resp={resp}")
-
-    # 等待 StopTransaction 被觸發（最多 10 秒）
-    try:
-        stop_result = await asyncio.wait_for(fut, timeout=10)
-        print(f"🟢【API回應】StopTransaction 完成: {stop_result}")
-        return {
-            "message": "充電已停止",
-            "transaction_id": transaction_id,
-            "stop_result": stop_result,
-        }
-    except asyncio.TimeoutError:
-        print(f"🔴【API異常】等待 StopTransaction 超時")
-        return JSONResponse(
-            status_code=504,
-            content={"message": "等待充電樁停止回覆逾時 (StopTransaction timeout)"},
-        )
-    finally:
-        pending_stop_transactions.pop(str(transaction_id), None)
-
-
 from fastapi import Query
 from fastapi.responses import JSONResponse
 
@@ -13872,14 +14005,14 @@ async def monitor_balance_and_auto_stop():
                 # 找出所有進行中交易
                 cur.execute(
                     """
-                    SELECT t.charge_point_id, t.id_tag
+                    SELECT t.transaction_id, t.charge_point_id, t.id_tag
                     FROM transactions t
                     WHERE t.stop_timestamp IS NULL
                 """
                 )
                 active_tx = cur.fetchall()
 
-            for cp_id, id_tag in active_tx:
+            for transaction_id, cp_id, id_tag in active_tx:
                 # 查詢卡片餘額
                 with get_conn() as conn:
                     c2 = conn.cursor()
@@ -13899,7 +14032,17 @@ async def monitor_balance_and_auto_stop():
                     )
 
                     try:
-                        await stop_transaction_by_charge_point(cp_id)
+                        await request_transaction_stop(
+                            charge_point_id=cp_id,
+                            transaction_id=int(transaction_id),
+                            trigger="balance_zero",
+                            auto_stop_reason=AUTO_STOP_REASON_BALANCE_INSUFFICIENT,
+                            wait_for_stop=False,
+                            ack_timeout=30.0,
+                            stop_timeout=45.0,
+                            auto_stop_balance=float(balance),
+                            auto_stop_estimated_amount=float(balance),
+                        )
                     except Exception as e:
                         logger.error(
                             f"[STOP][TRIGGER_ERR] auto_stop failed "
