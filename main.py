@@ -45,6 +45,19 @@ def get_cp_call_lock(cp_id: str):
     return lock
 
 
+start_transaction_locks = {}
+
+
+def get_start_transaction_lock(cp_id: str):
+    """Return the single-process StartTransaction lock for one charge point."""
+    cp_key = _normalize_cp_id(str(cp_id))
+    lock = start_transaction_locks.get(cp_key)
+    if lock is None:
+        lock = asyncio.Lock()
+        start_transaction_locks[cp_key] = lock
+    return lock
+
+
 def is_cp_connection_alive(cp_id: str, cp_obj=None) -> bool:
     """
     檢查這支 CP 是否仍為目前有效連線
@@ -3491,11 +3504,97 @@ class ChargePoint(OcppChargePoint):
                 )
 
             # 2) 更新記憶體狀態
+            # A charger-reported Charging state is only trusted when exactly
+            # one started, non-stopped transaction exists for this CP. These
+            # dictionaries are backend/frontend state only; they do not drive
+            # the physical relay or the MSI LED.
+            active_tx_rows = []
+            if status == "Charging":
+                try:
+                    with get_conn() as active_conn:
+                        active_cur = active_conn.cursor()
+                        active_cur.execute(
+                            """
+                            SELECT transaction_id
+                            FROM transactions
+                            WHERE charge_point_id = ?
+                              AND start_timestamp IS NOT NULL
+                              AND stop_timestamp IS NULL
+                            ORDER BY transaction_id DESC
+                            LIMIT 2
+                            """,
+                            (cp_id,),
+                        )
+                        active_tx_rows = active_cur.fetchall()
+                except Exception as e:
+                    logging.exception(
+                        f"[STATUS][ACTIVE_TX_CHECK_ERR] cp_id={cp_id} | err={e}"
+                    )
+
+                if len(active_tx_rows) != 1:
+                    rejection_reason = (
+                        "no_active_transaction"
+                        if not active_tx_rows
+                        else "multiple_active_transactions"
+                    )
+                    previous_status = charging_point_status.get(cp_id, {}) or {}
+                    safe_status = str(previous_status.get("status") or "Available")
+                    if safe_status == "Charging":
+                        safe_status = "Available"
+
+                    charging_point_status[cp_id] = {
+                        **previous_status,
+                        "connector_id": connector_id,
+                        "status": safe_status,
+                        "raw_status": status,
+                        "raw_timestamp": status_ts_utc,
+                        "backend_state": "ChargingWithoutTransaction",
+                        "charging_authorized": False,
+                        "active_transaction_id": None,
+                        "error_code": error_code,
+                        "derived": True,
+                    }
+
+                    previous_live = live_status_cache.get(cp_id, {}) or {}
+                    safe_live_status = str(previous_live.get("status") or safe_status)
+                    if safe_live_status == "Charging":
+                        safe_live_status = safe_status
+
+                    live_status_cache[cp_id] = {
+                        **previous_live,
+                        "status": safe_live_status,
+                        "raw_status": status,
+                        "raw_timestamp": status_ts_utc,
+                        "backend_state": "ChargingWithoutTransaction",
+                        "charging_authorized": False,
+                        "active_transaction_id": None,
+                        "error_code": error_code,
+                        "derived": True,
+                        "updated_at": time.time(),
+                    }
+
+                    logging.warning(
+                        f"[STATUS][CHARGING_WITHOUT_ACTIVE_TX] "
+                        f"cp_id={cp_id} | connector_id={connector_id} | "
+                        f"raw_status={status} | safe_status={safe_status} | "
+                        f"rejection_reason={rejection_reason} | timestamp={status_ts_utc}"
+                    )
+                    return call_result.StatusNotificationPayload()
+
             prev_status = charging_point_status.get(cp_id, {}) or {}
             charging_point_status[cp_id] = {
                 **prev_status,
                 "connector_id": connector_id,
                 "status": status,
+                "raw_status": status,
+                "raw_timestamp": status_ts_utc,
+                "backend_state": "ActiveTransaction" if status == "Charging" else status,
+                "charging_authorized": True if status == "Charging" else None,
+                "active_transaction_id": (
+                    int(active_tx_rows[0][0])
+                    if status == "Charging" and len(active_tx_rows) == 1
+                    else None
+                ),
                 "timestamp": status_ts_utc,
                 "error_code": error_code,
                 "derived": False,
@@ -3506,6 +3605,15 @@ class ChargePoint(OcppChargePoint):
             live_status_cache[cp_id] = {
                 **prev_live,
                 "status": status,
+                "raw_status": status,
+                "raw_timestamp": status_ts_utc,
+                "backend_state": "ActiveTransaction" if status == "Charging" else status,
+                "charging_authorized": True if status == "Charging" else None,
+                "active_transaction_id": (
+                    int(active_tx_rows[0][0])
+                    if status == "Charging" and len(active_tx_rows) == 1
+                    else None
+                ),
                 "error_code": error_code,
                 "timestamp": prev_live.get("timestamp") or status_ts_utc,
                 "updated_at": time.time(),
@@ -3893,29 +4001,89 @@ class ChargePoint(OcppChargePoint):
                     tzinfo=timezone.utc
                 ).isoformat()
 
-            t_step = time.perf_counter()
-            with sqlite3.connect(DB_FILE, check_same_thread=False, timeout=15) as conn:
-                cursor = conn.cursor()
-                cursor.execute(
-                    """
-                    INSERT INTO transactions (
-                        charge_point_id,
-                        connector_id,
-                        id_tag,
-                        meter_start,
-                        start_timestamp
-                    ) VALUES (?, ?, ?, ?, ?)
-                    """,
+            # Serialize only the duplicate check and transaction INSERT for
+            # this CP. The lock is process-local and contains no OCPP call.
+            async with get_start_transaction_lock(self.id):
+                # Prevent two active transactions for the same charge point.
+                # An exact application-level resend receives the existing tx
+                # id; conflicting input receives the OCPP 1.6 ConcurrentTx
+                # status.
+                with get_conn() as active_conn:
+                    active_cur = active_conn.cursor()
+                    active_cur.execute(
+                        """
+                        SELECT transaction_id, connector_id, id_tag,
+                               meter_start, start_timestamp
+                        FROM transactions
+                        WHERE charge_point_id = ?
+                          AND start_timestamp IS NOT NULL
+                          AND stop_timestamp IS NULL
+                        ORDER BY transaction_id DESC
+                        LIMIT 1
+                        """,
+                        (self.id,),
+                    )
+                    existing_active_tx = active_cur.fetchone()
+
+                if existing_active_tx:
                     (
-                        self.id,
-                        connector_id,
-                        id_tag,
-                        int(meter_start),
-                        start_ts_to_save,
-                    ),
-                )
-                tx_id = cursor.lastrowid
-                conn.commit()
+                        existing_tx_id,
+                        existing_connector_id,
+                        existing_id_tag,
+                        existing_meter_start,
+                        existing_start_timestamp,
+                    ) = existing_active_tx
+                    is_exact_resend = (
+                        str(existing_id_tag or "") == str(id_tag or "")
+                        and int(existing_connector_id or 0) == int(connector_id or 0)
+                        and int(existing_meter_start or 0) == int(meter_start or 0)
+                        and str(existing_start_timestamp or "")
+                        == str(start_ts_to_save or "")
+                    )
+
+                    logging.warning(
+                        f"[START_TX][DUPLICATE_ACTIVE_TX] "
+                        f"cp_id={self.id} | existing_transaction_id={existing_tx_id} | "
+                        f"incoming_id_tag={id_tag} | incoming_meter_start={meter_start} | "
+                        f"incoming_timestamp={timestamp} | exact_resend={is_exact_resend}"
+                    )
+
+                    if is_exact_resend:
+                        return call_result.StartTransactionPayload(
+                            transaction_id=int(existing_tx_id),
+                            id_tag_info={"status": "Accepted"},
+                        )
+
+                    return call_result.StartTransactionPayload(
+                        transaction_id=0,
+                        id_tag_info={"status": "ConcurrentTx"},
+                    )
+
+                t_step = time.perf_counter()
+                with sqlite3.connect(
+                    DB_FILE, check_same_thread=False, timeout=15
+                ) as conn:
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        """
+                        INSERT INTO transactions (
+                            charge_point_id,
+                            connector_id,
+                            id_tag,
+                            meter_start,
+                            start_timestamp
+                        ) VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (
+                            self.id,
+                            connector_id,
+                            id_tag,
+                            int(meter_start),
+                            start_ts_to_save,
+                        ),
+                    )
+                    tx_id = cursor.lastrowid
+                    conn.commit()
 
             logging.warning(
                 f"[DEBUG][START_TX][STEP] "
@@ -4261,6 +4429,24 @@ class ChargePoint(OcppChargePoint):
                 settlement_committed = True
                 logger.error("[STOP][COMMIT] DB commit done")
 
+                # Remove only the in-memory Smart Charging state that is still
+                # bound to this completed transaction. Do not send an untested
+                # ClearChargingProfile/0A command to the physical charger.
+                limit_state = current_limit_state.get(cp_id)
+                if isinstance(limit_state, dict):
+                    try:
+                        limit_state_tx_id = int(limit_state.get("last_tx_id"))
+                    except (TypeError, ValueError):
+                        limit_state_tx_id = None
+
+                    if limit_state_tx_id == int(transaction_id):
+                        current_limit_state.pop(cp_id, None)
+                        logger.warning(
+                            f"[STOP][CLEAR_TX_CONTROL_STATE] "
+                            f"cp_id={cp_id} | tx_id={transaction_id} | "
+                            f"cleared=current_limit_state"
+                        )
+
                 # ==================================================
                 # LINE 階段 7：StopTransaction 完成後自動推播
                 # 放在 DB commit 後，確保交易、扣款、餘額已完成。
@@ -4503,6 +4689,174 @@ class ChargePoint(OcppChargePoint):
             if not isinstance(meter_value_list, list):
                 meter_value_list = [meter_value_list]
 
+            transaction_id_present = any(
+                key in kwargs
+                for key in ("transactionId", "transaction_id", "TransactionId")
+            )
+
+            meter_timestamps = [
+                pick(mv, "timestamp", "timeStamp", "Timestamp")
+                for mv in meter_value_list
+                if isinstance(mv, dict)
+            ]
+            default_energy_measurand = "Energy.Active.Import.Register"
+            meter_measurands = []
+            for mv in meter_value_list:
+                if not isinstance(mv, dict):
+                    continue
+                sampled_values = pick(
+                    mv,
+                    "sampledValue",
+                    "sampled_value",
+                    "SampledValue",
+                    default=[],
+                ) or []
+                if not isinstance(sampled_values, list):
+                    sampled_values = [sampled_values]
+                for sampled_value in sampled_values:
+                    if not isinstance(sampled_value, dict):
+                        continue
+                    raw_value = pick(sampled_value, "value", "Value")
+                    measurand = str(
+                        pick(
+                            sampled_value,
+                            "measurand",
+                            "Measurand",
+                            default="",
+                        )
+                        or ""
+                    ).strip()
+                    if not measurand:
+                        try:
+                            float(raw_value)
+                        except (TypeError, ValueError):
+                            continue
+                        measurand = default_energy_measurand
+                    if measurand:
+                        meter_measurands.append(measurand)
+
+            transactional_measurand_present = any(
+                measurand.startswith(
+                    (
+                        "Energy.Active.Import",
+                        "Power.Active.Import",
+                        "Current.Import",
+                    )
+                )
+                for measurand in meter_measurands
+            )
+
+            if not transaction_id_present:
+                # Connector 0 and non-transactional batches are deliberately
+                # ignored: the current schema cannot safely persist CP-level
+                # telemetry without an empty/fake transaction id.
+                if connector_id <= 0 or not transactional_measurand_present:
+                    logging.warning(
+                        f"[MV][SKIPPED_NON_TRANSACTION_TELEMETRY] "
+                        f"cp_id={cp_id} | connector_id={connector_id} | "
+                        f"measurands={meter_measurands} | timestamp={meter_timestamps}"
+                    )
+                    return call_result.MeterValuesPayload()
+
+                try:
+                    with get_conn() as active_conn:
+                        active_cur = active_conn.cursor()
+                        active_cur.execute(
+                            """
+                            SELECT transaction_id
+                            FROM transactions
+                            WHERE charge_point_id = ?
+                              AND start_timestamp IS NOT NULL
+                              AND stop_timestamp IS NULL
+                            ORDER BY transaction_id DESC
+                            LIMIT 2
+                            """,
+                            (cp_id,),
+                        )
+                        active_tx_rows = active_cur.fetchall()
+                except Exception as e:
+                    logging.exception(
+                        f"[MV][MISSING_TX_ID_LOOKUP_FAILED] "
+                        f"cp_id={cp_id} | connector_id={connector_id} | "
+                        f"timestamp={meter_timestamps} | err={e}"
+                    )
+                    return call_result.MeterValuesPayload()
+
+                if not active_tx_rows:
+                    logging.warning(
+                        f"[MV][REJECTED_MISSING_TX_ID_NO_ACTIVE_TX] "
+                        f"cp_id={cp_id} | connector_id={connector_id} | "
+                        f"timestamp={meter_timestamps}"
+                    )
+                    return call_result.MeterValuesPayload()
+
+                if len(active_tx_rows) != 1:
+                    logging.warning(
+                        f"[MV][REJECTED_MISSING_TX_ID_MULTIPLE_ACTIVE_TX] "
+                        f"cp_id={cp_id} | connector_id={connector_id} | "
+                        f"active_transaction_ids="
+                        f"{[int(row[0]) for row in active_tx_rows]} | "
+                        f"timestamp={meter_timestamps}"
+                    )
+                    return call_result.MeterValuesPayload()
+
+                transaction_id = int(active_tx_rows[0][0])
+                logging.warning(
+                    f"[MV][RESOLVED_MISSING_TX_ID] "
+                    f"cp_id={cp_id} | connector_id={connector_id} | "
+                    f"resolved_transaction_id={transaction_id} | "
+                    f"timestamp={meter_timestamps}"
+                )
+
+            if transaction_id_present:
+                rejection_reason = None
+                tx_row = None
+
+                if transaction_id in (None, ""):
+                    rejection_reason = "missing_transaction_id"
+                else:
+                    try:
+                        with get_conn() as tx_conn:
+                            tx_cur = tx_conn.cursor()
+                            tx_cur.execute(
+                                """
+                                SELECT transaction_id, charge_point_id,
+                                       start_timestamp, stop_timestamp
+                                FROM transactions
+                                WHERE transaction_id = ?
+                                LIMIT 1
+                                """,
+                                (transaction_id,),
+                            )
+                            tx_row = tx_cur.fetchone()
+                    except Exception as e:
+                        rejection_reason = "transaction_lookup_failed"
+                        logging.exception(
+                            f"[MV][ACTIVE_TX_CHECK_ERR] cp_id={cp_id} | "
+                            f"transaction_id={transaction_id} | err={e}"
+                        )
+
+                    if rejection_reason is None:
+                        if not tx_row:
+                            rejection_reason = "transaction_not_found"
+                        elif _normalize_cp_id(str(tx_row[1])) != _normalize_cp_id(str(cp_id)):
+                            rejection_reason = "charge_point_mismatch"
+                        elif tx_row[2] is None:
+                            rejection_reason = "transaction_not_started"
+                        elif tx_row[3] is not None:
+                            rejection_reason = "transaction_already_stopped"
+
+                if rejection_reason is not None:
+                    logging.warning(
+                        f"[MV][REJECTED_INACTIVE_TX] "
+                        f"cp_id={cp_id} | transaction_id={transaction_id} | "
+                        f"rejection_reason={rejection_reason} | "
+                        f"meter_value={meter_value_list} | timestamp={meter_timestamps}"
+                    )
+                    return call_result.MeterValuesPayload()
+
+                transaction_id = int(tx_row[0])
+
             # === 本批次即時量測（只取「最新 timestamp 那一組」）===
             batch_voltage = None
             batch_current = None
@@ -4560,8 +4914,11 @@ class ChargePoint(OcppChargePoint):
                         unit = pick(sv, "unit", "Unit", default="")
                         phase = pick(sv, "phase", "Phase")
 
-                        if raw_val is None or not meas:
+                        if raw_val is None:
                             continue
+
+                        if not str(meas or "").strip():
+                            meas = default_energy_measurand
 
                         try:
                             val = float(raw_val)
