@@ -1,3 +1,179 @@
+from fastapi import Body, FastAPI, HTTPException
+
+# The household routes are declared early to keep this large legacy module's
+# additions isolated.  The main FastAPI initialization below reuses this app.
+app = FastAPI()
+
+
+def _household_http_error(exc: Exception) -> HTTPException:
+    message = str(exc)
+    status = 404 if "not found" in message else 409 if "already" in message else 400
+    return HTTPException(status_code=status, detail=message)
+
+
+@app.get("/api/household-accounts")
+def api_list_household_accounts():
+    with household_connect(DB_FILE) as account_conn:
+        accounts = list_household_accounts(account_conn)
+        for account in accounts:
+            account["cards"] = list_account_cards(account_conn, account["account_id"])
+    return accounts
+
+
+@app.post("/api/household-accounts")
+def api_create_household_account(data: dict = Body(...)):
+    with household_connect(DB_FILE) as account_conn:
+        try:
+            return create_household_account(
+                account_conn,
+                data.get("account_code") or data.get("accountCode") or "",
+                data.get("account_name") or data.get("accountName") or "",
+                data.get("balance", 0),
+                data.get("status", "active"),
+            )
+        except HouseholdAccountError as exc:
+            raise _household_http_error(exc) from exc
+
+
+@app.get("/api/household-accounts/{account_id}")
+def api_get_household_account(account_id: int):
+    with household_connect(DB_FILE) as account_conn:
+        account = get_account_by_id(account_conn, account_id)
+        if not account:
+            raise HTTPException(status_code=404, detail="account not found")
+        account["cards"] = list_account_cards(account_conn, account_id)
+        return account
+
+
+@app.put("/api/household-accounts/{account_id}")
+def api_update_household_account(account_id: int, data: dict = Body(...)):
+    fields = {
+        "account_code": data.get("account_code", data.get("accountCode")),
+        "account_name": data.get("account_name", data.get("accountName")),
+        "status": data.get("status"),
+    }
+    fields = {key: value for key, value in fields.items() if value is not None}
+    with household_connect(DB_FILE) as account_conn:
+        try:
+            return update_household_account(account_conn, account_id, **fields)
+        except HouseholdAccountError as exc:
+            raise _household_http_error(exc) from exc
+
+
+@app.post("/api/household-accounts/{account_id}/topup")
+def api_topup_household_account(account_id: int, data: dict = Body(...)):
+    with household_connect(DB_FILE) as account_conn:
+        try:
+            return topup_household_account(account_conn, account_id, data.get("amount"))
+        except HouseholdAccountError as exc:
+            raise _household_http_error(exc) from exc
+
+
+@app.get("/api/household-accounts/{account_id}/cards")
+def api_list_account_cards(account_id: int):
+    with household_connect(DB_FILE) as account_conn:
+        if not get_account_by_id(account_conn, account_id):
+            raise HTTPException(status_code=404, detail="account not found")
+        return list_account_cards(account_conn, account_id)
+
+
+@app.post("/api/household-accounts/{account_id}/cards")
+def api_add_account_card(account_id: int, data: dict = Body(...)):
+    card_id = data.get("card_id") or data.get("cardId") or data.get("idTag") or ""
+    with household_connect(DB_FILE) as account_conn:
+        try:
+            result = bind_card_to_account(
+                account_conn,
+                account_id,
+                card_id,
+                data.get("card_holder_name", data.get("cardHolderName")),
+                data.get("relationship"),
+                data.get("status", "active"),
+                data.get("valid_until", data.get("validUntil")),
+            )
+            for cp_id in data.get("charge_point_ids", data.get("chargePointIds", [])) or []:
+                if not account_conn.execute(
+                    "SELECT 1 FROM card_whitelist WHERE card_id=? AND charge_point_id=?",
+                    (card_id, cp_id),
+                ).fetchone():
+                    account_conn.execute(
+                        "INSERT INTO card_whitelist(card_id,charge_point_id) VALUES (?,?)",
+                        (card_id, cp_id),
+                    )
+            account_conn.commit()
+            return result
+        except HouseholdAccountError as exc:
+            raise _household_http_error(exc) from exc
+
+
+@app.put("/api/account-cards/{card_id}")
+def api_update_account_card(card_id: str, data: dict = Body(...)):
+    fields = {
+        "card_holder_name": data.get("card_holder_name", data.get("cardHolderName")),
+        "relationship": data.get("relationship"),
+        "status": data.get("status"),
+    }
+    fields = {key: value for key, value in fields.items() if value is not None}
+    with household_connect(DB_FILE) as account_conn:
+        try:
+            return update_account_card(account_conn, card_id, **fields)
+        except HouseholdAccountError as exc:
+            raise _household_http_error(exc) from exc
+
+
+@app.delete("/api/account-cards/{card_id}")
+def api_disable_account_card(card_id: str):
+    with household_connect(DB_FILE) as account_conn:
+        try:
+            return disable_account_card(account_conn, card_id)
+        except HouseholdAccountError as exc:
+            raise _household_http_error(exc) from exc
+
+
+@app.post("/api/card-enrollments")
+def api_create_card_enrollment(data: dict = Body(...)):
+    with household_connect(DB_FILE) as account_conn:
+        try:
+            return create_enrollment_session(
+                account_conn,
+                int(data.get("account_id", data.get("accountId"))),
+                data.get("charge_point_id", data.get("chargePointId", "")),
+                data.get("requested_by", data.get("requestedBy")),
+                data.get("card_holder_name", data.get("cardHolderName")),
+                data.get("relationship"),
+                int(data.get("duration_seconds", data.get("durationSeconds", 120))),
+            )
+        except (HouseholdAccountError, TypeError, ValueError) as exc:
+            raise _household_http_error(exc) from exc
+
+
+@app.get("/api/card-enrollments/{enrollment_id}")
+def api_get_card_enrollment(enrollment_id: str):
+    with household_connect(DB_FILE) as account_conn:
+        enrollment = get_enrollment_session(account_conn, enrollment_id)
+    if not enrollment:
+        raise HTTPException(status_code=404, detail="enrollment not found")
+    return enrollment
+
+
+@app.post("/api/card-enrollments/{enrollment_id}/confirm")
+def api_confirm_card_enrollment(enrollment_id: str):
+    with household_connect(DB_FILE) as account_conn:
+        try:
+            return confirm_enrollment(account_conn, enrollment_id)
+        except HouseholdAccountError as exc:
+            raise _household_http_error(exc) from exc
+
+
+@app.post("/api/card-enrollments/{enrollment_id}/cancel")
+def api_cancel_card_enrollment(enrollment_id: str):
+    with household_connect(DB_FILE) as account_conn:
+        try:
+            return cancel_enrollment(account_conn, enrollment_id)
+        except HouseholdAccountError as exc:
+            raise _household_http_error(exc) from exc
+
+
 import asyncio
 
 from urllib.parse import unquote  # ← 新增
@@ -1089,7 +1265,8 @@ from zoneinfo import ZoneInfo
 TZ_TAIPEI = ZoneInfo("Asia/Taipei")
 
 
-app = FastAPI()
+if "app" not in globals():
+    app = FastAPI()
 
 
 # === WebSocket 連線驗證設定（可選）===
@@ -1247,12 +1424,35 @@ def _debug_card_state(id_tag: str, cp_id: str | None = None):
         rows = cur.fetchall()
         whitelist = [r[0] for r in rows] if rows else []
 
+    with household_connect(DB_FILE) as account_conn:
+        account_card = resolve_account_by_card(account_conn, id_tag)
+        active_enrollment = account_conn.execute(
+            """
+            SELECT enrollment_id, account_id, charge_point_id, status,
+                   detected_id_tag, expires_at
+            FROM card_enrollment_sessions
+            WHERE status IN ('waiting','detected') AND expires_at > ?
+              AND (? IS NULL OR charge_point_id = ?)
+              AND (detected_id_tag IS NULL OR detected_id_tag = ?)
+            ORDER BY created_at DESC LIMIT 1
+            """,
+            (datetime.utcnow().replace(tzinfo=timezone.utc).isoformat(), cp_norm, cp_norm, id_tag),
+        ).fetchone()
+
     return {
         "idTag": id_tag,
         "cp_id": cp_norm,
         "id_tags": id_tag_info,
         "cards": card_info,
         "card_whitelist": whitelist,
+        "account_cards": account_card,
+        "household_account": account_card,
+        "account_id": account_card.get("account_id") if account_card else None,
+        "account_code": account_card.get("account_code") if account_card else None,
+        "account_status": account_card.get("account_status") if account_card else None,
+        "card_status": account_card.get("card_status") if account_card else None,
+        "shared_balance": account_card.get("balance") if account_card else None,
+        "active_enrollment": dict(active_enrollment) if active_enrollment else None,
         "cp_allowed": (cp_norm in whitelist) if cp_norm else None,
     }
 
@@ -1314,8 +1514,18 @@ def debug_start_transaction_check(
 
         # ========== Step 2：cards / balance ==========
         cur.execute(
-            "SELECT balance FROM cards WHERE card_id = ?",
-            (id_tag,),
+            """
+            SELECT ha.balance, ac.account_id, ha.account_code,
+                   ha.status, ac.status,
+                   EXISTS(
+                       SELECT 1 FROM card_whitelist cw
+                       WHERE cw.card_id=ac.card_id AND cw.charge_point_id=?
+                   )
+            FROM account_cards ac
+            JOIN household_accounts ha ON ha.account_id=ac.account_id
+            WHERE ac.card_id=?
+            """,
+            (cp_norm, id_tag),
         )
         row = cur.fetchone()
         if not row:
@@ -1330,6 +1540,22 @@ def debug_start_transaction_check(
             return out
 
         balance = float(row[0] or 0)
+        account_id, account_code, account_status, card_status, cp_allowed = row[1:]
+        if account_status != "active" or card_status != "active" or not cp_allowed:
+            out = {
+                "cp_id": cp_norm,
+                "idTag": id_tag,
+                "decision": "Blocked",
+                "reason": "account_card_or_whitelist_inactive",
+                "account_id": account_id,
+                "account_code": account_code,
+                "account_status": account_status,
+                "card_status": card_status,
+                "shared_balance": balance,
+                "cp_allowed": bool(cp_allowed),
+            }
+            logging.warning(f"[DEBUG][START_TX_CHECK] {out}")
+            return out
         if balance <= 0:
             out = {
                 "cp_id": cp_norm,
@@ -1859,8 +2085,36 @@ async def get_status(cp_id: str):
 # ===============================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 from db_config import get_database_path
+from household_account_service import (
+    HouseholdAccountError,
+    bind_card_to_account,
+    cancel_enrollment,
+    capture_unknown_card,
+    confirm_enrollment,
+    connect as household_connect,
+    create_enrollment_session,
+    create_household_account,
+    disable_account_card,
+    ensure_schema as ensure_household_schema,
+    ensure_legacy_account_for_card,
+    get_account_by_id,
+    get_enrollment_session,
+    list_account_cards,
+    list_household_accounts,
+    resolve_account_by_card,
+    topup_household_account,
+    update_account_card,
+    update_household_account,
+)
 
 DB_FILE = get_database_path()
+
+SHARED_BALANCE_BY_CARD_SQL = """
+    SELECT ha.balance
+    FROM account_cards ac
+    JOIN household_accounts ha ON ha.account_id = ac.account_id
+    WHERE ac.card_id = ?
+"""
 
 
 def get_conn(timeout_seconds: float = 15, busy_timeout_ms: int = 15000):
@@ -2969,6 +3223,12 @@ cursor.execute("CREATE INDEX IF NOT EXISTS idx_meter_values_cp_ts ON meter_value
 cursor.execute("CREATE INDEX IF NOT EXISTS idx_transactions_cp_stop ON transactions(charge_point_id, stop_timestamp);")
 conn.commit()
 
+# Shared household balances and RFID enrollment.  This creates only additive,
+# idempotent schema; legacy balance migration remains an explicit backed-up
+# operation in migrate_household_accounts.py.
+with household_connect(DB_FILE) as _household_schema_conn:
+    ensure_household_schema(_household_schema_conn)
+
 
 cursor.execute(
     """
@@ -3325,7 +3585,7 @@ async def _auto_stop_if_balance_insufficient(
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT id_tag
+            SELECT id_tag, account_id
             FROM transactions
             WHERE transaction_id = ?
         """,
@@ -3335,9 +3595,12 @@ async def _auto_stop_if_balance_insufficient(
         if not row:
             return
 
-        id_tag = row[0]
+        id_tag, transaction_account_id = row
 
-        cur.execute("SELECT balance FROM cards WHERE card_id = ?", (id_tag,))
+        cur.execute(
+            "SELECT balance FROM household_accounts WHERE account_id=?",
+            (transaction_account_id,),
+        )
         card = cur.fetchone()
 
     if not card:
@@ -3732,9 +3995,26 @@ class ChargePoint(OcppChargePoint):
             if not row:
                 status = "Invalid"
                 status_db = None
+                # Every unknown Authorize is audited.  A matching active
+                # enrollment may capture the card, but this first tap remains
+                # Invalid until an administrator confirms it.
+                with household_connect(DB_FILE) as enrollment_conn:
+                    capture_unknown_card(enrollment_conn, id_tag, cp_id)
             else:
                 status_db = row[0]
-                status = "Accepted" if status_db == "Accepted" else "Blocked"
+                with household_connect(DB_FILE) as account_conn:
+                    account_card = (
+                        resolve_account_by_card(account_conn, id_tag)
+                        or ensure_legacy_account_for_card(account_conn, id_tag)
+                    )
+                status = (
+                    "Accepted"
+                    if status_db == "Accepted"
+                    and account_card
+                    and account_card["card_status"] == "active"
+                    and account_card["account_status"] == "active"
+                    else "Blocked"
+                )
 
             total_ms = _ms_since(t0)
 
@@ -3891,9 +4171,25 @@ class ChargePoint(OcppChargePoint):
             # [3] 餘額檢查
             # =================================================
             t_step = time.perf_counter()
-            with sqlite3.connect(DB_FILE, check_same_thread=False, timeout=15) as conn:
-                cursor = conn.cursor()
-                cursor.execute("SELECT balance FROM cards WHERE card_id = ?", (id_tag,))
+            with household_connect(DB_FILE) as legacy_conn:
+                ensure_legacy_account_for_card(legacy_conn, id_tag)
+            with get_conn() as account_conn:
+                cursor = account_conn.cursor()
+                cursor.execute(
+                    """
+                    SELECT ac.account_id, ha.account_code, ac.card_holder_name,
+                           ac.status, ha.status, ha.balance,
+                           EXISTS(
+                               SELECT 1 FROM card_whitelist cw
+                               WHERE cw.card_id = ac.card_id
+                                 AND cw.charge_point_id = ?
+                           ) AS cp_allowed
+                    FROM account_cards ac
+                    JOIN household_accounts ha ON ha.account_id = ac.account_id
+                    WHERE ac.card_id = ?
+                    """,
+                    (self.id, id_tag),
+                )
                 card = cursor.fetchone()
 
             logging.warning(
@@ -3911,7 +4207,32 @@ class ChargePoint(OcppChargePoint):
                     transaction_id=0, id_tag_info={"status": "Invalid"}
                 )
 
-            balance = float(card[0] or 0)
+            (
+                account_id,
+                account_code,
+                card_holder_name,
+                card_status,
+                account_status,
+                shared_balance,
+                cp_allowed,
+            ) = card
+            if card_status != "active" or account_status != "active":
+                logging.warning(
+                    f"[START_TX][BLOCKED] idTag={id_tag} | card_status={card_status} | "
+                    f"account_status={account_status}"
+                )
+                return call_result.StartTransactionPayload(
+                    transaction_id=0, id_tag_info={"status": "Blocked"}
+                )
+            if not cp_allowed:
+                logging.warning(
+                    f"[START_TX][BLOCKED] idTag={id_tag} | cp_id={self.id} | reason=not_whitelisted"
+                )
+                return call_result.StartTransactionPayload(
+                    transaction_id=0, id_tag_info={"status": "Blocked"}
+                )
+
+            balance = float(shared_balance or 0)
             if balance <= 0:
                 logging.warning(
                     f"🔴 StartTransaction Blocked：idTag={id_tag} | balance={balance}"
@@ -4071,8 +4392,11 @@ class ChargePoint(OcppChargePoint):
                             connector_id,
                             id_tag,
                             meter_start,
-                            start_timestamp
-                        ) VALUES (?, ?, ?, ?, ?)
+                            start_timestamp,
+                            account_id,
+                            account_code,
+                            card_holder_name
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             self.id,
@@ -4080,6 +4404,9 @@ class ChargePoint(OcppChargePoint):
                             id_tag,
                             int(meter_start),
                             start_ts_to_save,
+                            account_id,
+                            account_code,
+                            card_holder_name,
                         ),
                     )
                     tx_id = cursor.lastrowid
@@ -4283,7 +4610,7 @@ class ChargePoint(OcppChargePoint):
                 # ==================================================
                 _cur.execute(
                     """
-                    SELECT id_tag, meter_start
+                    SELECT id_tag, meter_start, account_id
                     FROM transactions
                     WHERE transaction_id = ?
                     """,
@@ -4296,7 +4623,7 @@ class ChargePoint(OcppChargePoint):
                         f"[STOP][ERR] transaction not found | tx_id={transaction_id}"
                     )
                 else:
-                    id_tag, meter_start = row
+                    id_tag, meter_start, transaction_account_id = row
 
                     try:
                         used_kwh = max(
@@ -4350,14 +4677,40 @@ class ChargePoint(OcppChargePoint):
                     balance_before = None
                     balance_after = None
 
+                    if transaction_account_id is None:
+                        previous_row_factory = _conn.row_factory
+                        _conn.row_factory = sqlite3.Row
+                        legacy_account = ensure_legacy_account_for_card(
+                            _conn, id_tag, commit=False
+                        )
+                        _conn.row_factory = previous_row_factory
+                        if legacy_account:
+                            transaction_account_id = legacy_account["account_id"]
+                            _cur.execute(
+                                """
+                                UPDATE transactions
+                                SET account_id=?, account_code=?, card_holder_name=?
+                                WHERE transaction_id=?
+                                """,
+                                (
+                                    legacy_account["account_id"],
+                                    legacy_account["account_code"],
+                                    legacy_account["card_holder_name"],
+                                    transaction_id,
+                                ),
+                            )
+
                     _cur.execute(
-                        "SELECT balance FROM cards WHERE card_id = ?",
-                        (id_tag,),
+                        "SELECT balance FROM household_accounts WHERE account_id = ?",
+                        (transaction_account_id,),
                     )
                     card = _cur.fetchone()
 
                     if not card:
-                        logger.error(f"[STOP][ERR] card not found | card_id={id_tag}")
+                        logger.error(
+                            f"[STOP][ERR] household account not found | "
+                            f"account_id={transaction_account_id} | card_id={id_tag}"
+                        )
                     else:
                         balance_before = _money_float(card[0] or 0)
 
@@ -4373,8 +4726,39 @@ class ChargePoint(OcppChargePoint):
                         )
 
                         _cur.execute(
-                            "UPDATE cards SET balance = ? WHERE card_id = ?",
-                            (balance_after, id_tag),
+                            """
+                            UPDATE household_accounts
+                            SET balance = ?, updated_at = ?
+                            WHERE account_id = ?
+                            """,
+                            (balance_after, stop_ts, transaction_account_id),
+                        )
+                        # Compatibility shadow for a lazily adopted, single
+                        # legacy card only.  Shared/multi-card accounts are
+                        # never mirrored; household_accounts remains the
+                        # authorization and accounting source of truth.
+                        _cur.execute(
+                            """
+                            UPDATE cards
+                            SET balance = ?
+                            WHERE card_id = ?
+                              AND EXISTS (
+                                  SELECT 1
+                                  FROM household_accounts ha
+                                  WHERE ha.account_id = ?
+                                    AND ha.account_code LIKE 'LEGACY-%'
+                              )
+                              AND 1 = (
+                                  SELECT COUNT(*) FROM account_cards
+                                  WHERE account_id = ?
+                              )
+                            """,
+                            (
+                                balance_after,
+                                id_tag,
+                                transaction_account_id,
+                                transaction_account_id,
+                            ),
                         )
 
                         # 計算本次社區總盈餘
@@ -4393,7 +4777,7 @@ class ChargePoint(OcppChargePoint):
                         )
 
                         logger.error(
-                            f"[STOP][UPDATE] card_id={id_tag} "
+                            f"[STOP][UPDATE] account_id={transaction_account_id} | card_id={id_tag} "
                             f"| balance_before={balance_before} "
                             f"| balance_after={balance_after} "
                             f"| surplus={surplus_amount} "
@@ -6110,7 +6494,6 @@ def get_current_tx_summary_by_cp(charge_point_id: str):
         row = cur.fetchone()
         if not row:
             return {"found": False}
-
         tx_id, id_tag, start_ts, stop_ts, meter_start, meter_stop = row
 
         # 先抓 payments 總額（若交易已正式結帳可直接使用）
@@ -7681,12 +8064,18 @@ async def delete_card(id_tag: str):
 # 新增獨立的卡片餘額查詢 API（修正縮排）
 @app.get("/api/cards/{id_tag}/balance")
 def get_card_balance(id_tag: str):
-    cursor = conn.cursor()
-    cursor.execute("SELECT balance FROM cards WHERE card_id = ?", (id_tag,))
-    row = cursor.fetchone()
-    if not row:
+    with household_connect(DB_FILE) as account_conn:
+        row = resolve_account_by_card(account_conn, id_tag)
+    if row is None:
         return {"balance": 0, "found": False}
-    return {"balance": row[0], "found": True}
+    return {
+        "card_id": id_tag,
+        "account_id": row["account_id"],
+        "account_code": row["account_code"],
+        "account_name": row["account_name"],
+        "balance": row["balance"],
+        "found": True,
+    }
 
 
 @app.get("/api/charge-points/{charge_point_id}/status")
@@ -7793,23 +8182,25 @@ def get_transaction_summary(transaction_id: str):
         row = cur.fetchone()
         if not row:
             return {"found": False}
+        id_tag, total_amount = row
 
         t_step = time.perf_counter()
         with get_conn() as _c:
             cur = _c.cursor()
-            cur.execute("SELECT balance FROM cards WHERE card_id = ?", (id_tag,))
+            cur.execute(SHARED_BALANCE_BY_CARD_SQL, (id_tag,))
             card_row = cur.fetchone()
+        balance = float(card_row[0] or 0) if card_row else 0.0
 
         logging.warning(
             f"[DEBUG][START_TX][STEP] "
-            f"cp_id={self.id} | step=card_balance_lookup | ms={_ms_since(t_step)}"
+            f"transaction_id={transaction_id} | step=shared_balance_lookup | ms={_ms_since(t_step)}"
         )
 
         return {
             "found": True,
             "transaction_id": transaction_id,
             "id_tag": id_tag,
-            "total_amount": round(total_amount, 2),
+            "total_amount": round(float(total_amount or 0), 2),
             "balance": round(balance, 2),
         }
 
@@ -7955,13 +8346,19 @@ async def get_transactions(
                 WHERE p.transaction_id = t.transaction_id
                 ORDER BY p.id DESC
                 LIMIT 1
-            ) AS total_amount
+            ) AS total_amount,
+            t.account_id,
+            t.account_code,
+            t.card_holder_name,
+            ha.account_name
         FROM transactions t
         LEFT JOIN users u
             ON UPPER(TRIM(u.id_tag)) = UPPER(TRIM(t.id_tag))
             OR UPPER(TRIM(u.card_number)) = UPPER(TRIM(t.id_tag))
         LEFT JOIN card_owners co
             ON UPPER(TRIM(co.card_id)) = UPPER(TRIM(t.id_tag))
+        LEFT JOIN household_accounts ha
+            ON ha.account_id = t.account_id
         WHERE 1=1
     """
     params = []
@@ -8022,6 +8419,10 @@ async def get_transactions(
             department,
             card_number,
             total_amount,
+            account_id,
+            account_code,
+            card_holder_name,
+            account_name,
         ) = row
 
         energy_kwh = None
@@ -8061,6 +8462,10 @@ async def get_transactions(
                 "cardId": card_number or id_tag,
                 "idTag": id_tag,
                 "cardNumber": card_number or id_tag,
+                "accountId": account_id,
+                "accountCode": account_code,
+                "accountName": account_name,
+                "cardHolderName": card_holder_name or resident_name,
 
                 "department": department or "--",
                 "householdDisplay": household_display,
@@ -8170,7 +8575,8 @@ def compute_transaction_cost(transaction_id: int):
                 stop_timestamp,
                 reason,
                 balance_before,
-                balance_after
+                balance_after,
+                account_id
             FROM transactions
             WHERE transaction_id = ?
             """,
@@ -8193,6 +8599,7 @@ def compute_transaction_cost(transaction_id: int):
             reason,
             balance_before,
             balance_after,
+            account_id,
         ) = tx
 
         cur.execute(
@@ -8233,15 +8640,15 @@ def compute_transaction_cost(transaction_id: int):
             cur.execute(
                 """
                 SELECT balance
-                FROM cards
-                WHERE card_id = ?
+                FROM household_accounts
+                WHERE account_id = ?
                 """,
-                (id_tag,),
+                (account_id,),
             )
-            card_row = cur.fetchone()
+            account_row = cur.fetchone()
             remaining_balance = (
-                round(float(card_row[0]), 2)
-                if card_row and card_row[0] is not None
+                round(float(account_row[0]), 2)
+                if account_row and account_row[0] is not None
                 else None
             )
 
@@ -8552,14 +8959,17 @@ def build_charge_completed_line_message(transaction_id: int) -> dict:
                 co.name AS card_owner_name,
                 u.name AS user_name,
                 u.card_number,
-                c.balance AS current_card_balance
+                ha.balance AS current_account_balance,
+                t.account_code,
+                ha.account_name,
+                t.card_holder_name
             FROM transactions t
             LEFT JOIN card_owners co
                 ON co.card_id = t.id_tag
             LEFT JOIN users u
                 ON u.id_tag = t.id_tag
-            LEFT JOIN cards c
-                ON c.card_id = t.id_tag
+            LEFT JOIN household_accounts ha
+                ON ha.account_id = t.account_id
             WHERE t.transaction_id = ?
             """,
             (tx_id_param,),
@@ -8584,10 +8994,13 @@ def build_charge_completed_line_message(transaction_id: int) -> dict:
         card_owner_name,
         user_name,
         card_number,
-        current_card_balance,
+        current_account_balance,
+        account_code,
+        account_name,
+        transaction_card_holder_name,
     ) = row
 
-    resident_name = card_owner_name or user_name or "--"
+    resident_name = transaction_card_holder_name or card_owner_name or user_name or "--"
     display_card = id_tag or card_number or "--"
     is_completed = bool(stop_timestamp)
 
@@ -8626,7 +9039,7 @@ def build_charge_completed_line_message(transaction_id: int) -> dict:
         balance_after_value = balance_after
 
     if balance_after_value is None:
-        balance_after_value = current_card_balance
+        balance_after_value = current_account_balance
 
     duration_text = _build_line_duration_text(start_timestamp, stop_timestamp)
 
@@ -8642,6 +9055,9 @@ def build_charge_completed_line_message(transaction_id: int) -> dict:
 
     message_lines.extend(
         [
+            f"住戶帳戶：{account_name or account_code or '--'}",
+            f"持卡人：{resident_name}",
+            f"實際卡號：{display_card}",
             f"住戶：{resident_name}",
             f"卡號：{display_card}",
             f"充電樁：{charge_point_id or '--'}",
@@ -8681,6 +9097,9 @@ def build_charge_completed_line_message(transaction_id: int) -> dict:
         "message": message,
         "data": {
             "residentName": resident_name,
+            "accountCode": account_code,
+            "accountName": account_name,
+            "cardHolderName": resident_name,
             "cardId": display_card,
             "idTag": id_tag,
             "chargePointId": charge_point_id,
@@ -9221,14 +9640,14 @@ def build_low_balance_line_message(transaction_id: int) -> dict:
                 co.name AS card_owner_name,
                 u.name AS user_name,
                 u.card_number,
-                c.balance AS current_card_balance
+                ha.balance AS current_account_balance
             FROM transactions t
             LEFT JOIN card_owners co
                 ON co.card_id = t.id_tag
             LEFT JOIN users u
                 ON u.id_tag = t.id_tag
-            LEFT JOIN cards c
-                ON c.card_id = t.id_tag
+            LEFT JOIN household_accounts ha
+                ON ha.account_id = t.account_id
             WHERE t.transaction_id = ?
             """,
             (tx_id_param,),
@@ -9247,7 +9666,7 @@ def build_low_balance_line_message(transaction_id: int) -> dict:
         card_owner_name,
         user_name,
         card_number,
-        current_card_balance,
+        current_account_balance,
     ) = row
 
     resident_name = card_owner_name or user_name or "--"
@@ -9255,7 +9674,7 @@ def build_low_balance_line_message(transaction_id: int) -> dict:
 
     balance_after_value = balance_after
     if balance_after_value is None:
-        balance_after_value = current_card_balance
+        balance_after_value = current_account_balance
 
     balance_after_text = _format_line_amount(balance_after_value)
 
@@ -9672,14 +10091,14 @@ def build_auto_stop_balance_insufficient_line_message(transaction_id: int) -> di
                 co.name AS card_owner_name,
                 u.name AS user_name,
                 u.card_number,
-                c.balance AS current_card_balance
+                ha.balance AS current_account_balance
             FROM transactions t
             LEFT JOIN card_owners co
                 ON co.card_id = t.id_tag
             LEFT JOIN users u
                 ON u.id_tag = t.id_tag
-            LEFT JOIN cards c
-                ON c.card_id = t.id_tag
+            LEFT JOIN household_accounts ha
+                ON ha.account_id = t.account_id
             WHERE t.transaction_id = ?
             """,
             (tx_id_param,),
@@ -9703,7 +10122,7 @@ def build_auto_stop_balance_insufficient_line_message(transaction_id: int) -> di
         card_owner_name,
         user_name,
         card_number,
-        current_card_balance,
+        current_account_balance,
     ) = row
 
     if auto_stop_reason != AUTO_STOP_REASON_BALANCE_INSUFFICIENT:
@@ -9726,7 +10145,7 @@ def build_auto_stop_balance_insufficient_line_message(transaction_id: int) -> di
 
     final_balance_value = balance_after
     if final_balance_value is None:
-        final_balance_value = current_card_balance
+        final_balance_value = current_account_balance
 
     message_lines = [
         "餘額不足自動停充通知",
@@ -11006,10 +11425,11 @@ async def test_line_messaging(payload: dict = Body(...)):
                     lb.display_name,
                     lb.enabled,
                     co.name AS resident_name,
-                    c.balance
+                    ha.balance
                 FROM line_bindings lb
                 LEFT JOIN card_owners co ON co.card_id = lb.id_tag
-                LEFT JOIN cards c ON c.card_id = lb.id_tag
+                LEFT JOIN account_cards ac ON ac.card_id = lb.id_tag
+                LEFT JOIN household_accounts ha ON ha.account_id = ac.account_id
                 WHERE lb.id_tag IN ({placeholders})
                 """,
                 targets,
@@ -11387,10 +11807,11 @@ def bind_line_user_to_id_tag(
                     lb.created_at,
                     lb.updated_at,
                     co.name AS resident_name,
-                    c.balance
+                    ha.balance
                 FROM line_bindings lb
                 LEFT JOIN card_owners co ON co.card_id = lb.id_tag
-                LEFT JOIN cards c ON c.card_id = lb.id_tag
+                LEFT JOIN account_cards ac ON ac.card_id = lb.id_tag
+                LEFT JOIN household_accounts ha ON ha.account_id = ac.account_id
                 WHERE lb.id_tag = ?
                 """,
                 (id_tag,),
@@ -11492,10 +11913,11 @@ async def list_line_bindings(
                 lb.created_at,
                 lb.updated_at,
                 co.name AS resident_name,
-                c.balance
+                ha.balance
             FROM line_bindings lb
             LEFT JOIN card_owners co ON co.card_id = lb.id_tag
-            LEFT JOIN cards c ON c.card_id = lb.id_tag
+            LEFT JOIN account_cards ac ON ac.card_id = lb.id_tag
+            LEFT JOIN household_accounts ha ON ha.account_id = ac.account_id
             {where_sql}
             ORDER BY lb.updated_at DESC, lb.created_at DESC, lb.id DESC
             """,
@@ -11531,10 +11953,11 @@ async def get_line_binding(id_tag: str = Path(...)):
                 lb.created_at,
                 lb.updated_at,
                 co.name AS resident_name,
-                c.balance
+                ha.balance
             FROM line_bindings lb
             LEFT JOIN card_owners co ON co.card_id = lb.id_tag
-            LEFT JOIN cards c ON c.card_id = lb.id_tag
+            LEFT JOIN account_cards ac ON ac.card_id = lb.id_tag
+            LEFT JOIN household_accounts ha ON ha.account_id = ac.account_id
             WHERE lb.id_tag = ?
             """,
             (id_tag,),
@@ -11676,10 +12099,11 @@ async def create_or_update_line_binding(payload: dict = Body(...)):
                     lb.created_at,
                     lb.updated_at,
                     co.name AS resident_name,
-                    c.balance
+                    ha.balance
                 FROM line_bindings lb
                 LEFT JOIN card_owners co ON co.card_id = lb.id_tag
-                LEFT JOIN cards c ON c.card_id = lb.id_tag
+                LEFT JOIN account_cards ac ON ac.card_id = lb.id_tag
+                LEFT JOIN household_accounts ha ON ha.account_id = ac.account_id
                 WHERE lb.id_tag = ?
                 """,
                 (id_tag,),
@@ -11815,10 +12239,11 @@ async def update_line_binding(id_tag: str = Path(...), payload: dict = Body(...)
                     lb.created_at,
                     lb.updated_at,
                     co.name AS resident_name,
-                    c.balance
+                    ha.balance
                 FROM line_bindings lb
                 LEFT JOIN card_owners co ON co.card_id = lb.id_tag
-                LEFT JOIN cards c ON c.card_id = lb.id_tag
+                LEFT JOIN account_cards ac ON ac.card_id = lb.id_tag
+                LEFT JOIN household_accounts ha ON ha.account_id = ac.account_id
                 WHERE lb.id_tag = ?
                 """,
                 (id_tag,),
@@ -12436,13 +12861,20 @@ def get_cards():
             """
             SELECT 
                 c.card_id, 
-                c.balance,
+                ha.balance,
                 t.status,
                 t.valid_until,
-                o.name
+                COALESCE(ac.card_holder_name, o.name),
+                ac.account_id,
+                ha.account_code,
+                ha.account_name,
+                ac.relationship,
+                ac.status
             FROM cards c
             LEFT JOIN id_tags t ON c.card_id = t.id_tag
             LEFT JOIN card_owners o ON c.card_id = o.card_id
+            LEFT JOIN account_cards ac ON ac.card_id = c.card_id
+            LEFT JOIN household_accounts ha ON ha.account_id = ac.account_id
             ORDER BY c.card_id
         """
         )
@@ -12457,6 +12889,11 @@ def get_cards():
                 "balance": r[1],
                 "status": r[2],
                 "validUntil": r[3],
+                "accountId": r[5],
+                "accountCode": r[6],
+                "accountName": r[7],
+                "relationship": r[8],
+                "cardStatus": r[9],
                 "name": r[4],  # ⭐ 新增住戶名稱
             }
         )
@@ -12627,18 +13064,16 @@ async def delete_charge_point(cp_id: str = Path(...)):
 @app.put("/api/cards/{card_id}")
 async def update_card(card_id: str, payload: dict):
     new_balance = payload.get("balance")
-    if new_balance is None:
-        raise HTTPException(status_code=400, detail="Missing balance")
-
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            "UPDATE cards SET balance = ? WHERE card_id = ?",
-            (new_balance, card_id),
+    if new_balance is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="shared balance cannot be overwritten; use the household topup API",
         )
-        conn.commit()
-
-    return {"message": f"Card {card_id} updated", "new_balance": new_balance}
+    with household_connect(DB_FILE) as account_conn:
+        try:
+            return update_account_card(account_conn, card_id, **payload)
+        except HouseholdAccountError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 
@@ -12646,35 +13081,18 @@ async def update_card(card_id: str, payload: dict):
 async def topup_card(card_id: str = Path(...), data: dict = Body(...)):
     amount = data.get("amount")
     if amount is None or not isinstance(amount, (int, float)) or amount <= 0:
-        raise HTTPException(status_code=400, detail="儲值金額錯誤")
-
-    cursor.execute("SELECT balance FROM cards WHERE card_id = ?", (card_id,))
-    row = cursor.fetchone()
-
-    if not row:
-        # ⛳️ 沒有這張卡 → 幫他自動新增，初始餘額就是此次儲值金額
-        cursor.execute(
-            "INSERT INTO cards (card_id, balance) VALUES (?, ?)", (card_id, amount)
-        )
-        conn.commit()
-        return {
-            "status": "created",
-            "card_id": card_id,
-            "new_balance": round(amount, 2),
-        }
-    else:
-        # ✅ 已存在 → 正常加值
-        new_balance = row[0] + amount
-        cursor.execute(
-            "UPDATE cards SET balance = ? WHERE card_id = ?", (new_balance, card_id)
-        )
-        conn.commit()
-        return {
-            "status": "success",
-            "card_id": card_id,
-            "new_balance": round(new_balance, 2),
-        }
-
+        raise HTTPException(status_code=400, detail="amount must be greater than zero")
+    with household_connect(DB_FILE) as account_conn:
+        account = resolve_account_by_card(account_conn, card_id)
+        if not account:
+            raise HTTPException(status_code=404, detail="household account not found for card")
+        updated = topup_household_account(account_conn, account["account_id"], amount)
+    return {
+        "status": "success",
+        "card_id": card_id,
+        "account_id": updated["account_id"],
+        "new_balance": updated["balance"],
+    }
 
 @app.get("/api/version-check")
 def version_check():
@@ -13110,15 +13528,22 @@ async def recalculate_all_payments():
 
             # 這裡重點修正：直接用 id_tag 對應卡片卡號
             card_id = id_tag
-            cursor.execute("SELECT balance FROM cards WHERE card_id = ?", (card_id,))
+            cursor.execute(SHARED_BALANCE_BY_CARD_SQL, (card_id,))
             balance_row = cursor.fetchone()
             if balance_row:
                 old_balance = balance_row[0]
                 if old_balance >= total_amount:
                     new_balance = round(old_balance - total_amount, 2)
                     cursor.execute(
-                        "UPDATE cards SET balance = ? WHERE card_id = ?",
-                        (new_balance, card_id),
+                        """
+                        UPDATE household_accounts SET balance = ?, updated_at = ?
+                        WHERE account_id = (SELECT account_id FROM account_cards WHERE card_id = ?)
+                        """,
+                        (
+                            new_balance,
+                            datetime.utcnow().replace(tzinfo=timezone.utc).isoformat(),
+                            card_id,
+                        ),
                     )
                     print(
                         f"💳 扣款成功：{card_id} | {old_balance} → {new_balance} 元 | txn={txn_id}"
@@ -13719,7 +14144,7 @@ def get_community_dashboard():
                 # 3) payments.total_amount
                 #
                 # 原因：
-                # StopTransaction 目前會扣 cards.balance，
+                # StopTransaction 目前會扣 household_accounts.balance，
                 # 並寫入 transactions.balance_before / balance_after，
                 # 同時也會 INSERT payments.total_amount。
                 # 但部分版本 transactions 不一定有 cost 欄位，
@@ -13830,13 +14255,32 @@ def get_community_dashboard():
                     balance = None
 
                     # 從 cards 找住戶與餘額
+                    if card_id:
+                        try:
+                            cur.execute(
+                                """
+                                SELECT ha.balance, COALESCE(ac.card_holder_name, co.name)
+                                FROM account_cards ac
+                                JOIN household_accounts ha ON ha.account_id = ac.account_id
+                                LEFT JOIN card_owners co ON co.card_id = ac.card_id
+                                WHERE ac.card_id = ?
+                                LIMIT 1
+                                """,
+                                (card_id,),
+                            )
+                            account_row = cur.fetchone()
+                            if account_row:
+                                balance = account_row[0]
+                                if not resident_name:
+                                    resident_name = account_row[1] or ""
+                        except Exception:
+                            pass
+
                     if card_id and card_id_col:
                         try:
                             select_cols = [card_id_col]
                             if card_resident_col and card_resident_col not in select_cols:
                                 select_cols.append(card_resident_col)
-                            if card_balance_col and card_balance_col not in select_cols:
-                                select_cols.append(card_balance_col)
 
                             cur.execute(f"""
                                 SELECT {", ".join(select_cols)}
@@ -13849,19 +14293,15 @@ def get_community_dashboard():
                             if card_row:
                                 if not resident_name and card_resident_col:
                                     resident_name = _row_get(card_row, card_resident_col, "")
-                                if card_balance_col:
-                                    balance = _row_get(card_row, card_balance_col, None)
                         except Exception:
                             pass
 
                     # 若 cards 沒資料，再從 id_tags 找
-                    if card_id and (not resident_name or balance is None) and id_tag_id_col:
+                    if card_id and not resident_name and id_tag_id_col:
                         try:
                             select_cols = [id_tag_id_col]
                             if id_tag_resident_col and id_tag_resident_col not in select_cols:
                                 select_cols.append(id_tag_resident_col)
-                            if id_tag_balance_col and id_tag_balance_col not in select_cols:
-                                select_cols.append(id_tag_balance_col)
 
                             cur.execute(f"""
                                 SELECT {", ".join(select_cols)}
@@ -13874,8 +14314,6 @@ def get_community_dashboard():
                             if id_tag_row:
                                 if not resident_name and id_tag_resident_col:
                                     resident_name = _row_get(id_tag_row, id_tag_resident_col, "")
-                                if balance is None and id_tag_balance_col:
-                                    balance = _row_get(id_tag_row, id_tag_balance_col, None)
                         except Exception:
                             pass
 
@@ -14021,25 +14459,21 @@ def get_community_dashboard():
             # ==================================================
             low_balance_threshold = float(globals().get("LOW_BALANCE_LINE_THRESHOLD", 1000.0))
 
-            if card_id_col and card_balance_col:
+            if True:
                 try:
-                    select_cols = [card_id_col, card_balance_col]
-                    if card_resident_col and card_resident_col not in select_cols:
-                        select_cols.append(card_resident_col)
-
-                    cur.execute(f"""
-                        SELECT {", ".join(select_cols)}
-                        FROM cards
-                        WHERE {card_balance_col} IS NOT NULL
-                          AND {card_balance_col} < ?
-                        ORDER BY {card_balance_col} ASC
+                    cur.execute("""
+                        SELECT account_name, balance, account_code
+                        FROM household_accounts
+                        WHERE balance IS NOT NULL
+                          AND balance < ?
+                        ORDER BY balance ASC
                         LIMIT 10
                     """, (low_balance_threshold,))
                     low_balance_rows = cur.fetchall()
 
                     for row in low_balance_rows:
-                        resident_name = _row_get(row, card_resident_col, "") if card_resident_col else ""
-                        balance = _round2(_row_get(row, card_balance_col, 0))
+                        resident_name = row[0] or row[2] or ""
+                        balance = _round2(row[1])
                         alerts.append({
                             "type": "low_balance",
                             "level": "warning",
@@ -14362,18 +14796,21 @@ async def monitor_balance_and_auto_stop():
                 # 找出所有進行中交易
                 cur.execute(
                     """
-                    SELECT t.transaction_id, t.charge_point_id, t.id_tag
+                    SELECT t.transaction_id, t.charge_point_id, t.id_tag, t.account_id
                     FROM transactions t
                     WHERE t.stop_timestamp IS NULL
                 """
                 )
                 active_tx = cur.fetchall()
 
-            for transaction_id, cp_id, id_tag in active_tx:
+            for transaction_id, cp_id, id_tag, transaction_account_id in active_tx:
                 # 查詢卡片餘額
                 with get_conn() as conn:
                     c2 = conn.cursor()
-                    c2.execute("SELECT balance FROM cards WHERE card_id=?", (id_tag,))
+                    c2.execute(
+                        "SELECT balance FROM household_accounts WHERE account_id=?",
+                        (transaction_account_id,),
+                    )
                     row = c2.fetchone()
 
                 if not row:
