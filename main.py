@@ -7,29 +7,93 @@ app = FastAPI()
 
 def _household_http_error(exc: Exception) -> HTTPException:
     message = str(exc)
-    status = 404 if "not found" in message else 409 if "already" in message else 400
+    status = (
+        409
+        if isinstance(exc, HouseholdAccountConflictError)
+        else 404
+        if "not found" in message
+        else 400
+    )
     return HTTPException(status_code=status, detail=message)
+
+
+_REQUEST_MISSING = object()
+
+
+def _request_alias(
+    data: dict, snake_key: str, camel_key: str, default=_REQUEST_MISSING
+):
+    snake_present = snake_key in data
+    camel_present = camel_key in data
+    if snake_present and camel_present and data[snake_key] != data[camel_key]:
+        raise HouseholdAccountError(
+            f"conflicting values for {snake_key} and {camel_key}"
+        )
+    if snake_present or camel_present:
+        value = data[snake_key] if snake_present else data[camel_key]
+        if value is None:
+            raise HouseholdAccountError(f"{snake_key} cannot be null")
+        return value
+    return default
+
+
+def _household_api_payload(account: dict, cards: list[dict] | None = None) -> dict:
+    """Expose the floor/parking contract without leaking deprecated identity fields."""
+    payload = {
+        "account_id": account.get("account_id"),
+        "accountId": account.get("account_id"),
+        "floor_no": account.get("floor_no"),
+        "floorNo": account.get("floor_no"),
+        "parking_space_no": account.get("parking_space_no"),
+        "parkingSpaceNo": account.get("parking_space_no"),
+        "balance": account.get("balance"),
+        "status": account.get("status"),
+        "created_at": account.get("created_at"),
+        "updated_at": account.get("updated_at"),
+    }
+    if cards is not None:
+        payload["cards"] = cards
+    return payload
+
+
+def _floor_parking_display(floor_no, parking_space_no, fallback="--") -> str:
+    values = [
+        str(value).strip()
+        for value in (floor_no, parking_space_no)
+        if value is not None and str(value).strip()
+    ]
+    return "／".join(values) if values else fallback
 
 
 @app.get("/api/household-accounts")
 def api_list_household_accounts():
     with household_connect(DB_FILE) as account_conn:
         accounts = list_household_accounts(account_conn)
-        for account in accounts:
-            account["cards"] = list_account_cards(account_conn, account["account_id"])
-    return accounts
+        result = [
+            _household_api_payload(
+                account,
+                list_account_cards(account_conn, account["account_id"]),
+            )
+            for account in accounts
+        ]
+    return result
 
 
 @app.post("/api/household-accounts")
 def api_create_household_account(data: dict = Body(...)):
     with household_connect(DB_FILE) as account_conn:
         try:
-            return create_household_account(
-                account_conn,
-                data.get("account_code") or data.get("accountCode") or "",
-                data.get("account_name") or data.get("accountName") or "",
-                data.get("balance", 0),
-                data.get("status", "active"),
+            return _household_api_payload(
+                create_household_account(
+                    account_conn,
+                    _request_alias(data, "floor_no", "floorNo", ""),
+                    _request_alias(
+                        data, "parking_space_no", "parkingSpaceNo", ""
+                    ),
+                    data.get("balance", 0),
+                    data.get("status", "active"),
+                ),
+                [],
             )
         except HouseholdAccountError as exc:
             raise _household_http_error(exc) from exc
@@ -41,21 +105,33 @@ def api_get_household_account(account_id: int):
         account = get_account_by_id(account_conn, account_id)
         if not account:
             raise HTTPException(status_code=404, detail="account not found")
-        account["cards"] = list_account_cards(account_conn, account_id)
-        return account
+        return _household_api_payload(
+            account, list_account_cards(account_conn, account_id)
+        )
 
 
 @app.put("/api/household-accounts/{account_id}")
 def api_update_household_account(account_id: int, data: dict = Body(...)):
+    try:
+        fields = {
+            "floor_no": _request_alias(data, "floor_no", "floorNo"),
+            "parking_space_no": _request_alias(
+                data, "parking_space_no", "parkingSpaceNo"
+            ),
+            "status": data.get("status"),
+        }
+    except HouseholdAccountError as exc:
+        raise _household_http_error(exc) from exc
     fields = {
-        "account_code": data.get("account_code", data.get("accountCode")),
-        "account_name": data.get("account_name", data.get("accountName")),
-        "status": data.get("status"),
+        key: value
+        for key, value in fields.items()
+        if value is not None and value is not _REQUEST_MISSING
     }
-    fields = {key: value for key, value in fields.items() if value is not None}
     with household_connect(DB_FILE) as account_conn:
         try:
-            return update_household_account(account_conn, account_id, **fields)
+            return _household_api_payload(
+                update_household_account(account_conn, account_id, **fields)
+            )
         except HouseholdAccountError as exc:
             raise _household_http_error(exc) from exc
 
@@ -64,7 +140,9 @@ def api_update_household_account(account_id: int, data: dict = Body(...)):
 def api_topup_household_account(account_id: int, data: dict = Body(...)):
     with household_connect(DB_FILE) as account_conn:
         try:
-            return topup_household_account(account_conn, account_id, data.get("amount"))
+            return _household_api_payload(
+                topup_household_account(account_conn, account_id, data.get("amount"))
+            )
         except HouseholdAccountError as exc:
             raise _household_http_error(exc) from exc
 
@@ -86,10 +164,8 @@ def api_add_account_card(account_id: int, data: dict = Body(...)):
                 account_conn,
                 account_id,
                 card_id,
-                data.get("card_holder_name", data.get("cardHolderName")),
-                data.get("relationship"),
-                data.get("status", "active"),
-                data.get("valid_until", data.get("validUntil")),
+                status=data.get("status", "active"),
+                valid_until=data.get("valid_until", data.get("validUntil")),
             )
             for cp_id in data.get("charge_point_ids", data.get("chargePointIds", [])) or []:
                 if not account_conn.execute(
@@ -109,8 +185,6 @@ def api_add_account_card(account_id: int, data: dict = Body(...)):
 @app.put("/api/account-cards/{card_id}")
 def api_update_account_card(card_id: str, data: dict = Body(...)):
     fields = {
-        "card_holder_name": data.get("card_holder_name", data.get("cardHolderName")),
-        "relationship": data.get("relationship"),
         "status": data.get("status"),
     }
     fields = {key: value for key, value in fields.items() if value is not None}
@@ -139,9 +213,9 @@ def api_create_card_enrollment(data: dict = Body(...)):
                 int(data.get("account_id", data.get("accountId"))),
                 data.get("charge_point_id", data.get("chargePointId", "")),
                 data.get("requested_by", data.get("requestedBy")),
-                data.get("card_holder_name", data.get("cardHolderName")),
-                data.get("relationship"),
-                int(data.get("duration_seconds", data.get("durationSeconds", 120))),
+                duration_seconds=int(
+                    data.get("duration_seconds", data.get("durationSeconds", 120))
+                ),
             )
         except (HouseholdAccountError, TypeError, ValueError) as exc:
             raise _household_http_error(exc) from exc
@@ -2087,6 +2161,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 from db_config import get_database_path
 from household_account_service import (
     HouseholdAccountError,
+    HouseholdAccountConflictError,
     bind_card_to_account,
     cancel_enrollment,
     capture_unknown_card,
@@ -2689,6 +2764,37 @@ def ensure_line_message_logs_table():
             """
             CREATE INDEX IF NOT EXISTS idx_line_message_logs_created_at
             ON line_message_logs (created_at)
+            """
+        )
+
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS line_notification_claims (
+                event_type TEXT NOT NULL,
+                transaction_id INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                claimed_at TEXT NOT NULL,
+                completed_at TEXT,
+                PRIMARY KEY (event_type, transaction_id)
+            )
+            """
+        )
+
+        # Recipient-level claims are separate from the legacy transaction-level
+        # table so existing claims and logs remain untouched.
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS line_recipient_notification_claims (
+                event_type TEXT NOT NULL,
+                transaction_id INTEGER NOT NULL,
+                line_user_id TEXT NOT NULL,
+                source_card_id TEXT,
+                status TEXT NOT NULL,
+                claimed_at TEXT NOT NULL,
+                completed_at TEXT,
+                error TEXT,
+                PRIMARY KEY (event_type, transaction_id, line_user_id)
+            )
             """
         )
 
@@ -4177,7 +4283,7 @@ class ChargePoint(OcppChargePoint):
                 cursor = account_conn.cursor()
                 cursor.execute(
                     """
-                    SELECT ac.account_id, ha.account_code, ac.card_holder_name,
+                    SELECT ac.account_id, ha.floor_no, ha.parking_space_no,
                            ac.status, ha.status, ha.balance,
                            EXISTS(
                                SELECT 1 FROM card_whitelist cw
@@ -4209,8 +4315,8 @@ class ChargePoint(OcppChargePoint):
 
             (
                 account_id,
-                account_code,
-                card_holder_name,
+                floor_no,
+                parking_space_no,
                 card_status,
                 account_status,
                 shared_balance,
@@ -4394,8 +4500,8 @@ class ChargePoint(OcppChargePoint):
                             meter_start,
                             start_timestamp,
                             account_id,
-                            account_code,
-                            card_holder_name
+                            floor_no,
+                            parking_space_no
                         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
@@ -4405,8 +4511,8 @@ class ChargePoint(OcppChargePoint):
                             int(meter_start),
                             start_ts_to_save,
                             account_id,
-                            account_code,
-                            card_holder_name,
+                            floor_no,
+                            parking_space_no,
                         ),
                     )
                     tx_id = cursor.lastrowid
@@ -4689,13 +4795,13 @@ class ChargePoint(OcppChargePoint):
                             _cur.execute(
                                 """
                                 UPDATE transactions
-                                SET account_id=?, account_code=?, card_holder_name=?
+                                SET account_id=?, floor_no=?, parking_space_no=?
                                 WHERE transaction_id=?
                                 """,
                                 (
                                     legacy_account["account_id"],
-                                    legacy_account["account_code"],
-                                    legacy_account["card_holder_name"],
+                                    legacy_account["floor_no"],
+                                    legacy_account["parking_space_no"],
                                     transaction_id,
                                 ),
                             )
@@ -8350,7 +8456,9 @@ async def get_transactions(
             t.account_id,
             t.account_code,
             t.card_holder_name,
-            ha.account_name
+            ha.account_name,
+            t.floor_no,
+            t.parking_space_no
         FROM transactions t
         LEFT JOIN users u
             ON UPPER(TRIM(u.id_tag)) = UPPER(TRIM(t.id_tag))
@@ -8423,6 +8531,8 @@ async def get_transactions(
             account_code,
             card_holder_name,
             account_name,
+            floor_no,
+            parking_space_no,
         ) = row
 
         energy_kwh = None
@@ -8450,7 +8560,7 @@ async def get_transactions(
                 duration_minutes = None
                 duration_text = "--"
 
-        household_display = department or "--"
+        household_display = _floor_parking_display(floor_no, parking_space_no)
 
         result.append(
             {
@@ -8469,9 +8579,8 @@ async def get_transactions(
 
                 "department": department or "--",
                 "householdDisplay": household_display,
-                "floorNo": household_display,
-                "buildingNo": household_display,
-                "roomNo": household_display,
+                "floorNo": floor_no,
+                "parkingSpaceNo": parking_space_no,
 
                 "startTimestamp": start_timestamp,
                 "stopTimestamp": stop_timestamp,
@@ -8956,13 +9065,10 @@ def build_charge_completed_line_message(transaction_id: int) -> dict:
                 t.reason,
                 t.balance_before,
                 t.balance_after,
-                co.name AS card_owner_name,
-                u.name AS user_name,
                 u.card_number,
                 ha.balance AS current_account_balance,
-                t.account_code,
-                ha.account_name,
-                t.card_holder_name
+                t.floor_no,
+                t.parking_space_no
             FROM transactions t
             LEFT JOIN card_owners co
                 ON co.card_id = t.id_tag
@@ -8991,16 +9097,13 @@ def build_charge_completed_line_message(transaction_id: int) -> dict:
         reason,
         balance_before,
         balance_after,
-        card_owner_name,
-        user_name,
         card_number,
         current_account_balance,
-        account_code,
-        account_name,
-        transaction_card_holder_name,
+        floor_no,
+        parking_space_no,
     ) = row
 
-    resident_name = transaction_card_holder_name or card_owner_name or user_name or "--"
+    household_display = _floor_parking_display(floor_no, parking_space_no)
     display_card = id_tag or card_number or "--"
     is_completed = bool(stop_timestamp)
 
@@ -9055,10 +9158,7 @@ def build_charge_completed_line_message(transaction_id: int) -> dict:
 
     message_lines.extend(
         [
-            f"住戶帳戶：{account_name or account_code or '--'}",
-            f"持卡人：{resident_name}",
-            f"實際卡號：{display_card}",
-            f"住戶：{resident_name}",
+            f"樓號／車位：{household_display}",
             f"卡號：{display_card}",
             f"充電樁：{charge_point_id or '--'}",
             f"交易編號：{tx_id}",
@@ -9096,10 +9196,8 @@ def build_charge_completed_line_message(transaction_id: int) -> dict:
         "chargePointId": charge_point_id,
         "message": message,
         "data": {
-            "residentName": resident_name,
-            "accountCode": account_code,
-            "accountName": account_name,
-            "cardHolderName": resident_name,
+            "floorNo": floor_no,
+            "parkingSpaceNo": parking_space_no,
             "cardId": display_card,
             "idTag": id_tag,
             "chargePointId": charge_point_id,
@@ -9205,6 +9303,60 @@ def get_line_binding_by_id_tag(id_tag: str) -> dict | None:
             f"[LINE][BINDING_LOOKUP][ERR] idTag={id_tag} | err={e}"
         )
         return None
+
+
+def resolve_household_line_recipients(
+    conn: sqlite3.Connection, transaction_id: int
+) -> list[dict]:
+    """Resolve current enabled LINE recipients for a transaction's account."""
+    transaction = conn.execute(
+        """
+        SELECT account_id, floor_no, parking_space_no, id_tag
+        FROM transactions
+        WHERE transaction_id = ?
+        """,
+        (int(transaction_id),),
+    ).fetchone()
+    if not transaction or transaction[0] is None:
+        return []
+
+    account_id, floor_no, parking_space_no, transaction_card_id = transaction
+    rows = conn.execute(
+        """
+        SELECT ac.card_id, lb.line_user_id, lb.display_name
+        FROM account_cards ac
+        JOIN line_bindings lb ON lb.id_tag = ac.card_id
+        WHERE ac.account_id = ?
+          AND ac.status = 'active'
+          AND lb.enabled = 1
+          AND NULLIF(TRIM(lb.line_user_id), '') IS NOT NULL
+        ORDER BY TRIM(lb.line_user_id), ac.card_id
+        """,
+        (account_id,),
+    ).fetchall()
+
+    recipients: dict[str, dict] = {}
+    for card_id, raw_line_user_id, display_name in rows:
+        line_user_id = str(raw_line_user_id or "").strip()
+        if not line_user_id:
+            continue
+        recipient = recipients.setdefault(
+            line_user_id,
+            {
+                "line_user_id": line_user_id,
+                "display_name": str(display_name or "").strip() or None,
+                "source_card_ids": [],
+                "account_id": int(account_id),
+                "floor_no": floor_no,
+                "parking_space_no": parking_space_no,
+                "transaction_card_id": transaction_card_id,
+            },
+        )
+        source_card_id = str(card_id or "").strip()
+        if source_card_id and source_card_id not in recipient["source_card_ids"]:
+            recipient["source_card_ids"].append(source_card_id)
+
+    return [recipients[key] for key in sorted(recipients)]
 
 
 def _safe_json_dumps_for_line_log(value) -> str | None:
@@ -9315,6 +9467,227 @@ def insert_line_message_log(
         }
 
 
+def claim_line_notification(event_type: str, transaction_id: int) -> bool:
+    """Persist an at-most-once claim before calling the external LINE API."""
+    claimed_at = datetime.now(timezone.utc).isoformat()
+    try:
+        with get_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """
+                INSERT INTO line_notification_claims(
+                    event_type, transaction_id, status, claimed_at
+                ) VALUES (?, ?, 'sending', ?)
+                """,
+                (event_type, int(transaction_id), claimed_at),
+            )
+            conn.commit()
+        return True
+    except sqlite3.IntegrityError:
+        return False
+
+
+def complete_line_notification_claim(
+    event_type: str, transaction_id: int | None, status: str | None
+) -> None:
+    if transaction_id is None:
+        return
+    completed_at = datetime.now(timezone.utc).isoformat()
+    try:
+        with get_conn() as conn:
+            conn.execute(
+                """
+                UPDATE line_notification_claims
+                SET status=?, completed_at=?
+                WHERE event_type=? AND transaction_id=?
+                """,
+                (
+                    str(status or "failed"),
+                    completed_at,
+                    event_type,
+                    int(transaction_id),
+                ),
+            )
+            conn.commit()
+    except Exception:
+        logging.exception(
+            "[LINE][CLAIM][COMPLETE_ERR] event_type=%s tx_id=%s",
+            event_type,
+            transaction_id,
+        )
+
+
+def claim_line_recipient_notification(
+    event_type: str,
+    transaction_id: int,
+    line_user_id: str,
+    source_card_id: str | None = None,
+) -> bool:
+    """Claim one event for one LINE recipient using persistent SQLite state."""
+    claimed_at = datetime.now(timezone.utc).isoformat()
+    try:
+        with get_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """
+                INSERT INTO line_recipient_notification_claims(
+                    event_type, transaction_id, line_user_id, source_card_id,
+                    status, claimed_at
+                ) VALUES (?, ?, ?, ?, 'sending', ?)
+                """,
+                (
+                    event_type,
+                    int(transaction_id),
+                    str(line_user_id).strip(),
+                    str(source_card_id or "").strip() or None,
+                    claimed_at,
+                ),
+            )
+            conn.commit()
+        return True
+    except sqlite3.IntegrityError:
+        return False
+
+
+def complete_line_recipient_notification_claim(
+    event_type: str,
+    transaction_id: int | None,
+    line_user_id: str | None,
+    status: str | None,
+    error: str | None = None,
+) -> None:
+    if transaction_id is None or not str(line_user_id or "").strip():
+        return
+    try:
+        with get_conn() as conn:
+            conn.execute(
+                """
+                UPDATE line_recipient_notification_claims
+                SET status=?, completed_at=?, error=?
+                WHERE event_type=? AND transaction_id=? AND line_user_id=?
+                """,
+                (
+                    str(status or "failed"),
+                    datetime.now(timezone.utc).isoformat(),
+                    str(error or "").strip() or None,
+                    event_type,
+                    int(transaction_id),
+                    str(line_user_id).strip(),
+                ),
+            )
+            conn.commit()
+    except Exception:
+        logging.exception(
+            "[LINE][RECIPIENT_CLAIM][COMPLETE_ERR] "
+            "event_type=%s tx_id=%s line_user_id=%s",
+            event_type,
+            transaction_id,
+            line_user_id,
+        )
+
+
+def send_household_line_notification(
+    *,
+    event_type: str,
+    transaction_id: int,
+    id_tag: str,
+    message: str,
+    finalize_result,
+) -> dict:
+    """Send one transaction event to every unique current household recipient."""
+    with get_conn() as conn:
+        recipients = resolve_household_line_recipients(conn, transaction_id)
+
+    if not recipients:
+        return finalize_result(
+            {
+                "ok": True,
+                "status": "skipped",
+                "reason": "no_household_recipients",
+                "transactionId": transaction_id,
+                "idTag": id_tag,
+            },
+            message=message,
+        )
+
+    results = []
+    for recipient in recipients:
+        line_user_id = recipient["line_user_id"]
+        source_card_ids = recipient["source_card_ids"]
+        source_card_id = source_card_ids[0] if source_card_ids else None
+        if not claim_line_recipient_notification(
+            event_type,
+            transaction_id,
+            line_user_id,
+            source_card_id=source_card_id,
+        ):
+            results.append(
+                {
+                    "ok": True,
+                    "status": "skipped",
+                    "reason": "duplicate_notification",
+                    "transactionId": transaction_id,
+                    "idTag": id_tag,
+                    "lineUserId": line_user_id,
+                    "sourceCardIds": source_card_ids,
+                }
+            )
+            continue
+
+        try:
+            line_result = send_line_message(
+                line_user_id=line_user_id,
+                message=message,
+            )
+        except Exception as exc:
+            line_result = {"ok": False, "error": str(exc)}
+
+        sent = bool(line_result.get("ok"))
+        result = {
+            "ok": sent,
+            "status": "sent" if sent else "failed",
+            "reason": "ok" if sent else "line_api_failed",
+            "transactionId": transaction_id,
+            "idTag": id_tag,
+            "lineUserId": line_user_id,
+            "sourceCardIds": source_card_ids,
+            "lineResult": line_result,
+        }
+        results.append(
+            finalize_result(
+                result,
+                message=message,
+                line_user_id=line_user_id,
+            )
+        )
+
+    sent_count = sum(item.get("status") == "sent" for item in results)
+    failed_count = sum(item.get("status") == "failed" for item in results)
+    skipped_count = sum(item.get("status") == "skipped" for item in results)
+    if failed_count and sent_count:
+        status, reason = "partial", "partial_failure"
+    elif failed_count:
+        status, reason = "failed", "line_api_failed"
+    elif sent_count:
+        status, reason = "sent", "ok"
+    else:
+        status, reason = "skipped", "duplicate_notification"
+    return {
+        "ok": failed_count == 0,
+        "status": status,
+        "reason": reason,
+        "transactionId": transaction_id,
+        "idTag": id_tag,
+        "summary": {
+            "recipients": len(recipients),
+            "sent": sent_count,
+            "failed": failed_count,
+            "skipped": skipped_count,
+        },
+        "recipientResults": results,
+    }
+
+
 def finalize_charge_completed_line_result(
     result: dict,
     message: str | None = None,
@@ -9354,6 +9727,13 @@ def finalize_charge_completed_line_result(
         )
 
         result["messageLog"] = log_result
+        complete_line_recipient_notification_claim(
+            "charge_completed",
+            result.get("transactionId"),
+            result.get("lineUserId") or line_user_id,
+            status,
+            error=reason if status == "failed" else None,
+        )
         return result
 
     except Exception as e:
@@ -9436,95 +9816,12 @@ def send_charge_completed_line_notification(transaction_id: int) -> dict:
                 message=message,
             )
 
-        binding = get_line_binding_by_id_tag(id_tag)
-
-        if not binding:
-            logging.warning(
-                f"[LINE][CHARGE_COMPLETED][SKIP] tx_id={tx_id} | idTag={id_tag} | reason=no_binding"
-            )
-            return finalize_charge_completed_line_result(
-                {
-                    "ok": True,
-                    "status": "skipped",
-                    "reason": "no_binding",
-                    "transactionId": tx_id,
-                    "idTag": id_tag,
-                },
-                message=message,
-            )
-
-        if not binding.get("enabled"):
-            logging.warning(
-                f"[LINE][CHARGE_COMPLETED][SKIP] tx_id={tx_id} | idTag={id_tag} | reason=binding_disabled"
-            )
-            return finalize_charge_completed_line_result(
-                {
-                    "ok": True,
-                    "status": "skipped",
-                    "reason": "binding_disabled",
-                    "transactionId": tx_id,
-                    "idTag": id_tag,
-                    "lineUserId": binding.get("lineUserId"),
-                },
-                message=message,
-                line_user_id=binding.get("lineUserId"),
-            )
-
-        line_user_id = str(binding.get("lineUserId") or "").strip()
-
-        if not line_user_id:
-            logging.warning(
-                f"[LINE][CHARGE_COMPLETED][SKIP] tx_id={tx_id} | idTag={id_tag} | reason=empty_line_user_id"
-            )
-            return finalize_charge_completed_line_result(
-                {
-                    "ok": True,
-                    "status": "skipped",
-                    "reason": "empty_line_user_id",
-                    "transactionId": tx_id,
-                    "idTag": id_tag,
-                },
-                message=message,
-            )
-
-        line_result = send_line_message(
-            line_user_id=line_user_id,
+        return send_household_line_notification(
+            event_type="charge_completed",
+            transaction_id=tx_id,
+            id_tag=id_tag,
             message=message,
-        )
-
-        if line_result.get("ok"):
-            logging.warning(
-                f"[LINE][CHARGE_COMPLETED][SENT] tx_id={tx_id} | idTag={id_tag} | line_user_id={line_user_id}"
-            )
-            return finalize_charge_completed_line_result(
-                {
-                    "ok": True,
-                    "status": "sent",
-                    "reason": "ok",
-                    "transactionId": tx_id,
-                    "idTag": id_tag,
-                    "lineUserId": line_user_id,
-                    "lineResult": line_result,
-                },
-                message=message,
-                line_user_id=line_user_id,
-            )
-
-        logging.error(
-            f"[LINE][CHARGE_COMPLETED][FAILED] tx_id={tx_id} | idTag={id_tag} | line_result={line_result}"
-        )
-        return finalize_charge_completed_line_result(
-            {
-                "ok": False,
-                "status": "failed",
-                "reason": "line_api_failed",
-                "transactionId": tx_id,
-                "idTag": id_tag,
-                "lineUserId": line_user_id,
-                "lineResult": line_result,
-            },
-            message=message,
-            line_user_id=line_user_id,
+            finalize_result=finalize_charge_completed_line_result,
         )
 
     except HTTPException as e:
@@ -9637,10 +9934,10 @@ def build_low_balance_line_message(transaction_id: int) -> dict:
                 t.id_tag,
                 t.stop_timestamp,
                 t.balance_after,
-                co.name AS card_owner_name,
-                u.name AS user_name,
                 u.card_number,
-                ha.balance AS current_account_balance
+                ha.balance AS current_account_balance,
+                t.floor_no,
+                t.parking_space_no
             FROM transactions t
             LEFT JOIN card_owners co
                 ON co.card_id = t.id_tag
@@ -9663,13 +9960,13 @@ def build_low_balance_line_message(transaction_id: int) -> dict:
         id_tag,
         stop_timestamp,
         balance_after,
-        card_owner_name,
-        user_name,
         card_number,
         current_account_balance,
+        floor_no,
+        parking_space_no,
     ) = row
 
-    resident_name = card_owner_name or user_name or "--"
+    household_display = _floor_parking_display(floor_no, parking_space_no)
     display_card = id_tag or card_number or "--"
 
     balance_after_value = balance_after
@@ -9680,8 +9977,9 @@ def build_low_balance_line_message(transaction_id: int) -> dict:
 
     message_lines = [
         "餘額提醒",
+        f"{household_display} 餘額偏低，目前餘額 {balance_after_text}",
+        f"卡號：{display_card}",
         f"交易完成時間：{_format_line_taipei_time(stop_timestamp)}",
-        f"扣款後餘額：{balance_after_text}",
         "",
         "餘額已經低於 1000 元，請盡速儲值。",
     ]
@@ -9697,7 +9995,8 @@ def build_low_balance_line_message(transaction_id: int) -> dict:
         "chargePointId": charge_point_id,
         "message": message,
         "data": {
-            "residentName": resident_name,
+            "floorNo": floor_no,
+            "parkingSpaceNo": parking_space_no,
             "cardId": display_card,
             "idTag": id_tag,
             "chargePointId": charge_point_id,
@@ -9752,6 +10051,13 @@ def finalize_low_balance_line_result(
         )
 
         result["messageLog"] = log_result
+        complete_line_recipient_notification_claim(
+            "low_balance_after_transaction",
+            result.get("transactionId"),
+            result.get("lineUserId") or line_user_id,
+            status,
+            error=reason if status == "failed" else None,
+        )
         return result
 
     except Exception as e:
@@ -9884,95 +10190,12 @@ def send_low_balance_line_notification(transaction_id: int) -> dict:
                 message=message,
             )
 
-        binding = get_line_binding_by_id_tag(id_tag)
-
-        if not binding:
-            logging.warning(
-                f"[LINE][LOW_BALANCE][SKIP] tx_id={tx_id} | idTag={id_tag} | reason=no_binding"
-            )
-            return finalize_low_balance_line_result(
-                {
-                    "ok": True,
-                    "status": "skipped",
-                    "reason": "no_binding",
-                    "transactionId": tx_id,
-                    "idTag": id_tag,
-                },
-                message=message,
-            )
-
-        if not binding.get("enabled"):
-            logging.warning(
-                f"[LINE][LOW_BALANCE][SKIP] tx_id={tx_id} | idTag={id_tag} | reason=binding_disabled"
-            )
-            return finalize_low_balance_line_result(
-                {
-                    "ok": True,
-                    "status": "skipped",
-                    "reason": "binding_disabled",
-                    "transactionId": tx_id,
-                    "idTag": id_tag,
-                    "lineUserId": binding.get("lineUserId"),
-                },
-                message=message,
-                line_user_id=binding.get("lineUserId"),
-            )
-
-        line_user_id = str(binding.get("lineUserId") or "").strip()
-
-        if not line_user_id:
-            logging.warning(
-                f"[LINE][LOW_BALANCE][SKIP] tx_id={tx_id} | idTag={id_tag} | reason=empty_line_user_id"
-            )
-            return finalize_low_balance_line_result(
-                {
-                    "ok": True,
-                    "status": "skipped",
-                    "reason": "empty_line_user_id",
-                    "transactionId": tx_id,
-                    "idTag": id_tag,
-                },
-                message=message,
-            )
-
-        line_result = send_line_message(
-            line_user_id=line_user_id,
+        return send_household_line_notification(
+            event_type="low_balance_after_transaction",
+            transaction_id=tx_id,
+            id_tag=id_tag,
             message=message,
-        )
-
-        if line_result.get("ok"):
-            logging.warning(
-                f"[LINE][LOW_BALANCE][SENT] tx_id={tx_id} | idTag={id_tag} | balance_after={balance_after_float} | line_user_id={line_user_id}"
-            )
-            return finalize_low_balance_line_result(
-                {
-                    "ok": True,
-                    "status": "sent",
-                    "reason": "ok",
-                    "transactionId": tx_id,
-                    "idTag": id_tag,
-                    "lineUserId": line_user_id,
-                    "lineResult": line_result,
-                },
-                message=message,
-                line_user_id=line_user_id,
-            )
-
-        logging.error(
-            f"[LINE][LOW_BALANCE][FAILED] tx_id={tx_id} | idTag={id_tag} | line_result={line_result}"
-        )
-        return finalize_low_balance_line_result(
-            {
-                "ok": False,
-                "status": "failed",
-                "reason": "line_api_failed",
-                "transactionId": tx_id,
-                "idTag": id_tag,
-                "lineUserId": line_user_id,
-                "lineResult": line_result,
-            },
-            message=message,
-            line_user_id=line_user_id,
+            finalize_result=finalize_low_balance_line_result,
         )
 
     except HTTPException as e:
@@ -10088,10 +10311,10 @@ def build_auto_stop_balance_insufficient_line_message(transaction_id: int) -> di
                 t.auto_stop_triggered_at,
                 t.auto_stop_balance,
                 t.auto_stop_estimated_amount,
-                co.name AS card_owner_name,
-                u.name AS user_name,
                 u.card_number,
-                ha.balance AS current_account_balance
+                ha.balance AS current_account_balance,
+                t.floor_no,
+                t.parking_space_no
             FROM transactions t
             LEFT JOIN card_owners co
                 ON co.card_id = t.id_tag
@@ -10119,10 +10342,10 @@ def build_auto_stop_balance_insufficient_line_message(transaction_id: int) -> di
         auto_stop_triggered_at,
         auto_stop_balance,
         auto_stop_estimated_amount,
-        card_owner_name,
-        user_name,
         card_number,
         current_account_balance,
+        floor_no,
+        parking_space_no,
     ) = row
 
     if auto_stop_reason != AUTO_STOP_REASON_BALANCE_INSUFFICIENT:
@@ -10140,7 +10363,7 @@ def build_auto_stop_balance_insufficient_line_message(transaction_id: int) -> di
             },
         }
 
-    resident_name = card_owner_name or user_name or "--"
+    household_display = _floor_parking_display(floor_no, parking_space_no)
     display_card = id_tag or card_number or "--"
 
     final_balance_value = balance_after
@@ -10149,7 +10372,7 @@ def build_auto_stop_balance_insufficient_line_message(transaction_id: int) -> di
 
     message_lines = [
         "餘額不足自動停充通知",
-        f"住戶：{resident_name}",
+        f"樓號／車位：{household_display}",
         f"卡號：{display_card}",
         f"充電樁：{charge_point_id or '--'}",
         f"交易編號：{tx_id}",
@@ -10173,7 +10396,8 @@ def build_auto_stop_balance_insufficient_line_message(transaction_id: int) -> di
         "chargePointId": charge_point_id,
         "message": message,
         "data": {
-            "residentName": resident_name,
+            "floorNo": floor_no,
+            "parkingSpaceNo": parking_space_no,
             "cardId": display_card,
             "idTag": id_tag,
             "chargePointId": charge_point_id,
@@ -10245,6 +10469,13 @@ def finalize_auto_stop_balance_insufficient_line_result(
         )
 
         result["messageLog"] = log_result
+        complete_line_recipient_notification_claim(
+            "auto_stop_balance_insufficient",
+            result.get("transactionId"),
+            result.get("lineUserId") or line_user_id,
+            status,
+            error=reason if status == "failed" else None,
+        )
         return result
 
     except Exception as e:
@@ -10345,96 +10576,12 @@ def send_auto_stop_balance_insufficient_line_notification(transaction_id: int) -
                 message=message,
             )
 
-        binding = get_line_binding_by_id_tag(id_tag)
-
-        if not binding:
-            logging.warning(
-                f"[LINE][AUTO_STOP_BALANCE][SKIP] tx_id={tx_id} | idTag={id_tag} | reason=no_binding"
-            )
-            return finalize_auto_stop_balance_insufficient_line_result(
-                {
-                    "ok": True,
-                    "status": "skipped",
-                    "reason": "no_binding",
-                    "transactionId": tx_id,
-                    "idTag": id_tag,
-                },
-                message=message,
-            )
-
-        if not binding.get("enabled"):
-            logging.warning(
-                f"[LINE][AUTO_STOP_BALANCE][SKIP] tx_id={tx_id} | idTag={id_tag} | reason=binding_disabled"
-            )
-            return finalize_auto_stop_balance_insufficient_line_result(
-                {
-                    "ok": True,
-                    "status": "skipped",
-                    "reason": "binding_disabled",
-                    "transactionId": tx_id,
-                    "idTag": id_tag,
-                    "lineUserId": binding.get("lineUserId"),
-                },
-                message=message,
-                line_user_id=binding.get("lineUserId"),
-            )
-
-        line_user_id = str(binding.get("lineUserId") or "").strip()
-
-        if not line_user_id:
-            logging.warning(
-                f"[LINE][AUTO_STOP_BALANCE][SKIP] tx_id={tx_id} | idTag={id_tag} | reason=empty_line_user_id"
-            )
-            return finalize_auto_stop_balance_insufficient_line_result(
-                {
-                    "ok": True,
-                    "status": "skipped",
-                    "reason": "empty_line_user_id",
-                    "transactionId": tx_id,
-                    "idTag": id_tag,
-                },
-                message=message,
-            )
-
-        line_result = send_line_message(
-            line_user_id=line_user_id,
+        return send_household_line_notification(
+            event_type="auto_stop_balance_insufficient",
+            transaction_id=tx_id,
+            id_tag=id_tag,
             message=message,
-        )
-
-        if line_result.get("ok"):
-            logging.warning(
-                f"[LINE][AUTO_STOP_BALANCE][SENT] "
-                f"tx_id={tx_id} | idTag={id_tag} | line_user_id={line_user_id}"
-            )
-            return finalize_auto_stop_balance_insufficient_line_result(
-                {
-                    "ok": True,
-                    "status": "sent",
-                    "reason": "ok",
-                    "transactionId": tx_id,
-                    "idTag": id_tag,
-                    "lineUserId": line_user_id,
-                    "lineResult": line_result,
-                },
-                message=message,
-                line_user_id=line_user_id,
-            )
-
-        logging.error(
-            f"[LINE][AUTO_STOP_BALANCE][FAILED] tx_id={tx_id} | idTag={id_tag} | line_result={line_result}"
-        )
-        return finalize_auto_stop_balance_insufficient_line_result(
-            {
-                "ok": False,
-                "status": "failed",
-                "reason": "line_api_failed",
-                "transactionId": tx_id,
-                "idTag": id_tag,
-                "lineUserId": line_user_id,
-                "lineResult": line_result,
-            },
-            message=message,
-            line_user_id=line_user_id,
+            finalize_result=finalize_auto_stop_balance_insufficient_line_result,
         )
 
     except HTTPException as e:
@@ -10719,6 +10866,8 @@ async def get_transaction_detail(transaction_id: int):
             t.balance_before,
             t.balance_after,
             t.surplus_amount, -- ⭐ 加入這行
+            t.floor_no,
+            t.parking_space_no,
             COALESCE(
                 NULLIF(TRIM(u.name), ''),
                 NULLIF(TRIM(co.name), '')
@@ -10753,6 +10902,8 @@ async def get_transaction_detail(transaction_id: int):
         balance_before,
         balance_after,
         surplus_amount, # ⭐ 加入這行
+        floor_no,
+        parking_space_no,
         resident_name,
         department,
         card_number,
@@ -10776,8 +10927,11 @@ async def get_transaction_detail(transaction_id: int):
         "cardId": card_number or id_tag,
         "residentName": resident_name or "--",
         "department": department,
-        "householdDisplay": department or None,
-        "floorNo": department or None,
+        "householdDisplay": _floor_parking_display(
+            floor_no, parking_space_no
+        ),
+        "floorNo": floor_no,
+        "parkingSpaceNo": parking_space_no,
         "meterStart": meter_start,
         "startTimestamp": start_timestamp,
         "meterStop": meter_stop,
@@ -11424,7 +11578,8 @@ async def test_line_messaging(payload: dict = Body(...)):
                     lb.line_user_id,
                     lb.display_name,
                     lb.enabled,
-                    co.name AS resident_name,
+                    ha.floor_no,
+                    ha.parking_space_no,
                     ha.balance
                 FROM line_bindings lb
                 LEFT JOIN card_owners co ON co.card_id = lb.id_tag
@@ -11445,8 +11600,9 @@ async def test_line_messaging(payload: dict = Body(...)):
                 "lineUserId": str(row[1] or "").strip(),
                 "displayName": row[2],
                 "enabled": bool(row[3]),
-                "residentName": row[4],
-                "balance": float(row[5]) if row[5] is not None else None,
+                "floorNo": row[4],
+                "parkingSpaceNo": row[5],
+                "balance": float(row[6]) if row[6] is not None else None,
             }
 
         results = []
@@ -11473,7 +11629,8 @@ async def test_line_messaging(payload: dict = Body(...)):
                         "idTag": target,
                         "status": "skipped",
                         "reason": "disabled",
-                        "residentName": binding.get("residentName"),
+                        "floorNo": binding.get("floorNo"),
+                        "parkingSpaceNo": binding.get("parkingSpaceNo"),
                         "displayName": binding.get("displayName"),
                         "message": "此卡號的 LINE 綁定已停用",
                     }
@@ -11489,7 +11646,8 @@ async def test_line_messaging(payload: dict = Body(...)):
                         "idTag": target,
                         "status": "skipped",
                         "reason": "empty_line_user_id",
-                        "residentName": binding.get("residentName"),
+                        "floorNo": binding.get("floorNo"),
+                        "parkingSpaceNo": binding.get("parkingSpaceNo"),
                         "displayName": binding.get("displayName"),
                         "message": "此卡號沒有有效的 LINE userId",
                     }
@@ -11508,7 +11666,8 @@ async def test_line_messaging(payload: dict = Body(...)):
                         "idTag": target,
                         "status": "sent",
                         "reason": "ok",
-                        "residentName": binding.get("residentName"),
+                        "floorNo": binding.get("floorNo"),
+                        "parkingSpaceNo": binding.get("parkingSpaceNo"),
                         "displayName": binding.get("displayName"),
                         "lineResult": line_result,
                     }
@@ -11520,7 +11679,8 @@ async def test_line_messaging(payload: dict = Body(...)):
                         "idTag": target,
                         "status": "failed",
                         "reason": "line_api_error",
-                        "residentName": binding.get("residentName"),
+                        "floorNo": binding.get("floorNo"),
+                        "parkingSpaceNo": binding.get("parkingSpaceNo"),
                         "displayName": binding.get("displayName"),
                         "lineResult": line_result,
                     }
@@ -11614,8 +11774,9 @@ def _line_binding_row_to_dict(row):
         "enabled": bool(row[4]),
         "createdAt": row[5],
         "updatedAt": row[6],
-        "residentName": row[7] if len(row) > 7 else None,
-        "balance": float(row[8]) if len(row) > 8 and row[8] is not None else None,
+        "floorNo": row[7] if len(row) > 7 else None,
+        "parkingSpaceNo": row[8] if len(row) > 8 else None,
+        "balance": float(row[9]) if len(row) > 9 and row[9] is not None else None,
     }
 
 
@@ -11806,7 +11967,8 @@ def bind_line_user_to_id_tag(
                     lb.enabled,
                     lb.created_at,
                     lb.updated_at,
-                    co.name AS resident_name,
+                    ha.floor_no,
+                    ha.parking_space_no,
                     ha.balance
                 FROM line_bindings lb
                 LEFT JOIN card_owners co ON co.card_id = lb.id_tag
@@ -11869,7 +12031,7 @@ async def list_line_bindings(
     Query 可選：
     - enabled=true：只看啟用
     - enabled=false：只看停用
-    - q=關鍵字：搜尋 idTag / lineUserId / displayName / residentName
+    - q=關鍵字：搜尋 idTag / lineUserId / displayName / 樓號 / 車位號碼
     """
 
     where = []
@@ -11890,11 +12052,12 @@ async def list_line_bindings(
                 lb.id_tag LIKE ?
                 OR lb.line_user_id LIKE ?
                 OR IFNULL(lb.display_name, '') LIKE ?
-                OR IFNULL(co.name, '') LIKE ?
+                OR IFNULL(ha.floor_no, '') LIKE ?
+                OR IFNULL(ha.parking_space_no, '') LIKE ?
             )
             """
         )
-        params.extend([keyword, keyword, keyword, keyword])
+        params.extend([keyword, keyword, keyword, keyword, keyword])
 
     where_sql = ""
     if where:
@@ -11912,7 +12075,8 @@ async def list_line_bindings(
                 lb.enabled,
                 lb.created_at,
                 lb.updated_at,
-                co.name AS resident_name,
+                ha.floor_no,
+                ha.parking_space_no,
                 ha.balance
             FROM line_bindings lb
             LEFT JOIN card_owners co ON co.card_id = lb.id_tag
@@ -11952,7 +12116,8 @@ async def get_line_binding(id_tag: str = Path(...)):
                 lb.enabled,
                 lb.created_at,
                 lb.updated_at,
-                co.name AS resident_name,
+                ha.floor_no,
+                ha.parking_space_no,
                 ha.balance
             FROM line_bindings lb
             LEFT JOIN card_owners co ON co.card_id = lb.id_tag
@@ -12098,7 +12263,8 @@ async def create_or_update_line_binding(payload: dict = Body(...)):
                     lb.enabled,
                     lb.created_at,
                     lb.updated_at,
-                    co.name AS resident_name,
+                    ha.floor_no,
+                    ha.parking_space_no,
                     ha.balance
                 FROM line_bindings lb
                 LEFT JOIN card_owners co ON co.card_id = lb.id_tag
@@ -12238,7 +12404,8 @@ async def update_line_binding(id_tag: str = Path(...), payload: dict = Body(...)
                     lb.enabled,
                     lb.created_at,
                     lb.updated_at,
-                    co.name AS resident_name,
+                    ha.floor_no,
+                    ha.parking_space_no,
                     ha.balance
                 FROM line_bindings lb
                 LEFT JOIN card_owners co ON co.card_id = lb.id_tag
@@ -12864,12 +13031,10 @@ def get_cards():
                 ha.balance,
                 t.status,
                 t.valid_until,
-                COALESCE(ac.card_holder_name, o.name),
                 ac.account_id,
-                ha.account_code,
-                ha.account_name,
-                ac.relationship,
-                ac.status
+                ac.status,
+                ha.floor_no,
+                ha.parking_space_no
             FROM cards c
             LEFT JOIN id_tags t ON c.card_id = t.id_tag
             LEFT JOIN card_owners o ON c.card_id = o.card_id
@@ -12889,12 +13054,10 @@ def get_cards():
                 "balance": r[1],
                 "status": r[2],
                 "validUntil": r[3],
-                "accountId": r[5],
-                "accountCode": r[6],
-                "accountName": r[7],
-                "relationship": r[8],
-                "cardStatus": r[9],
-                "name": r[4],  # ⭐ 新增住戶名稱
+                "accountId": r[4],
+                "cardStatus": r[5],
+                "floorNo": r[6],
+                "parkingSpaceNo": r[7],
             }
         )
 
@@ -13976,6 +14139,8 @@ def get_community_dashboard():
             tx_resident_col = _pick_col(tx_columns, ["resident_name", "residentName", "user_name", "userName"])
             tx_balance_before_col = _pick_col(tx_columns, ["balance_before", "balanceBefore"])
             tx_balance_after_col = _pick_col(tx_columns, ["balance_after", "balanceAfter"])
+            tx_floor_col = _pick_col(tx_columns, ["floor_no", "floorNo"])
+            tx_parking_col = _pick_col(tx_columns, ["parking_space_no", "parkingSpaceNo"])
 
             payment_columns = _get_table_columns(cur, "payments")
             payment_tx_id_col = _pick_col(payment_columns, ["transaction_id", "transactionId", "tx_id", "txId"])
@@ -14232,6 +14397,8 @@ def get_community_dashboard():
                     tx_meter_stop_col,
                     tx_cost_col,
                     tx_resident_col,
+                    tx_floor_col,
+                    tx_parking_col,
                 ]:
                     if col and col not in active_select_cols:
                         active_select_cols.append(col)
@@ -14252,6 +14419,10 @@ def get_community_dashboard():
 
                     cp_info = cp_map.get(cp_id, {})
                     resident_name = _row_get(row, tx_resident_col, "") if tx_resident_col else ""
+                    floor_no = _row_get(row, tx_floor_col, None) if tx_floor_col else None
+                    parking_space_no = (
+                        _row_get(row, tx_parking_col, None) if tx_parking_col else None
+                    )
                     balance = None
 
                     # 從 cards 找住戶與餘額
@@ -14403,6 +14574,8 @@ def get_community_dashboard():
                         "chargePointId": cp_id,
                         "chargePointName": cp_info.get("chargePointName") or cp_id,
                         "residentName": resident_name or "",
+                        "floorNo": floor_no,
+                        "parkingSpaceNo": parking_space_no,
                         "cardId": card_id,
                         "status": _get_current_status(cp_id),
 
@@ -14462,7 +14635,7 @@ def get_community_dashboard():
             if True:
                 try:
                     cur.execute("""
-                        SELECT account_name, balance, account_code
+                        SELECT floor_no, parking_space_no, balance
                         FROM household_accounts
                         WHERE balance IS NOT NULL
                           AND balance < ?
@@ -14472,14 +14645,18 @@ def get_community_dashboard():
                     low_balance_rows = cur.fetchall()
 
                     for row in low_balance_rows:
-                        resident_name = row[0] or row[2] or ""
-                        balance = _round2(row[1])
+                        floor_no, parking_space_no, raw_balance = row
+                        household_display = _floor_parking_display(
+                            floor_no, parking_space_no, fallback="住戶"
+                        )
+                        balance = _round2(raw_balance)
                         alerts.append({
                             "type": "low_balance",
                             "level": "warning",
-                            "message": f"{resident_name or '住戶'} 餘額偏低，目前餘額 {balance} 元",
+                            "message": f"{household_display} 餘額偏低，目前餘額 {balance} 元",
                             "chargePointId": "",
-                            "residentName": resident_name or "",
+                            "floorNo": floor_no,
+                            "parkingSpaceNo": parking_space_no,
                         })
                 except Exception:
                     pass

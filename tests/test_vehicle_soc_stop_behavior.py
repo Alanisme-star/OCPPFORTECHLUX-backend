@@ -141,6 +141,24 @@ class VehicleSocStopBehaviorTests(unittest.IsolatedAsyncioTestCase):
             )
             conn.commit()
 
+        with main.household_connect(main.DB_FILE) as account_conn:
+            account = main.ensure_legacy_account_for_card(account_conn, CARD_ID)
+            self.test_floor_no = f"TEST-{account['account_id']}F"
+            self.test_parking_space_no = f"TEST-B{account['account_id']}"
+            account_conn.execute(
+                """
+                UPDATE household_accounts
+                SET floor_no=?, parking_space_no=?
+                WHERE account_id=?
+                """,
+                (
+                    self.test_floor_no,
+                    self.test_parking_space_no,
+                    account["account_id"],
+                ),
+            )
+            account_conn.commit()
+
         self.cp = SimpleNamespace(
             id=CP_ID,
             supports_smart_charging=True,
@@ -208,7 +226,7 @@ class VehicleSocStopBehaviorTests(unittest.IsolatedAsyncioTestCase):
                     """
                     SELECT transaction_id, meter_start, start_timestamp,
                            meter_stop, stop_timestamp, reason,
-                           balance_before, balance_after
+                           balance_before, balance_after, floor_no, parking_space_no
                     FROM transactions
                     ORDER BY transaction_id
                     """
@@ -259,12 +277,31 @@ class VehicleSocStopBehaviorTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_1_start_meter_values_then_suspended_ev_keeps_transaction_active(self):
         start_result, tx_id = await self._start(1000, "2026-07-20T02:00:00+00:00")
+        with main.get_conn() as conn:
+            conn.execute(
+                """
+                UPDATE household_accounts
+                SET floor_no='CHANGED-F', parking_space_no='CHANGED-P'
+                WHERE account_id=(
+                    SELECT account_id FROM account_cards WHERE card_id=?
+                )
+                """,
+                (CARD_ID,),
+            )
+            conn.commit()
         meter_result = await self._meter(tx_id, 1800, "2026-07-20T02:20:00+00:00")
         status_result = await self._status("SuspendedEV", "2026-07-20T02:21:00+00:00")
 
         state = self._print_snapshot("test_1_suspended_ev", [start_result, meter_result, status_result])
         self.assertEqual(len(state["transactions"]), 1)
         self.assertIsNone(state["transactions"][0]["stop_timestamp"])
+        self.assertEqual(
+            (
+                state["transactions"][0]["floor_no"],
+                state["transactions"][0]["parking_space_no"],
+            ),
+            (self.test_floor_no, self.test_parking_space_no),
+        )
         self.assertIsNone(state["transactions"][0]["meter_stop"])
         self.assertEqual(len(state["payments"]), 0)
         self.assertEqual(len(state["history"]), 0)

@@ -25,6 +25,8 @@ ENV/
 *.db
 *.sqlite
 *.sqlite3
+*.backup.*
+*.migration.lock
 
 # =========================
 # Logs / Runtime outputs
@@ -35,6 +37,7 @@ ENV/
 *.coverage
 .pytest_cache/
 htmlcov/
+coverage/
 
 # =========================
 # IDE / Editor
