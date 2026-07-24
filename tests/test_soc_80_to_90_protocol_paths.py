@@ -38,14 +38,14 @@ def _payload_value(payload, name):
 class Soc80To90ProtocolPathTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.line_calls = []
+        self.post_transaction_line_calls = []
         self.rebalance_calls = []
         self.remote_stop_calls = []
         self.profile_calls = []
         self.balance_stop_candidates = []
 
         self.originals = {
-            "schedule_charge_completed_line_notification": main.schedule_charge_completed_line_notification,
-            "schedule_low_balance_line_notification": main.schedule_low_balance_line_notification,
+            "schedule_post_transaction_line_notifications": main.schedule_post_transaction_line_notifications,
             "schedule_auto_stop_balance_insufficient_line_notification": main.schedule_auto_stop_balance_insufficient_line_notification,
             "request_rebalance": main.request_rebalance,
             "_schedule_balance_estimate_stop": main._schedule_balance_estimate_stop,
@@ -54,10 +54,17 @@ class Soc80To90ProtocolPathTests(unittest.IsolatedAsyncioTestCase):
             "_price_for_timestamp": main._price_for_timestamp,
         }
 
-        main.schedule_charge_completed_line_notification = (
-            lambda tx_id: self.line_calls.append(int(tx_id))
+        def fake_post_transaction_line_notifications(
+            tx_id, send_low_balance=False
+        ):
+            self.line_calls.append(int(tx_id))
+            self.post_transaction_line_calls.append(
+                (int(tx_id), bool(send_low_balance))
+            )
+
+        main.schedule_post_transaction_line_notifications = (
+            fake_post_transaction_line_notifications
         )
-        main.schedule_low_balance_line_notification = lambda _tx_id: None
         main.schedule_auto_stop_balance_insufficient_line_notification = (
             lambda _tx_id: None
         )
@@ -289,6 +296,7 @@ class Soc80To90ProtocolPathTests(unittest.IsolatedAsyncioTestCase):
             "balance": balance,
             "meter_values": meter_rows,
             "line_calls": list(self.line_calls),
+            "post_transaction_line_calls": list(self.post_transaction_line_calls),
             "active_transaction_ids": active_tx_ids,
             "smart_active_cp_ids": main.get_effective_active_cp_ids(),
             "charging_point_status": copy.deepcopy(
@@ -340,6 +348,10 @@ class Soc80To90ProtocolPathTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(after_duplicate_stop["payments"]), 1)
         self.assertEqual(len(after_duplicate_stop["history"]), 1)
         self.assertEqual(after_duplicate_stop["line_calls"], [tx_a])
+        self.assertEqual(
+            after_duplicate_stop["post_transaction_line_calls"],
+            [(tx_a, False)],
+        )
         self.assertEqual(after_duplicate_stop["balance"], 9992.0)
         self.assertEqual(after_duplicate_stop["stop_transaction_rows"], 1)
         self.assertEqual(
@@ -396,6 +408,10 @@ class Soc80To90ProtocolPathTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(final_state["payments"]), 2)
         self.assertEqual(len(final_state["history"]), 2)
         self.assertEqual(final_state["line_calls"], [tx_a, tx_b])
+        self.assertEqual(
+            final_state["post_transaction_line_calls"],
+            [(tx_a, False), (tx_b, False)],
+        )
         self.assertEqual(final_state["balance"], 9987.0)
         tx_a_row, tx_b_row = final_state["transactions"]
         self.assertEqual(tx_a_row["meter_start"], 1000)

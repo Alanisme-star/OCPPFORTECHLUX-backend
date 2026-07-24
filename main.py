@@ -1339,10 +1339,6 @@ from zoneinfo import ZoneInfo
 TZ_TAIPEI = ZoneInfo("Asia/Taipei")
 
 
-if "app" not in globals():
-    app = FastAPI()
-
-
 # === WebSocket 連線驗證設定（可選）===
 REQUIRED_TOKEN = os.getenv("OCPP_WS_TOKEN", None)
 
@@ -4938,33 +4934,21 @@ class ChargePoint(OcppChargePoint):
                         )
 
                 # ==================================================
-                # LINE 階段 7：StopTransaction 完成後自動推播
-                # 放在 DB commit 後，確保交易、扣款、餘額已完成。
-                # 注意：此處只排程，不等待 LINE API，避免影響 StopTransaction 回覆。
-                # ==================================================
-                try:
-                    schedule_charge_completed_line_notification(transaction_id)
-                except Exception as e:
-                    logger.exception(
-                        f"[LINE][CHARGE_COMPLETED][SCHEDULE_CALL_ERR] "
-                        f"tx_id={transaction_id} | err={e}"
-                    )
-
-                # ==================================================
                 # LINE 階段 1：交易完成後低餘額提醒
                 # 規則：
                 # - 每一筆交易完成後都重新判斷一次
                 # - 不使用永久 already_warned_low_balance 旗標
                 # - LINE 發送失敗不得影響 StopTransaction 回覆
                 # ==================================================
+                should_send_low_balance = False
                 try:
                     balance_after_for_low_balance = locals().get("balance_after")
-
-                    if (
+                    should_send_low_balance = (
                         balance_after_for_low_balance is not None
                         and float(balance_after_for_low_balance) < float(LOW_BALANCE_LINE_THRESHOLD)
-                    ):
-                        schedule_low_balance_line_notification(transaction_id)
+                    )
+
+                    if should_send_low_balance:
                         logger.warning(
                             f"[LINE][LOW_BALANCE][TRIGGERED] "
                             f"tx_id={transaction_id} | "
@@ -4983,6 +4967,22 @@ class ChargePoint(OcppChargePoint):
                     logger.exception(
                         f"[LINE][LOW_BALANCE][SCHEDULE_CALL_ERR] "
                         f"tx_id={transaction_id} | err={e}"
+                    )
+
+                # ==================================================
+                # LINE：交易完成通知與低餘額提醒共用同一 task，
+                # 依序完成第一則後才開始第二則。
+                # ==================================================
+                try:
+                    schedule_post_transaction_line_notifications(
+                        transaction_id,
+                        send_low_balance=should_send_low_balance,
+                    )
+                except Exception as e:
+                    logger.exception(
+                        f"[LINE][POST_TX][SCHEDULE_CALL_ERR] "
+                        f"tx_id={transaction_id} | "
+                        f"send_low_balance={should_send_low_balance} | err={e}"
                     )
 
                 # ==================================================
@@ -8171,15 +8171,17 @@ async def delete_card(id_tag: str):
 @app.get("/api/cards/{id_tag}/balance")
 def get_card_balance(id_tag: str):
     with household_connect(DB_FILE) as account_conn:
-        row = resolve_account_by_card(account_conn, id_tag)
-    if row is None:
-        return {"balance": 0, "found": False}
+        account = resolve_account_by_card(account_conn, id_tag)
+    if account is None:
+        return {
+            "card_id": id_tag,
+            "balance": 0,
+            "found": False,
+        }
     return {
         "card_id": id_tag,
-        "account_id": row["account_id"],
-        "account_code": row["account_code"],
-        "account_name": row["account_name"],
-        "balance": row["balance"],
+        "account_id": account["account_id"],
+        "balance": account["balance"],
         "found": True,
     }
 
@@ -10224,6 +10226,110 @@ def send_low_balance_line_notification(transaction_id: int) -> dict:
                 "transactionId": tx_id,
                 "error": str(e),
             }
+        )
+
+
+def schedule_post_transaction_line_notifications(
+    transaction_id: int,
+    send_low_balance: bool = False,
+) -> None:
+    """
+    以單一 asyncio task 依序發送交易完成後的 LINE 通知。
+
+    第一則完成通知失敗時只記錄錯誤；低餘額提醒仍會在第一則結束後嘗試。
+    """
+
+    try:
+        tx_id = int(transaction_id)
+    except Exception:
+        logging.warning(
+            f"[LINE][POST_TX][SCHEDULE_SKIP] "
+            f"tx_id={transaction_id} | send_low_balance={bool(send_low_balance)}"
+        )
+        return
+
+    should_send_low_balance = bool(send_low_balance)
+
+    async def _runner():
+        logging.warning(
+            f"[LINE][POST_TX][CHARGE_COMPLETED_START] "
+            f"tx_id={tx_id} | send_low_balance={should_send_low_balance}"
+        )
+        try:
+            charge_completed_result = await asyncio.to_thread(
+                send_charge_completed_line_notification,
+                tx_id,
+            )
+            if (
+                isinstance(charge_completed_result, dict)
+                and charge_completed_result.get("ok") is False
+            ):
+                logging.error(
+                    f"[LINE][POST_TX][CHARGE_COMPLETED_ERR] "
+                    f"tx_id={tx_id} | send_low_balance={should_send_low_balance} | "
+                    f"status={charge_completed_result.get('status')} | "
+                    f"reason={charge_completed_result.get('reason')}"
+                )
+            else:
+                logging.warning(
+                    f"[LINE][POST_TX][CHARGE_COMPLETED_DONE] "
+                    f"tx_id={tx_id} | send_low_balance={should_send_low_balance} | "
+                    f"status={charge_completed_result.get('status') if isinstance(charge_completed_result, dict) else None}"
+                )
+        except Exception as e:
+            logging.exception(
+                f"[LINE][POST_TX][CHARGE_COMPLETED_ERR] "
+                f"tx_id={tx_id} | send_low_balance={should_send_low_balance} | err={e}"
+            )
+
+        if should_send_low_balance:
+            logging.warning(
+                f"[LINE][POST_TX][LOW_BALANCE_START] "
+                f"tx_id={tx_id} | send_low_balance={should_send_low_balance}"
+            )
+            try:
+                low_balance_result = await asyncio.to_thread(
+                    send_low_balance_line_notification,
+                    tx_id,
+                )
+                if (
+                    isinstance(low_balance_result, dict)
+                    and low_balance_result.get("ok") is False
+                ):
+                    logging.error(
+                        f"[LINE][POST_TX][LOW_BALANCE_ERR] "
+                        f"tx_id={tx_id} | send_low_balance={should_send_low_balance} | "
+                        f"status={low_balance_result.get('status')} | "
+                        f"reason={low_balance_result.get('reason')}"
+                    )
+                else:
+                    logging.warning(
+                        f"[LINE][POST_TX][LOW_BALANCE_DONE] "
+                        f"tx_id={tx_id} | send_low_balance={should_send_low_balance} | "
+                        f"status={low_balance_result.get('status') if isinstance(low_balance_result, dict) else None}"
+                    )
+            except Exception as e:
+                logging.exception(
+                    f"[LINE][POST_TX][LOW_BALANCE_ERR] "
+                    f"tx_id={tx_id} | send_low_balance={should_send_low_balance} | err={e}"
+                )
+
+        logging.warning(
+            f"[LINE][POST_TX][DONE] "
+            f"tx_id={tx_id} | send_low_balance={should_send_low_balance}"
+        )
+
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(_runner())
+        logging.warning(
+            f"[LINE][POST_TX][SCHEDULED] "
+            f"tx_id={tx_id} | send_low_balance={should_send_low_balance}"
+        )
+    except RuntimeError as e:
+        logging.exception(
+            f"[LINE][POST_TX][SCHEDULE_ERR] "
+            f"tx_id={tx_id} | send_low_balance={should_send_low_balance} | err={e}"
         )
 
 

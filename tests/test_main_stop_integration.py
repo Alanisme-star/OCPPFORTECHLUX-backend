@@ -255,18 +255,17 @@ class MainStopIntegrationTests(unittest.IsolatedAsyncioTestCase):
             )
             conn.commit()
 
-        counters = {"completed": 0, "low": 0, "auto": 0, "rebalance": 0}
+        counters = {"post_tx": [], "auto": 0, "rebalance": 0}
         originals = (
-            main.schedule_charge_completed_line_notification,
-            main.schedule_low_balance_line_notification,
+            main.schedule_post_transaction_line_notifications,
             main.schedule_auto_stop_balance_insufficient_line_notification,
             main.request_rebalance,
         )
-        main.schedule_charge_completed_line_notification = lambda tx: counters.__setitem__(
-            "completed", counters["completed"] + 1
-        )
-        main.schedule_low_balance_line_notification = lambda tx: counters.__setitem__(
-            "low", counters["low"] + 1
+
+        main.schedule_post_transaction_line_notifications = (
+            lambda tx, send_low_balance=False: counters["post_tx"].append(
+                (int(tx), bool(send_low_balance))
+            )
         )
         main.schedule_auto_stop_balance_insufficient_line_notification = (
             lambda tx: counters.__setitem__("auto", counters["auto"] + 1)
@@ -304,13 +303,11 @@ class MainStopIntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(balance_after_first, balance_after_second)
             self.assertEqual(payment_count, 1)
             self.assertEqual(stop_count, 1)
-            self.assertEqual(counters["completed"], 1)
-            self.assertEqual(counters["low"], 1)
+            self.assertEqual(counters["post_tx"], [(tx_id, True)])
             self.assertEqual(counters["auto"], 1)
         finally:
             (
-                main.schedule_charge_completed_line_notification,
-                main.schedule_low_balance_line_notification,
+                main.schedule_post_transaction_line_notifications,
                 main.schedule_auto_stop_balance_insufficient_line_notification,
                 main.request_rebalance,
             ) = originals

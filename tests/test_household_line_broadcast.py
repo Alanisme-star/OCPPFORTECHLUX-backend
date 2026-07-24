@@ -208,10 +208,8 @@ class HouseholdLineBroadcastTests(unittest.TestCase):
             ),
             patch.object(
                 main,
-                "schedule_charge_completed_line_notification",
-                side_effect=main.send_charge_completed_line_notification,
-            ),
-            patch.object(main, "schedule_low_balance_line_notification"),
+                "schedule_post_transaction_line_notifications",
+            ) as post_tx_scheduler,
             patch.object(
                 main, "schedule_auto_stop_balance_insufficient_line_notification"
             ),
@@ -223,6 +221,11 @@ class HouseholdLineBroadcastTests(unittest.TestCase):
             cp = SimpleNamespace(id="CP-1005")
             asyncio.run(main.ChargePoint.on_stop_transaction(cp, **stop_args))
             asyncio.run(main.ChargePoint.on_stop_transaction(cp, **stop_args))
+            post_tx_scheduler.assert_called_once_with(
+                1005,
+                send_low_balance=True,
+            )
+            main.send_charge_completed_line_notification(1005)
 
         conn = connect(self.db_file)
         self.assertEqual(get_account_by_id(conn, account["account_id"])["balance"], 900)
@@ -373,10 +376,8 @@ class HouseholdLineBroadcastTests(unittest.TestCase):
             ),
             patch.object(
                 main,
-                "schedule_charge_completed_line_notification",
-                side_effect=main.send_charge_completed_line_notification,
-            ),
-            patch.object(main, "schedule_low_balance_line_notification"),
+                "schedule_post_transaction_line_notifications",
+            ) as post_tx_scheduler,
             patch.object(
                 main, "schedule_auto_stop_balance_insufficient_line_notification"
             ),
@@ -392,6 +393,11 @@ class HouseholdLineBroadcastTests(unittest.TestCase):
                     reason="Local",
                 )
             )
+            post_tx_scheduler.assert_called_once_with(
+                1008,
+                send_low_balance=True,
+            )
+            main.send_charge_completed_line_notification(1008)
 
         conn = connect(self.db_file)
         self.assertEqual(get_account_by_id(conn, account["account_id"])["balance"], 900)

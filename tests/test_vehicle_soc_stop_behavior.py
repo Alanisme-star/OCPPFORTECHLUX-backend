@@ -35,7 +35,7 @@ def _payload_value(payload, name):
 class VehicleSocStopBehaviorTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.line_completed_calls = []
-        self.low_balance_calls = []
+        self.post_transaction_line_calls = []
         self.auto_stop_line_calls = []
         self.rebalance_calls = []
         self.balance_stop_candidates = []
@@ -43,8 +43,7 @@ class VehicleSocStopBehaviorTests(unittest.IsolatedAsyncioTestCase):
         self.remote_stop_calls = []
 
         self.originals = {
-            "schedule_charge_completed_line_notification": main.schedule_charge_completed_line_notification,
-            "schedule_low_balance_line_notification": main.schedule_low_balance_line_notification,
+            "schedule_post_transaction_line_notifications": main.schedule_post_transaction_line_notifications,
             "schedule_auto_stop_balance_insufficient_line_notification": main.schedule_auto_stop_balance_insufficient_line_notification,
             "request_rebalance": main.request_rebalance,
             "_schedule_balance_estimate_stop": main._schedule_balance_estimate_stop,
@@ -53,11 +52,16 @@ class VehicleSocStopBehaviorTests(unittest.IsolatedAsyncioTestCase):
             "request_transaction_stop": main.request_transaction_stop,
         }
 
-        main.schedule_charge_completed_line_notification = (
-            lambda tx_id: self.line_completed_calls.append(int(tx_id))
-        )
-        main.schedule_low_balance_line_notification = (
-            lambda tx_id: self.low_balance_calls.append(int(tx_id))
+        def fake_post_transaction_line_notifications(
+            tx_id, send_low_balance=False
+        ):
+            self.line_completed_calls.append(int(tx_id))
+            self.post_transaction_line_calls.append(
+                (int(tx_id), bool(send_low_balance))
+            )
+
+        main.schedule_post_transaction_line_notifications = (
+            fake_post_transaction_line_notifications
         )
         main.schedule_auto_stop_balance_insufficient_line_notification = (
             lambda tx_id: self.auto_stop_line_calls.append(int(tx_id))
@@ -260,6 +264,7 @@ class VehicleSocStopBehaviorTests(unittest.IsolatedAsyncioTestCase):
             "balance": balance,
             "meter_value_counts": meter_counts,
             "line_completed_calls": list(self.line_completed_calls),
+            "post_transaction_line_calls": list(self.post_transaction_line_calls),
             "line_completed_messages": [
                 main.build_charge_completed_line_message(tx_id).get("message")
                 for tx_id in self.line_completed_calls
@@ -307,6 +312,7 @@ class VehicleSocStopBehaviorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(state["history"]), 0)
         self.assertEqual(state["balance"], INITIAL_BALANCE)
         self.assertEqual(state["line_completed_calls"], [])
+        self.assertEqual(state["post_transaction_line_calls"], [])
         self.assertEqual(state["smart_active_cp_ids"], [CP_ID])
         self.assertEqual(state["charging_point_status"]["status"], "SuspendedEV")
         self.assertEqual(state["live_status_cache"]["status"], "SuspendedEV")
@@ -326,6 +332,7 @@ class VehicleSocStopBehaviorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(state["payments"]), 1)
         self.assertLess(state["balance"], INITIAL_BALANCE)
         self.assertEqual(state["line_completed_calls"], [tx_id])
+        self.assertEqual(state["post_transaction_line_calls"], [(tx_id, False)])
         self.assertEqual(state["smart_active_cp_ids"], [])
         self.assertEqual(len(history["history"]), 1)
         self.assertEqual(history["history"][0]["stop_timestamp"], "2026-07-20T03:21:00+00:00")
@@ -349,6 +356,10 @@ class VehicleSocStopBehaviorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(state["payments"]), 2)
         self.assertEqual(len(state["history"]), 2)
         self.assertEqual(state["line_completed_calls"], [tx_a, tx_b])
+        self.assertEqual(
+            state["post_transaction_line_calls"],
+            [(tx_a, False), (tx_b, False)],
+        )
         self.assertEqual(tx_rows[0]["meter_start"], 1000)
         self.assertEqual(tx_rows[0]["meter_stop"], 1800)
         self.assertEqual(tx_rows[1]["meter_start"], 1800)
@@ -373,6 +384,7 @@ class VehicleSocStopBehaviorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(state["payments"]), 1)
         self.assertEqual(len(state["history"]), 1)
         self.assertEqual(state["line_completed_calls"], [tx_id])
+        self.assertEqual(state["post_transaction_line_calls"], [(tx_id, False)])
         self.assertEqual(state["smart_active_cp_ids"], [])
         self.assertEqual(state["meter_value_counts"][str(tx_id)], 2)
         self.assertEqual(state["charging_point_status"]["status"], "Available")
@@ -406,6 +418,7 @@ class VehicleSocStopBehaviorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state["transactions"][0]["stop_timestamp"], "2026-07-20T06:41:00+00:00")
         self.assertEqual(len(state["payments"]), 1)
         self.assertEqual(state["line_completed_calls"], [tx_id])
+        self.assertEqual(state["post_transaction_line_calls"], [(tx_id, False)])
         self.assertEqual(state["smart_active_cp_ids"], [])
 
 

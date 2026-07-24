@@ -622,13 +622,15 @@ class HouseholdAccountTests(unittest.TestCase):
             "timestamp": "2026-07-22T01:00:00+00:00",
             "reason": "Remote",
         }
-        completed_notifications = []
+        post_transaction_notifications = []
         no_notification = patch.multiple(
             main,
-            schedule_charge_completed_line_notification=(
-                lambda transaction_id: completed_notifications.append(transaction_id)
+            schedule_post_transaction_line_notifications=(
+                lambda transaction_id, send_low_balance=False:
+                post_transaction_notifications.append(
+                    (transaction_id, bool(send_low_balance))
+                )
             ),
-            schedule_low_balance_line_notification=lambda *_: None,
             schedule_auto_stop_balance_insufficient_line_notification=lambda *_: None,
         )
         with (
@@ -651,7 +653,7 @@ class HouseholdAccountTests(unittest.TestCase):
             asyncio.run(main.ChargePoint.on_stop_transaction(cp, **stop_kwargs))
 
         verify = connect(self.db_file)
-        self.assertEqual(completed_notifications, [901])
+        self.assertEqual(post_transaction_notifications, [(901, True)])
         self.assertEqual(get_account_by_id(verify, account["account_id"])["balance"], 900)
         self.assertEqual(verify.execute("SELECT COUNT(*) FROM payments WHERE transaction_id=901").fetchone()[0], 1)
         self.assertIsNotNone(verify.execute("SELECT stop_timestamp FROM transactions WHERE transaction_id=901").fetchone()[0])
@@ -764,8 +766,7 @@ class HouseholdAccountTests(unittest.TestCase):
                 ),
                 patch.multiple(
                     main,
-                    schedule_charge_completed_line_notification=lambda *_: None,
-                    schedule_low_balance_line_notification=lambda *_: None,
+                    schedule_post_transaction_line_notifications=lambda *_args, **_kwargs: None,
                     schedule_auto_stop_balance_insufficient_line_notification=lambda *_: None,
                 ),
                 ThreadPoolExecutor(max_workers=2) as pool,
