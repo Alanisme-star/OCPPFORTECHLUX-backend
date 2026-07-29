@@ -39,13 +39,26 @@ def _request_alias(
 
 def _household_api_payload(account: dict, cards: list[dict] | None = None) -> dict:
     """Expose the floor/parking contract without leaking deprecated identity fields."""
+    first_card_holder_name = next(
+        (
+            card.get("card_holder_name")
+            for card in (cards or [])
+            if card.get("card_holder_name") is not None
+            and str(card.get("card_holder_name")).strip()
+        ),
+        None,
+    )
     payload = {
         "account_id": account.get("account_id"),
         "accountId": account.get("account_id"),
+        "door_no": account.get("door_no"),
+        "doorNo": account.get("door_no"),
         "floor_no": account.get("floor_no"),
         "floorNo": account.get("floor_no"),
         "parking_space_no": account.get("parking_space_no"),
         "parkingSpaceNo": account.get("parking_space_no"),
+        "first_card_holder_name": first_card_holder_name,
+        "firstCardHolderName": first_card_holder_name,
         "balance": account.get("balance"),
         "status": account.get("status"),
         "created_at": account.get("created_at"),
@@ -92,6 +105,7 @@ def api_create_household_account(data: dict = Body(...)):
                     ),
                     data.get("balance", 0),
                     data.get("status", "active"),
+                    door_no=_request_alias(data, "door_no", "doorNo", ""),
                 ),
                 [],
             )
@@ -114,6 +128,7 @@ def api_get_household_account(account_id: int):
 def api_update_household_account(account_id: int, data: dict = Body(...)):
     try:
         fields = {
+            "door_no": _request_alias(data, "door_no", "doorNo"),
             "floor_no": _request_alias(data, "floor_no", "floorNo"),
             "parking_space_no": _request_alias(
                 data, "parking_space_no", "parkingSpaceNo"
@@ -129,8 +144,11 @@ def api_update_household_account(account_id: int, data: dict = Body(...)):
     }
     with household_connect(DB_FILE) as account_conn:
         try:
+            account = update_household_account(account_conn, account_id, **fields)
+            cards = list_account_cards(account_conn, account_id)
             return _household_api_payload(
-                update_household_account(account_conn, account_id, **fields)
+                account,
+                cards,
             )
         except HouseholdAccountError as exc:
             raise _household_http_error(exc) from exc
@@ -140,8 +158,12 @@ def api_update_household_account(account_id: int, data: dict = Body(...)):
 def api_topup_household_account(account_id: int, data: dict = Body(...)):
     with household_connect(DB_FILE) as account_conn:
         try:
+            account = topup_household_account(
+                account_conn, account_id, data.get("amount")
+            )
             return _household_api_payload(
-                topup_household_account(account_conn, account_id, data.get("amount"))
+                account,
+                list_account_cards(account_conn, account_id),
             )
         except HouseholdAccountError as exc:
             raise _household_http_error(exc) from exc
@@ -160,12 +182,16 @@ def api_add_account_card(account_id: int, data: dict = Body(...)):
     card_id = data.get("card_id") or data.get("cardId") or data.get("idTag") or ""
     with household_connect(DB_FILE) as account_conn:
         try:
+            card_holder_name = _request_alias(
+                data, "card_holder_name", "cardHolderName", None
+            )
             result = bind_card_to_account(
                 account_conn,
                 account_id,
                 card_id,
                 status=data.get("status", "active"),
                 valid_until=data.get("valid_until", data.get("validUntil")),
+                card_holder_name=card_holder_name,
             )
             for cp_id in data.get("charge_point_ids", data.get("chargePointIds", [])) or []:
                 if not account_conn.execute(
@@ -184,10 +210,22 @@ def api_add_account_card(account_id: int, data: dict = Body(...)):
 
 @app.put("/api/account-cards/{card_id}")
 def api_update_account_card(card_id: str, data: dict = Body(...)):
+    try:
+        fields = {
+            "status": data.get("status"),
+            "card_holder_name": _request_alias(
+                data,
+                "card_holder_name",
+                "cardHolderName",
+            ),
+        }
+    except HouseholdAccountError as exc:
+        raise _household_http_error(exc) from exc
     fields = {
-        "status": data.get("status"),
+        key: value
+        for key, value in fields.items()
+        if value is not None and value is not _REQUEST_MISSING
     }
-    fields = {key: value for key, value in fields.items() if value is not None}
     with household_connect(DB_FILE) as account_conn:
         try:
             return update_account_card(account_conn, card_id, **fields)
@@ -215,6 +253,9 @@ def api_create_card_enrollment(data: dict = Body(...)):
                 data.get("requested_by", data.get("requestedBy")),
                 duration_seconds=int(
                     data.get("duration_seconds", data.get("durationSeconds", 120))
+                ),
+                card_holder_name=_request_alias(
+                    data, "card_holder_name", "cardHolderName", None
                 ),
             )
         except (HouseholdAccountError, TypeError, ValueError) as exc:
@@ -2203,6 +2244,92 @@ def get_conn(timeout_seconds: float = 15, busy_timeout_ms: int = 15000):
     conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)};")
     conn.execute("PRAGMA foreign_keys=ON;")
     return conn
+
+
+def _transaction_row_mapping(row, columns=None):
+    """Return a safe mapping for sqlite3.Row, dict, or an indexed row."""
+    if row is None:
+        return {}
+    if isinstance(row, dict):
+        return dict(row)
+    if hasattr(row, "keys"):
+        try:
+            return {key: row[key] for key in row.keys()}
+        except Exception:
+            return {}
+    if isinstance(row, (tuple, list)) and columns:
+        return dict(zip(columns, row))
+    return {}
+
+
+def _transaction_snapshot_payload(row, columns=None, card_holder_fallback=None):
+    """Serialize transaction-owned identity fields with snake/camel aliases."""
+    data = _transaction_row_mapping(row, columns)
+    card_holder_name = data.get("card_holder_name")
+    if (
+        (card_holder_name is None or not str(card_holder_name).strip())
+        and card_holder_fallback is not None
+    ):
+        card_holder_name = card_holder_fallback
+
+    transaction_id = data.get("transaction_id")
+    charge_point_id = data.get("charge_point_id")
+    connector_id = data.get("connector_id")
+    account_id = data.get("account_id")
+    id_tag = data.get("id_tag")
+    door_no = data.get("door_no")
+    floor_no = data.get("floor_no")
+    parking_space_no = data.get("parking_space_no")
+    start_timestamp = data.get("start_timestamp")
+    stop_timestamp = data.get("stop_timestamp")
+    meter_start = data.get("meter_start")
+    meter_stop = data.get("meter_stop")
+    energy_kwh = data.get("energy_kwh")
+    balance_before = data.get("balance_before")
+    balance_after = data.get("balance_after")
+    cost = data.get("cost")
+    surplus_amount = data.get("surplus_amount")
+
+    return {
+        "transaction_id": transaction_id,
+        "transactionId": transaction_id,
+        "charge_point_id": charge_point_id,
+        "chargePointId": charge_point_id,
+        "connector_id": connector_id,
+        "connectorId": connector_id,
+        "account_id": account_id,
+        "accountId": account_id,
+        "id_tag": id_tag,
+        "idTag": id_tag,
+        "card_id": id_tag,
+        "cardId": id_tag,
+        "door_no": door_no,
+        "doorNo": door_no,
+        "floor_no": floor_no,
+        "floorNo": floor_no,
+        "parking_space_no": parking_space_no,
+        "parkingSpaceNo": parking_space_no,
+        "card_holder_name": card_holder_name,
+        "cardHolderName": card_holder_name,
+        "start_timestamp": start_timestamp,
+        "startTimestamp": start_timestamp,
+        "stop_timestamp": stop_timestamp,
+        "stopTimestamp": stop_timestamp,
+        "meter_start": meter_start,
+        "meterStart": meter_start,
+        "meter_stop": meter_stop,
+        "meterStop": meter_stop,
+        "energy_kwh": energy_kwh,
+        "energyKwh": energy_kwh,
+        "balance_before": balance_before,
+        "balanceBefore": balance_before,
+        "balance_after": balance_after,
+        "balanceAfter": balance_after,
+        "cost": cost,
+        "amount": cost,
+        "surplus_amount": surplus_amount,
+        "surplusAmount": surplus_amount,
+    }
 
 
 def get_community_settings():
@@ -4279,7 +4406,8 @@ class ChargePoint(OcppChargePoint):
                 cursor = account_conn.cursor()
                 cursor.execute(
                     """
-                    SELECT ac.account_id, ha.floor_no, ha.parking_space_no,
+                    SELECT ac.account_id, ha.door_no, ha.floor_no,
+                           ha.parking_space_no, ac.card_holder_name,
                            ac.status, ha.status, ha.balance,
                            EXISTS(
                                SELECT 1 FROM card_whitelist cw
@@ -4311,8 +4439,10 @@ class ChargePoint(OcppChargePoint):
 
             (
                 account_id,
+                door_no,
                 floor_no,
                 parking_space_no,
+                card_holder_name,
                 card_status,
                 account_status,
                 shared_balance,
@@ -4496,9 +4626,11 @@ class ChargePoint(OcppChargePoint):
                             meter_start,
                             start_timestamp,
                             account_id,
+                            door_no,
                             floor_no,
-                            parking_space_no
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                            parking_space_no,
+                            card_holder_name
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             self.id,
@@ -4507,8 +4639,10 @@ class ChargePoint(OcppChargePoint):
                             int(meter_start),
                             start_ts_to_save,
                             account_id,
+                            door_no,
                             floor_no,
                             parking_space_no,
+                            card_holder_name,
                         ),
                     )
                     tx_id = cursor.lastrowid
@@ -6589,8 +6723,23 @@ def get_current_tx_summary_by_cp(charge_point_id: str):
         cur.execute(
             """
             SELECT t.transaction_id, t.id_tag, t.start_timestamp, t.stop_timestamp,
-                   t.meter_start, t.meter_stop
+                   t.meter_start, t.meter_stop,
+                   COALESCE(t.account_id, ac.account_id) AS account_id,
+                   COALESCE(NULLIF(TRIM(t.door_no), ''), ha.door_no) AS door_no,
+                   COALESCE(NULLIF(TRIM(t.floor_no), ''), ha.floor_no) AS floor_no,
+                   COALESCE(
+                       NULLIF(TRIM(t.parking_space_no), ''),
+                       ha.parking_space_no
+                   ) AS parking_space_no,
+                   COALESCE(
+                       NULLIF(TRIM(t.card_holder_name), ''),
+                       ac.card_holder_name
+                   ) AS card_holder_name
             FROM transactions t
+            LEFT JOIN account_cards ac
+                ON UPPER(TRIM(ac.card_id)) = UPPER(TRIM(t.id_tag))
+            LEFT JOIN household_accounts ha
+                ON ha.account_id = COALESCE(t.account_id, ac.account_id)
             WHERE t.charge_point_id = ? AND t.stop_timestamp IS NULL
             ORDER BY t.transaction_id DESC
             LIMIT 1
@@ -6600,7 +6749,19 @@ def get_current_tx_summary_by_cp(charge_point_id: str):
         row = cur.fetchone()
         if not row:
             return {"found": False}
-        tx_id, id_tag, start_ts, stop_ts, meter_start, meter_stop = row
+        (
+            tx_id,
+            id_tag,
+            start_ts,
+            stop_ts,
+            meter_start,
+            meter_stop,
+            account_id,
+            door_no,
+            floor_no,
+            parking_space_no,
+            card_holder_name,
+        ) = row
 
         # 先抓 payments 總額（若交易已正式結帳可直接使用）
         cur.execute(
@@ -6647,12 +6808,8 @@ def get_current_tx_summary_by_cp(charge_point_id: str):
                 f"segments_count={len(pricing_segments)}"
             )
 
-        return {
+        response = {
             "found": True,
-            "transaction_id": tx_id,
-            "id_tag": id_tag,
-            "start_timestamp": start_ts,
-            "stop_timestamp": stop_ts,
             "total_amount": round(float(total_amount), 2),
             "estimated_amount": round(float(live_total_amount), 2),
             "payment_total_amount": round(float(payment_total_amount), 2),
@@ -6661,6 +6818,26 @@ def get_current_tx_summary_by_cp(charge_point_id: str):
             "pricing_breakdown_total": round(float(live_total_amount), 2),
             "pricing_segments": pricing_segments,
         }
+        response.update(
+            _transaction_snapshot_payload(
+                {
+                    "transaction_id": tx_id,
+                    "charge_point_id": cp_id,
+                    "account_id": account_id,
+                    "id_tag": id_tag,
+                    "door_no": door_no,
+                    "floor_no": floor_no,
+                    "parking_space_no": parking_space_no,
+                    "card_holder_name": card_holder_name,
+                    "start_timestamp": start_ts,
+                    "stop_timestamp": stop_ts,
+                    "meter_start": meter_start,
+                    "meter_stop": meter_stop,
+                    "energy_kwh": final_energy,
+                }
+            )
+        )
+        return response
 
 @app.get("/api/charge-points/{charge_point_id}/last-finished-transaction/summary")
 def get_last_finished_tx_summary_by_cp(charge_point_id: str):
@@ -7109,7 +7286,9 @@ def get_card_history(card_id: str, limit: int = 20):
         cur.execute(
             f"""
             SELECT p.transaction_id, p.total_amount, p.paid_at,
-                   t.start_timestamp, t.stop_timestamp
+                   t.start_timestamp, t.stop_timestamp, t.account_id,
+                   t.id_tag, t.door_no, t.floor_no, t.parking_space_no,
+                   t.card_holder_name
             FROM payments p
             LEFT JOIN transactions t ON p.transaction_id = t.transaction_id
             WHERE p.transaction_id IN ({q_marks})
@@ -7123,15 +7302,27 @@ def get_card_history(card_id: str, limit: int = 20):
 
     history = []
     for row in rows:
-        history.append(
-            {
-                "transaction_id": row[0],
-                "amount": float(row[1] or 0),
-                "paid_at": row[2],
-                "start_timestamp": row[3],
-                "stop_timestamp": row[4],
-            }
+        history_item = {
+            "amount": float(row[1] or 0),
+            "paid_at": row[2],
+        }
+        history_item.update(
+            _transaction_snapshot_payload(
+                {
+                    "transaction_id": row[0],
+                    "account_id": row[5],
+                    "id_tag": row[6],
+                    "door_no": row[7],
+                    "floor_no": row[8],
+                    "parking_space_no": row[9],
+                    "card_holder_name": row[10],
+                    "start_timestamp": row[3],
+                    "stop_timestamp": row[4],
+                    "cost": float(row[1] or 0),
+                }
+            )
         )
+        history.append(history_item)
 
     return {"card_id": card_id, "history": history}
 
@@ -8459,6 +8650,7 @@ async def get_transactions(
             t.account_code,
             t.card_holder_name,
             ha.account_name,
+            t.door_no,
             t.floor_no,
             t.parking_space_no
         FROM transactions t
@@ -8533,6 +8725,7 @@ async def get_transactions(
             account_code,
             card_holder_name,
             account_name,
+            door_no,
             floor_no,
             parking_space_no,
         ) = row
@@ -8563,60 +8756,62 @@ async def get_transactions(
                 duration_text = "--"
 
         household_display = _floor_parking_display(floor_no, parking_space_no)
-
-        result.append(
-            {
-                "transactionId": transaction_id,
-                "chargePointId": cp_id,
-                "connectorId": connector_id,
-                "residentName": resident_name or "--",
-
-                "cardId": card_number or id_tag,
-                "idTag": id_tag,
-                "cardNumber": card_number or id_tag,
-                "accountId": account_id,
-                "accountCode": account_code,
-                "accountName": account_name,
-                "cardHolderName": card_holder_name or resident_name,
-
-                "department": department or "--",
-                "householdDisplay": household_display,
-                "floorNo": floor_no,
-                "parkingSpaceNo": parking_space_no,
-
-                "startTimestamp": start_timestamp,
-                "stopTimestamp": stop_timestamp,
-
-                "durationMinutes": duration_minutes,
-                "durationText": duration_text,
-                "energyKwh": energy_kwh,
-
-                "balanceBefore": (
-                    round(float(balance_before), 2)
-                    if balance_before is not None
-                    else None
-                ),
-                "cost": (
-                    round(float(total_amount), 2)
-                    if total_amount is not None
-                    else None
-                ),
-                "balanceAfter": (
-                    round(float(balance_after), 2)
-                    if balance_after is not None
-                    else None
-                ),
-                "surplusAmount": (
-                    round(float(surplus_amount), 2)
-                    if surplus_amount is not None
-                    else 0.0
-                ),
-
-                "meterStart": meter_start,
-                "meterStop": meter_stop,
-                "reason": reason,
-            }
+        rounded_balance_before = (
+            round(float(balance_before), 2)
+            if balance_before is not None
+            else None
         )
+        rounded_cost = (
+            round(float(total_amount), 2)
+            if total_amount is not None
+            else None
+        )
+        rounded_balance_after = (
+            round(float(balance_after), 2)
+            if balance_after is not None
+            else None
+        )
+        rounded_surplus = (
+            round(float(surplus_amount), 2)
+            if surplus_amount is not None
+            else 0.0
+        )
+        payload = {
+            "residentName": resident_name or "--",
+            "cardNumber": card_number or id_tag,
+            "accountCode": account_code,
+            "accountName": account_name,
+            "department": department or "--",
+            "householdDisplay": household_display,
+            "durationMinutes": duration_minutes,
+            "durationText": duration_text,
+            "reason": reason,
+        }
+        payload.update(
+            _transaction_snapshot_payload(
+                {
+                    "transaction_id": transaction_id,
+                    "charge_point_id": cp_id,
+                    "connector_id": connector_id,
+                    "account_id": account_id,
+                    "id_tag": id_tag,
+                    "door_no": door_no,
+                    "floor_no": floor_no,
+                    "parking_space_no": parking_space_no,
+                    "card_holder_name": card_holder_name,
+                    "start_timestamp": start_timestamp,
+                    "stop_timestamp": stop_timestamp,
+                    "meter_start": meter_start,
+                    "meter_stop": meter_stop,
+                    "energy_kwh": energy_kwh,
+                    "balance_before": rounded_balance_before,
+                    "balance_after": rounded_balance_after,
+                    "cost": rounded_cost,
+                    "surplus_amount": rounded_surplus,
+                }
+            )
+        )
+        result.append(payload)
 
     if includeSummary:
         active_charge_point_ids = sorted(
@@ -10972,8 +11167,12 @@ async def get_transaction_detail(transaction_id: int):
             t.balance_before,
             t.balance_after,
             t.surplus_amount, -- ⭐ 加入這行
+            t.account_id,
+            t.account_code,
+            t.door_no,
             t.floor_no,
             t.parking_space_no,
+            t.card_holder_name,
             COALESCE(
                 NULLIF(TRIM(u.name), ''),
                 NULLIF(TRIM(co.name), '')
@@ -11008,8 +11207,12 @@ async def get_transaction_detail(transaction_id: int):
         balance_before,
         balance_after,
         surplus_amount, # ⭐ 加入這行
+        account_id,
+        account_code,
+        door_no,
         floor_no,
         parking_space_no,
+        card_holder_name,
         resident_name,
         department,
         card_number,
@@ -11024,43 +11227,55 @@ async def get_transaction_detail(transaction_id: int):
         except Exception:
             energy_kwh = None
 
+    rounded_balance_before = (
+        round(float(balance_before), 2)
+        if balance_before is not None
+        else None
+    )
+    rounded_balance_after = (
+        round(float(balance_after), 2)
+        if balance_after is not None
+        else None
+    )
+    rounded_surplus = (
+        round(float(surplus_amount), 2)
+        if surplus_amount is not None
+        else 0.0
+    )
     result = {
-        "transactionId": tx_id,
-        "chargePointId": charge_point_id,
-        "connectorId": connector_id,
-        "idTag": id_tag,
         "cardNumber": card_number or id_tag,
-        "cardId": card_number or id_tag,
         "residentName": resident_name or "--",
         "department": department,
+        "accountCode": account_code,
         "householdDisplay": _floor_parking_display(
             floor_no, parking_space_no
         ),
-        "floorNo": floor_no,
-        "parkingSpaceNo": parking_space_no,
-        "meterStart": meter_start,
-        "startTimestamp": start_timestamp,
-        "meterStop": meter_stop,
-        "stopTimestamp": stop_timestamp,
         "reason": reason,
-        "energyKwh": energy_kwh,
-        "balanceBefore": (
-            round(float(balance_before), 2)
-            if balance_before is not None
-            else None
-        ),
-        "balanceAfter": (
-            round(float(balance_after), 2)
-            if balance_after is not None
-            else None
-        ),
-        "surplusAmount": ( # ⭐ 加入這行
-            round(float(surplus_amount), 2)
-            if surplus_amount is not None
-            else 0.0
-        ),
         "meterValues": [],
     }
+    result.update(
+        _transaction_snapshot_payload(
+            {
+                "transaction_id": tx_id,
+                "charge_point_id": charge_point_id,
+                "connector_id": connector_id,
+                "account_id": account_id,
+                "id_tag": id_tag,
+                "door_no": door_no,
+                "floor_no": floor_no,
+                "parking_space_no": parking_space_no,
+                "card_holder_name": card_holder_name,
+                "start_timestamp": start_timestamp,
+                "stop_timestamp": stop_timestamp,
+                "meter_start": meter_start,
+                "meter_stop": meter_stop,
+                "energy_kwh": energy_kwh,
+                "balance_before": rounded_balance_before,
+                "balance_after": rounded_balance_after,
+                "surplus_amount": rounded_surplus,
+            }
+        )
+    )
 
     # ... 後面 meterValues 相關的保留不變
     cursor.execute(

@@ -44,28 +44,50 @@ def normalize_household_identity(value: Any, field: str) -> str:
     return normalized
 
 
+def normalize_optional_household_identity(
+    value: Any, field: str
+) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise HouseholdAccountError(f"{field} must be a string")
+    normalized = unicodedata.normalize("NFKC", value).strip()
+    if len(normalized) > HOUSEHOLD_IDENTITY_MAX_LENGTH:
+        raise HouseholdAccountError(
+            f"{field} must be at most {HOUSEHOLD_IDENTITY_MAX_LENGTH} characters"
+        )
+    if any(unicodedata.category(char).startswith("C") for char in normalized):
+        raise HouseholdAccountError(f"{field} contains invalid control characters")
+    return normalized
+
+
 def _find_household_identity_conflicts(
     conn: sqlite3.Connection,
 ) -> list[dict[str, Any]]:
-    if not {"floor_no", "parking_space_no"} <= _columns(conn, "household_accounts"):
+    if not {"door_no", "floor_no", "parking_space_no"} <= _columns(
+        conn, "household_accounts"
+    ):
         return []
-    groups: dict[tuple[str, str], list[int]] = {}
+    groups: dict[tuple[str, str, str], list[int]] = {}
     rows = conn.execute(
         """
-        SELECT account_id, floor_no, parking_space_no
+        SELECT account_id, door_no, floor_no, parking_space_no
         FROM household_accounts
-        WHERE NULLIF(TRIM(floor_no), '') IS NOT NULL
+        WHERE NULLIF(TRIM(door_no), '') IS NOT NULL
+          AND NULLIF(TRIM(floor_no), '') IS NOT NULL
           AND NULLIF(TRIM(parking_space_no), '') IS NOT NULL
         """
     ).fetchall()
     for row in rows:
-        floor = unicodedata.normalize("NFKC", str(row[1])).strip().upper()
-        parking = unicodedata.normalize("NFKC", str(row[2])).strip().upper()
-        groups.setdefault((floor, parking), []).append(int(row[0]))
+        door = unicodedata.normalize("NFKC", str(row[1])).strip().upper()
+        floor = unicodedata.normalize("NFKC", str(row[2])).strip().upper()
+        parking = unicodedata.normalize("NFKC", str(row[3])).strip().upper()
+        groups.setdefault((door, floor, parking), []).append(int(row[0]))
     return [
         {
-            "floor_no": key[0],
-            "parking_space_no": key[1],
+            "door_no": key[0],
+            "floor_no": key[1],
+            "parking_space_no": key[2],
             "account_ids": account_ids,
         }
         for key, account_ids in groups.items()
@@ -114,6 +136,7 @@ def ensure_schema(conn: sqlite3.Connection) -> list[str]:
             account_id INTEGER PRIMARY KEY AUTOINCREMENT,
             account_code TEXT UNIQUE,
             account_name TEXT,
+            door_no TEXT,
             floor_no TEXT,
             parking_space_no TEXT,
             balance REAL NOT NULL DEFAULT 0,
@@ -175,36 +198,53 @@ def ensure_schema(conn: sqlite3.Connection) -> list[str]:
     }
     conn.execute("BEGIN IMMEDIATE")
     account_columns = _columns(conn, "household_accounts")
-    for definition in ("floor_no TEXT", "parking_space_no TEXT"):
+    for definition in ("door_no TEXT", "floor_no TEXT", "parking_space_no TEXT"):
         name = definition.split()[0]
         if name not in account_columns:
             conn.execute(f"ALTER TABLE household_accounts ADD COLUMN {definition}")
             changes.append(f"household_accounts.{name}")
+    card_columns = _columns(conn, "account_cards")
+    if "card_holder_name" not in card_columns:
+        conn.execute("ALTER TABLE account_cards ADD COLUMN card_holder_name TEXT")
+        changes.append("account_cards.card_holder_name")
+    enrollment_columns = _columns(conn, "card_enrollment_sessions")
+    if "card_holder_name" not in enrollment_columns:
+        conn.execute(
+            "ALTER TABLE card_enrollment_sessions ADD COLUMN card_holder_name TEXT"
+        )
+        changes.append("card_enrollment_sessions.card_holder_name")
     conflicts = _find_household_identity_conflicts(conn)
     if conflicts:
         details = "; ".join(
-            f"{item['floor_no']}/{item['parking_space_no']}: "
+            f"{item['door_no']}/{item['floor_no']}/{item['parking_space_no']}: "
             f"account_ids={item['account_ids']}"
             for item in conflicts
         )
         conn.rollback()
         raise HouseholdAccountConflictError(
-            f"duplicate floor/parking data must be resolved before migration: {details}"
+            "duplicate door/floor/parking data must be resolved before migration: "
+            f"{details}"
         )
+    conn.execute("DROP INDEX IF EXISTS idx_household_accounts_floor_parking")
     expected_index_sql = (
-        "CREATE UNIQUE INDEX idx_household_accounts_floor_parking "
-        "ON household_accounts(UPPER(TRIM(floor_no)), "
+        "CREATE UNIQUE INDEX idx_household_accounts_door_floor_parking "
+        "ON household_accounts(UPPER(TRIM(door_no)), "
+        "UPPER(TRIM(floor_no)), "
         "UPPER(TRIM(parking_space_no))) "
-        "WHERE NULLIF(TRIM(floor_no), '') IS NOT NULL "
+        "WHERE NULLIF(TRIM(door_no), '') IS NOT NULL "
+        "AND NULLIF(TRIM(floor_no), '') IS NOT NULL "
         "AND NULLIF(TRIM(parking_space_no), '') IS NOT NULL"
     )
     existing_index = conn.execute(
         "SELECT sql FROM sqlite_master WHERE type='index' "
-        "AND name='idx_household_accounts_floor_parking'"
+        "AND name='idx_household_accounts_door_floor_parking'"
     ).fetchone()
-    if existing_index and "UPPER(TRIM(floor_no))" not in (existing_index[0] or ""):
-        conn.execute("DROP INDEX idx_household_accounts_floor_parking")
-        existing_index = None
+    if existing_index:
+        actual_sql = " ".join((existing_index[0] or "").split()).upper()
+        expected_sql = " ".join(expected_index_sql.split()).upper()
+        if actual_sql != expected_sql:
+            conn.execute("DROP INDEX idx_household_accounts_door_floor_parking")
+            existing_index = None
     if not existing_index:
         conn.execute(expected_index_sql)
     if "cards" in table_names:
@@ -230,9 +270,10 @@ def ensure_schema(conn: sqlite3.Connection) -> list[str]:
         for definition in (
             "account_id INTEGER",
             "account_code TEXT",
-            "card_holder_name TEXT",
+            "door_no TEXT",
             "floor_no TEXT",
             "parking_space_no TEXT",
+            "card_holder_name TEXT",
         ):
             name = definition.split()[0]
             if name not in tx_columns:
@@ -253,8 +294,9 @@ def _row_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
 def resolve_account_by_card(conn: sqlite3.Connection, card_id: str) -> dict[str, Any] | None:
     row = conn.execute(
         """
-        SELECT ac.card_id, ac.account_id, ac.status AS card_status,
-               ha.floor_no, ha.parking_space_no,
+        SELECT ac.card_id, ac.account_id, ac.card_holder_name,
+               ac.status AS card_status, ha.door_no, ha.floor_no,
+               ha.parking_space_no,
                ha.balance, ha.status AS account_status
         FROM account_cards ac
         JOIN household_accounts ha ON ha.account_id = ac.account_id
@@ -281,6 +323,8 @@ def list_household_accounts(conn: sqlite3.Connection) -> list[dict[str, Any]]:
         LEFT JOIN account_cards ac ON ac.account_id = ha.account_id
         GROUP BY ha.account_id
         ORDER BY
+            CASE WHEN NULLIF(TRIM(ha.door_no), '') IS NULL THEN 1 ELSE 0 END,
+            UPPER(TRIM(ha.door_no)),
             CASE WHEN NULLIF(TRIM(ha.floor_no), '') IS NULL THEN 1 ELSE 0 END,
             UPPER(TRIM(ha.floor_no)),
             CASE WHEN NULLIF(TRIM(ha.parking_space_no), '') IS NULL THEN 1 ELSE 0 END,
@@ -294,8 +338,9 @@ def list_household_accounts(conn: sqlite3.Connection) -> list[dict[str, Any]]:
 def list_account_cards(conn: sqlite3.Connection, account_id: int) -> list[dict[str, Any]]:
     rows = conn.execute(
         """
-        SELECT ac.card_id, ac.account_id, ac.status, ac.created_at, ac.updated_at,
-               it.status AS id_tag_status, it.valid_until
+        SELECT ac.card_id, ac.account_id, ac.card_holder_name, ac.status,
+               ac.created_at, ac.updated_at, it.status AS id_tag_status,
+               it.valid_until
         FROM account_cards ac
         LEFT JOIN id_tags it ON it.id_tag = ac.card_id
         WHERE ac.account_id = ?
@@ -374,9 +419,11 @@ def create_household_account(
     parking_space_no: str,
     balance: Any = 0,
     status: str = "active",
+    door_no: str | None = None,
 ) -> dict[str, Any]:
     floor = normalize_household_identity(floor_no, "floor_no")
     parking = normalize_household_identity(parking_space_no, "parking_space_no")
+    door = normalize_optional_household_identity(door_no, "door_no")
     if status not in ("active", "disabled"):
         raise HouseholdAccountError("invalid account status")
     opening = money(balance)
@@ -391,16 +438,25 @@ def create_household_account(
         cur = conn.execute(
             """
             INSERT INTO household_accounts
-                (account_code, account_name, floor_no, parking_space_no,
+                (account_code, account_name, door_no, floor_no, parking_space_no,
                  balance, status, created_at, updated_at)
-            VALUES (?, '', ?, ?, ?, ?, ?, ?)
+            VALUES (?, '', ?, ?, ?, ?, ?, ?, ?)
             """,
-            (internal_code, floor, parking, float(opening), status, now, now),
+            (
+                internal_code,
+                door,
+                floor,
+                parking,
+                float(opening),
+                status,
+                now,
+                now,
+            ),
         )
         conn.commit()
     except sqlite3.IntegrityError as exc:
         raise HouseholdAccountConflictError(
-            "floor_no and parking_space_no already exist"
+            "door_no, floor_no and parking_space_no already exist"
         ) from exc
     return get_account_by_id(conn, int(cur.lastrowid)) or {}
 
@@ -408,13 +464,17 @@ def create_household_account(
 def update_household_account(
     conn: sqlite3.Connection, account_id: int, **fields: Any
 ) -> dict[str, Any]:
-    allowed = {"floor_no", "parking_space_no", "status"}
+    allowed = {"door_no", "floor_no", "parking_space_no", "status"}
     values = {key: value for key, value in fields.items() if key in allowed}
     if "status" in values and values["status"] not in ("active", "disabled"):
         raise HouseholdAccountError("invalid account status")
     for key in ("floor_no", "parking_space_no"):
         if key in values:
             values[key] = normalize_household_identity(values[key], key)
+    if "door_no" in values:
+        values["door_no"] = normalize_optional_household_identity(
+            values["door_no"], "door_no"
+        )
     if "floor_no" in values or "parking_space_no" in values:
         current = get_account_by_id(conn, account_id)
         if current is None:
@@ -438,7 +498,7 @@ def update_household_account(
         conn.commit()
     except sqlite3.IntegrityError as exc:
         raise HouseholdAccountConflictError(
-            "floor_no and parking_space_no already exist"
+            "door_no, floor_no and parking_space_no already exist"
         ) from exc
     if cur.rowcount != 1:
         raise HouseholdAccountError("account not found")
@@ -478,6 +538,7 @@ def bind_card_to_account(
     card_id: str,
     status: str = "active",
     valid_until: str | None = None,
+    card_holder_name: str | None = None,
 ) -> dict[str, Any]:
     card_id = card_id.strip()
     if not card_id:
@@ -501,10 +562,10 @@ def bind_card_to_account(
         conn.execute(
             """
             INSERT INTO account_cards
-                (card_id, account_id, status, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?)
+                (card_id, account_id, card_holder_name, status, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (card_id, account_id, status, now, now),
+            (card_id, account_id, card_holder_name, status, now, now),
         )
         conn.commit()
     except sqlite3.IntegrityError as exc:
@@ -517,7 +578,7 @@ def bind_card_to_account(
 
 
 def update_account_card(conn: sqlite3.Connection, card_id: str, **fields: Any) -> dict[str, Any]:
-    allowed = {"status"}
+    allowed = {"status", "card_holder_name"}
     values = {key: value for key, value in fields.items() if key in allowed}
     if "status" in values and values["status"] not in ("active", "disabled"):
         raise HouseholdAccountError("invalid card status")
@@ -571,6 +632,7 @@ def create_enrollment_session(
     charge_point_id: str,
     requested_by: str | None = None,
     duration_seconds: int = 120,
+    card_holder_name: str | None = None,
 ) -> dict[str, Any]:
     duration_seconds = max(1, min(int(duration_seconds or 120), 600))
     account = get_account_by_id(conn, account_id)
@@ -605,11 +667,12 @@ def create_enrollment_session(
             """
             INSERT INTO card_enrollment_sessions
                 (enrollment_id, account_id, charge_point_id, requested_by,
-                 status, created_at, expires_at)
-            VALUES (?, ?, ?, ?, 'waiting', ?, ?)
+                 card_holder_name, status, created_at, expires_at)
+            VALUES (?, ?, ?, ?, ?, 'waiting', ?, ?)
             """,
             (
                 enrollment_id, account_id, charge_point_id, requested_by,
+                card_holder_name,
                 utc_iso(now), utc_iso(now + timedelta(seconds=duration_seconds)),
             ),
         )
@@ -724,10 +787,16 @@ def confirm_enrollment(conn: sqlite3.Connection, enrollment_id: str) -> dict[str
         conn.execute(
             """
             INSERT INTO account_cards
-                (card_id,account_id,status,created_at,updated_at)
-            VALUES (?,?,'active',?,?)
+                (card_id,account_id,card_holder_name,status,created_at,updated_at)
+            VALUES (?,?,?,'active',?,?)
             """,
-            (card_id, row["account_id"], created, created),
+            (
+                card_id,
+                row["account_id"],
+                row["card_holder_name"],
+                created,
+                created,
+            ),
         )
         if not conn.execute(
             "SELECT 1 FROM card_whitelist WHERE card_id=? AND charge_point_id=?",

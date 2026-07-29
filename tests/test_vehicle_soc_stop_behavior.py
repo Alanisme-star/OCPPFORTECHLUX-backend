@@ -147,19 +147,26 @@ class VehicleSocStopBehaviorTests(unittest.IsolatedAsyncioTestCase):
 
         with main.household_connect(main.DB_FILE) as account_conn:
             account = main.ensure_legacy_account_for_card(account_conn, CARD_ID)
+            self.test_door_no = f"TEST-DOOR-{account['account_id']}"
             self.test_floor_no = f"TEST-{account['account_id']}F"
             self.test_parking_space_no = f"TEST-B{account['account_id']}"
+            self.test_card_holder_name = "SOC 測試持卡人"
             account_conn.execute(
                 """
                 UPDATE household_accounts
-                SET floor_no=?, parking_space_no=?
+                SET door_no=?, floor_no=?, parking_space_no=?
                 WHERE account_id=?
                 """,
                 (
+                    self.test_door_no,
                     self.test_floor_no,
                     self.test_parking_space_no,
                     account["account_id"],
                 ),
+            )
+            account_conn.execute(
+                "UPDATE account_cards SET card_holder_name=? WHERE card_id=?",
+                (self.test_card_holder_name, CARD_ID),
             )
             account_conn.commit()
 
@@ -230,7 +237,8 @@ class VehicleSocStopBehaviorTests(unittest.IsolatedAsyncioTestCase):
                     """
                     SELECT transaction_id, meter_start, start_timestamp,
                            meter_stop, stop_timestamp, reason,
-                           balance_before, balance_after, floor_no, parking_space_no
+                           balance_before, balance_after, door_no, floor_no,
+                           parking_space_no, card_holder_name
                     FROM transactions
                     ORDER BY transaction_id
                     """
@@ -286,11 +294,17 @@ class VehicleSocStopBehaviorTests(unittest.IsolatedAsyncioTestCase):
             conn.execute(
                 """
                 UPDATE household_accounts
-                SET floor_no='CHANGED-F', parking_space_no='CHANGED-P'
+                SET door_no='CHANGED-D', floor_no='CHANGED-F',
+                    parking_space_no='CHANGED-P'
                 WHERE account_id=(
                     SELECT account_id FROM account_cards WHERE card_id=?
                 )
                 """,
+                (CARD_ID,),
+            )
+            conn.execute(
+                "UPDATE account_cards SET card_holder_name='CHANGED-HOLDER' "
+                "WHERE card_id=?",
                 (CARD_ID,),
             )
             conn.commit()
@@ -302,10 +316,17 @@ class VehicleSocStopBehaviorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(state["transactions"][0]["stop_timestamp"])
         self.assertEqual(
             (
+                state["transactions"][0]["door_no"],
                 state["transactions"][0]["floor_no"],
                 state["transactions"][0]["parking_space_no"],
+                state["transactions"][0]["card_holder_name"],
             ),
-            (self.test_floor_no, self.test_parking_space_no),
+            (
+                self.test_door_no,
+                self.test_floor_no,
+                self.test_parking_space_no,
+                self.test_card_holder_name,
+            ),
         )
         self.assertIsNone(state["transactions"][0]["meter_stop"])
         self.assertEqual(len(state["payments"]), 0)
