@@ -7,7 +7,12 @@ from datetime import datetime
 from pathlib import Path
 
 from db_config import get_database_path
-from household_account_service import connect, ensure_schema, utc_iso
+from household_account_service import (
+    backfill_account_balance_ledger,
+    connect,
+    ensure_schema,
+    utc_iso,
+)
 
 
 def _safe_legacy_code(card_id: str) -> str:
@@ -41,6 +46,7 @@ def migrate(db_file: str | None = None, create_backup: bool = True) -> dict[str,
         "backup": str(backup) if backup else None,
         "accounts_created": 0,
         "cards_linked": 0,
+        "ledger_charges_backfilled": 0,
         "columns_added": [],
     }
     conn = connect(db_file)
@@ -89,6 +95,9 @@ def migrate(db_file: str | None = None, create_backup: bool = True) -> dict[str,
                 )
                 report["accounts_created"] = int(report["accounts_created"]) + 1
                 report["cards_linked"] = int(report["cards_linked"]) + 1
+            report["ledger_charges_backfilled"] = backfill_account_balance_ledger(
+                conn
+            )
             conn.commit()
         except Exception:
             conn.rollback()

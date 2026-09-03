@@ -185,12 +185,35 @@ def ensure_schema(conn: sqlite3.Connection) -> list[str]:
             result TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS account_balance_ledger (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_id INTEGER NOT NULL,
+            card_id TEXT NOT NULL,
+            entry_type TEXT NOT NULL,
+            amount REAL NOT NULL,
+            balance_before REAL,
+            balance_after REAL,
+            transaction_id INTEGER,
+            created_at TEXT,
+            FOREIGN KEY (account_id) REFERENCES household_accounts(account_id),
+            FOREIGN KEY (card_id) REFERENCES account_cards(card_id),
+            CHECK (entry_type IN ('topup', 'charge')),
+            CHECK (amount >= 0)
+        );
+
         CREATE INDEX IF NOT EXISTS idx_account_cards_account
             ON account_cards(account_id, status);
         CREATE INDEX IF NOT EXISTS idx_enrollment_cp_status_expiry
             ON card_enrollment_sessions(charge_point_id, status, expires_at);
         CREATE INDEX IF NOT EXISTS idx_unknown_card_detected
             ON unknown_card_logs(detected_at);
+        CREATE INDEX IF NOT EXISTS idx_account_balance_ledger_card_created
+            ON account_balance_ledger(card_id, created_at DESC, id DESC);
+        CREATE INDEX IF NOT EXISTS idx_account_balance_ledger_account_created
+            ON account_balance_ledger(account_id, created_at DESC, id DESC);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_account_balance_ledger_charge_tx
+            ON account_balance_ledger(transaction_id)
+            WHERE entry_type = 'charge' AND transaction_id IS NOT NULL;
         """
     )
     table_names = {
@@ -250,10 +273,12 @@ def ensure_schema(conn: sqlite3.Connection) -> list[str]:
     if "cards" in table_names:
         # A direct deletion from the legacy cards table represents removal of
         # that legacy card.  Drop only its LEGACY mapping so a later re-created
-        # card is a fresh adoption; ordinary/shared accounts are untouched.
+        # card is a fresh adoption.  Ledger-backed mappings are immutable audit
+        # links and must survive even if legacy SQL deletes the cards row.
+        conn.execute("DROP TRIGGER IF EXISTS cleanup_deleted_legacy_card_mapping")
         conn.execute(
             """
-            CREATE TRIGGER IF NOT EXISTS cleanup_deleted_legacy_card_mapping
+            CREATE TRIGGER cleanup_deleted_legacy_card_mapping
             AFTER DELETE ON cards
             BEGIN
                 DELETE FROM account_cards
@@ -261,6 +286,10 @@ def ensure_schema(conn: sqlite3.Connection) -> list[str]:
                   AND account_id IN (
                       SELECT account_id FROM household_accounts
                       WHERE account_code LIKE 'LEGACY-%'
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM account_balance_ledger
+                      WHERE card_id = OLD.card_id
                   );
             END
             """
@@ -283,8 +312,103 @@ def ensure_schema(conn: sqlite3.Connection) -> list[str]:
             "CREATE INDEX IF NOT EXISTS idx_transactions_account_id "
             "ON transactions(account_id)"
         )
+    backfill_account_balance_ledger(conn)
     conn.commit()
     return changes
+
+
+def backfill_account_balance_ledger(conn: sqlite3.Connection) -> int:
+    """Backfill confirmed legacy charge rows without inventing top-ups.
+
+    This function deliberately leaves unknown historic balances and timestamps
+    as NULL.  The payment amount is used only when transaction balance
+    snapshots are unavailable.  The partial unique index makes repeated runs
+    safe.
+    """
+    table_names = {
+        row[0]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        )
+    }
+    required = {
+        "account_balance_ledger",
+        "account_cards",
+        "household_accounts",
+        "payments",
+        "transactions",
+    }
+    if not required <= table_names:
+        return 0
+
+    payment_columns = _columns(conn, "payments")
+    transaction_columns = _columns(conn, "transactions")
+    if not {"transaction_id", "total_amount"} <= payment_columns:
+        return 0
+    if not {"transaction_id", "id_tag"} <= transaction_columns:
+        return 0
+
+    def tx_column(name: str) -> str:
+        return f"t.{name}" if name in transaction_columns else "NULL"
+
+    paid_at = "p.paid_at" if "paid_at" in payment_columns else "NULL"
+    rows = conn.execute(
+        f"""
+        SELECT t.transaction_id, t.id_tag, ac.account_id,
+               p.total_amount,
+               {tx_column('balance_before')} AS balance_before,
+               {tx_column('balance_after')} AS balance_after,
+               COALESCE({paid_at}, {tx_column('stop_timestamp')},
+                        {tx_column('start_timestamp')}) AS created_at
+        FROM transactions t
+        JOIN account_cards ac ON ac.card_id = t.id_tag
+        JOIN payments p ON p.transaction_id = t.transaction_id
+        WHERE t.transaction_id IS NOT NULL
+          AND NULLIF(TRIM(t.id_tag), '') IS NOT NULL
+          AND ({tx_column('account_id')} IS NULL
+               OR {tx_column('account_id')} = ac.account_id)
+        ORDER BY t.transaction_id, p.rowid
+        """
+    ).fetchall()
+
+    inserted = 0
+    seen_transactions: set[int] = set()
+    for row in rows:
+        transaction_id = int(row[0])
+        if transaction_id in seen_transactions:
+            continue
+        seen_transactions.add(transaction_id)
+
+        before = money(row[4]) if row[4] is not None else None
+        after = money(row[5]) if row[5] is not None else None
+        if before is not None and after is not None:
+            amount = max(Decimal("0.00"), before - after).quantize(
+                MONEY_QUANT, rounding=ROUND_HALF_UP
+            )
+        elif row[3] is not None:
+            amount = max(Decimal("0.00"), money(row[3]))
+        else:
+            continue
+
+        cur = conn.execute(
+            """
+            INSERT OR IGNORE INTO account_balance_ledger
+                (account_id, card_id, entry_type, amount, balance_before,
+                 balance_after, transaction_id, created_at)
+            VALUES (?, ?, 'charge', ?, ?, ?, ?, ?)
+            """,
+            (
+                int(row[2]),
+                str(row[1]).strip(),
+                float(amount),
+                float(before) if before is not None else None,
+                float(after) if after is not None else None,
+                transaction_id,
+                row[6],
+            ),
+        )
+        inserted += max(cur.rowcount, 0)
+    return inserted
 
 
 def _row_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -505,23 +629,65 @@ def update_household_account(
     return get_account_by_id(conn, account_id) or {}
 
 
-def topup_household_account(conn: sqlite3.Connection, account_id: int, amount: Any) -> dict[str, Any]:
+def topup_household_account(
+    conn: sqlite3.Connection,
+    account_id: int,
+    amount: Any,
+    card_id: str | None = None,
+) -> dict[str, Any]:
     increment = money(amount)
-    if increment <= 0:
+    if isinstance(amount, bool) or not increment.is_finite() or increment <= 0:
         raise HouseholdAccountError("amount must be greater than zero")
+    normalized_card_id = str(card_id or "").strip()
+    if not normalized_card_id:
+        raise HouseholdAccountError("card_id is required")
     conn.execute("BEGIN IMMEDIATE")
     try:
         now = utc_iso()
-        cur = conn.execute(
+        account = conn.execute(
+            "SELECT * FROM household_accounts WHERE account_id = ?", (account_id,)
+        ).fetchone()
+        if account is None:
+            raise HouseholdAccountError("account not found")
+        if account["status"] != "active":
+            raise HouseholdAccountConflictError("account is disabled")
+        linked_card = conn.execute(
+            "SELECT status FROM account_cards WHERE account_id = ? AND card_id = ?",
+            (account_id, normalized_card_id),
+        ).fetchone()
+        if linked_card is None:
+            raise HouseholdAccountError("card does not belong to account")
+        if linked_card["status"] != "active":
+            raise HouseholdAccountConflictError("card is disabled")
+
+        balance_before = money(account["balance"])
+        balance_after = (balance_before + increment).quantize(
+            MONEY_QUANT, rounding=ROUND_HALF_UP
+        )
+        conn.execute(
             """
             UPDATE household_accounts
-            SET balance = ROUND(balance + ?, 2), updated_at = ?
+            SET balance = ?, updated_at = ?
             WHERE account_id = ?
             """,
-            (float(increment), now, account_id),
+            (float(balance_after), now, account_id),
         )
-        if cur.rowcount != 1:
-            raise HouseholdAccountError("account not found")
+        conn.execute(
+            """
+            INSERT INTO account_balance_ledger
+                (account_id, card_id, entry_type, amount, balance_before,
+                 balance_after, transaction_id, created_at)
+            VALUES (?, ?, 'topup', ?, ?, ?, NULL, ?)
+            """,
+            (
+                account_id,
+                normalized_card_id,
+                float(increment),
+                float(balance_before),
+                float(balance_after),
+                now,
+            ),
+        )
         row = conn.execute(
             "SELECT * FROM household_accounts WHERE account_id = ?", (account_id,)
         ).fetchone()
@@ -610,7 +776,60 @@ def update_account_card(conn: sqlite3.Connection, card_id: str, **fields: Any) -
 
 
 def disable_account_card(conn: sqlite3.Connection, card_id: str) -> dict[str, Any]:
-    return update_account_card(conn, card_id, status="disabled")
+    normalized_card_id = str(card_id or "").strip()
+    if not normalized_card_id:
+        raise HouseholdAccountError("card_id is required")
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        row = conn.execute(
+            "SELECT account_id FROM account_cards WHERE card_id = ?",
+            (normalized_card_id,),
+        ).fetchone()
+        if row is None:
+            raise HouseholdAccountError("card not found")
+        now = utc_iso()
+        conn.execute(
+            """
+            UPDATE account_cards
+            SET status = 'disabled', updated_at = ?
+            WHERE card_id = ?
+            """,
+            (now, normalized_card_id),
+        )
+        id_tag_update = conn.execute(
+            "UPDATE id_tags SET status = 'Blocked' WHERE id_tag = ?",
+            (normalized_card_id,),
+        )
+        if id_tag_update.rowcount == 0:
+            conn.execute(
+                "INSERT INTO id_tags(id_tag, status) VALUES (?, 'Blocked')",
+                (normalized_card_id,),
+            )
+        table_names = {
+            item[0]
+            for item in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        if "card_whitelist" in table_names:
+            conn.execute(
+                "DELETE FROM card_whitelist WHERE card_id = ?",
+                (normalized_card_id,),
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    result = resolve_account_by_card(conn, normalized_card_id) or {}
+    result.update(
+        {
+            "action": "disabled",
+            "message": "card disabled; accounting history preserved",
+            "history_preserved": True,
+            "id_tag_status": "Blocked",
+        }
+    )
+    return result
 
 
 def expire_enrollments(conn: sqlite3.Connection, now: datetime | None = None) -> int:

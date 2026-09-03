@@ -158,8 +158,17 @@ def api_update_household_account(account_id: int, data: dict = Body(...)):
 def api_topup_household_account(account_id: int, data: dict = Body(...)):
     with household_connect(DB_FILE) as account_conn:
         try:
+            card_id = _request_alias(
+                data,
+                "card_id",
+                "cardId",
+                data.get("idTag"),
+            )
             account = topup_household_account(
-                account_conn, account_id, data.get("amount")
+                account_conn,
+                account_id,
+                data.get("amount"),
+                card_id=card_id,
             )
             return _household_api_payload(
                 account,
@@ -5012,6 +5021,28 @@ class ChargePoint(OcppChargePoint):
                             (balance_before, balance_after, surplus_amount, transaction_id),
                         )
 
+                        actual_charge = _money_float(
+                            _money_dec(balance_before) - _money_dec(balance_after)
+                        )
+                        _cur.execute(
+                            """
+                            INSERT INTO account_balance_ledger
+                                (account_id, card_id, entry_type, amount,
+                                 balance_before, balance_after, transaction_id,
+                                 created_at)
+                            VALUES (?, ?, 'charge', ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                transaction_account_id,
+                                id_tag,
+                                actual_charge,
+                                balance_before,
+                                balance_after,
+                                transaction_id,
+                                stop_ts,
+                            ),
+                        )
+
                         logger.error(
                             f"[STOP][UPDATE] account_id={transaction_account_id} | card_id={id_tag} "
                             f"| balance_before={balance_before} "
@@ -7279,64 +7310,40 @@ async def apply_current_limit(charge_point_id: str, data: dict = Body(...)):
 @app.get("/api/cards/{card_id}/history")
 def get_card_history(card_id: str, limit: int = 20):
     """
-    回傳指定卡片的扣款紀錄（從 payments 表）。
+    回傳指定卡片的加值與扣款流水。
     預設顯示最近 20 筆，可透過 limit 參數調整。
     """
     card_id = card_id.strip()
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+        raise HTTPException(status_code=422, detail="limit must be between 1 and 100")
     with get_conn() as conn:
         cur = conn.cursor()
-
-        # 找出該卡片相關的交易 ID
         cur.execute(
-            "SELECT transaction_id FROM transactions WHERE id_tag=? ORDER BY start_timestamp DESC",
-            (card_id,),
-        )
-        tx_ids = [r[0] for r in cur.fetchall()]
-        if not tx_ids:
-            return {"card_id": card_id, "history": []}
-
-        # 查詢扣款紀錄
-        q_marks = ",".join("?" * len(tx_ids))
-        cur.execute(
-            f"""
-            SELECT p.transaction_id, p.total_amount, p.paid_at,
-                   t.start_timestamp, t.stop_timestamp, t.account_id,
-                   t.id_tag, t.door_no, t.floor_no, t.parking_space_no,
-                   t.card_holder_name
-            FROM payments p
-            LEFT JOIN transactions t ON p.transaction_id = t.transaction_id
-            WHERE p.transaction_id IN ({q_marks})
-            ORDER BY p.paid_at DESC
+            """
+            SELECT id, entry_type, amount, balance_before, balance_after,
+                   transaction_id, created_at
+            FROM account_balance_ledger
+            WHERE card_id = ?
+            ORDER BY created_at DESC, id DESC
             LIMIT ?
-        """,
-            (*tx_ids, limit),
+            """,
+            (card_id, limit),
         )
-
         rows = cur.fetchall()
 
-    history = []
-    for row in rows:
-        history_item = {
-            "amount": float(row[1] or 0),
-            "paid_at": row[2],
+    history = [
+        {
+            "id": row[0],
+            "entry_type": row[1],
+            "amount": float(row[2]),
+            "signed_amount": float(row[2]) if row[1] == "topup" else -float(row[2]),
+            "balance_before": float(row[3]) if row[3] is not None else None,
+            "balance_after": float(row[4]) if row[4] is not None else None,
+            "transaction_id": row[5],
+            "created_at": row[6],
         }
-        history_item.update(
-            _transaction_snapshot_payload(
-                {
-                    "transaction_id": row[0],
-                    "account_id": row[5],
-                    "id_tag": row[6],
-                    "door_no": row[7],
-                    "floor_no": row[8],
-                    "parking_space_no": row[9],
-                    "card_holder_name": row[10],
-                    "start_timestamp": row[3],
-                    "stop_timestamp": row[4],
-                    "cost": float(row[1] or 0),
-                }
-            )
-        )
-        history.append(history_item)
+        for row in rows
+    ]
 
     return {"card_id": card_id, "history": history}
 
@@ -8320,54 +8327,88 @@ def apply_special_days_pricing(data: dict = Body(...)):
     }
 
 
-# === 刪除卡片（完整刪除：card_whitelist + card_owners + cards + id_tags） ===
+def _disable_or_hard_delete_card(id_tag: str) -> dict:
+    """Disable account-bound cards; hard-delete only unbound legacy cards."""
+    normalized_id_tag = str(id_tag or "").strip()
+    if not normalized_id_tag:
+        raise HTTPException(status_code=404, detail="card not found")
+
+    with household_connect(DB_FILE) as account_conn:
+        linked = account_conn.execute(
+            "SELECT 1 FROM account_cards WHERE card_id = ?",
+            (normalized_id_tag,),
+        ).fetchone()
+        ledger_count = int(
+            account_conn.execute(
+                "SELECT COUNT(*) FROM account_balance_ledger WHERE card_id = ?",
+                (normalized_id_tag,),
+            ).fetchone()[0]
+        )
+        exists = account_conn.execute(
+            """
+            SELECT 1 FROM id_tags WHERE id_tag = ?
+            UNION SELECT 1 FROM cards WHERE card_id = ?
+            UNION SELECT 1 FROM card_owners WHERE card_id = ?
+            UNION SELECT 1 FROM account_cards WHERE card_id = ?
+            LIMIT 1
+            """,
+            (
+                normalized_id_tag,
+                normalized_id_tag,
+                normalized_id_tag,
+                normalized_id_tag,
+            ),
+        ).fetchone()
+
+        if not exists and ledger_count == 0:
+            raise HTTPException(status_code=404, detail="card not found")
+        if linked:
+            return disable_account_card(account_conn, normalized_id_tag)
+        if ledger_count:
+            raise HTTPException(
+                status_code=409,
+                detail="card accounting history exists; physical deletion is not allowed",
+            )
+
+        account_conn.execute("BEGIN IMMEDIATE")
+        try:
+            account_conn.execute(
+                "DELETE FROM card_whitelist WHERE card_id = ?",
+                (normalized_id_tag,),
+            )
+            account_conn.execute(
+                "DELETE FROM card_owners WHERE card_id = ?",
+                (normalized_id_tag,),
+            )
+            account_conn.execute(
+                "DELETE FROM cards WHERE card_id = ?", (normalized_id_tag,)
+            )
+            account_conn.execute(
+                "DELETE FROM id_tags WHERE id_tag = ?", (normalized_id_tag,)
+            )
+            account_conn.commit()
+        except Exception:
+            account_conn.rollback()
+            raise
+
+    return {
+        "action": "hard_deleted",
+        "card_id": normalized_id_tag,
+        "message": "unbound legacy card deleted",
+        "history_preserved": False,
+    }
+
+
+# Account-bound cards are retained and disabled so accounting history remains.
 @app.delete("/api/cards/{id_tag}")
 async def delete_card(id_tag: str):
     try:
-        with get_conn() as conn:
-            cur = conn.cursor()
-
-            # 先檢查卡片是否存在（任一表存在都算）
-            cur.execute(
-                """
-                SELECT 1
-                FROM id_tags
-                WHERE id_tag = ?
-                UNION
-                SELECT 1
-                FROM cards
-                WHERE card_id = ?
-                UNION
-                SELECT 1
-                FROM card_owners
-                WHERE card_id = ?
-                LIMIT 1
-                """,
-                (id_tag, id_tag, id_tag),
-            )
-            exists = cur.fetchone()
-
-            if not exists:
-                raise HTTPException(status_code=404, detail="card not found")
-
-            # 刪除白名單
-            cur.execute("DELETE FROM card_whitelist WHERE card_id = ?", (id_tag,))
-
-            # 刪除住戶名稱
-            cur.execute("DELETE FROM card_owners WHERE card_id = ?", (id_tag,))
-
-            # 刪除餘額卡片資料
-            cur.execute("DELETE FROM cards WHERE card_id = ?", (id_tag,))
-
-            # 刪除 id_tags 主表
-            cur.execute("DELETE FROM id_tags WHERE id_tag = ?", (id_tag,))
-
-            conn.commit()
-
-        return {"message": f"Card {id_tag} deleted"}
+        return _disable_or_hard_delete_card(id_tag)
 
     except HTTPException:
         raise
+    except HouseholdAccountError as exc:
+        raise _household_http_error(exc) from exc
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -11490,20 +11531,12 @@ async def update_id_tag(id_tag: str = Path(...), data: dict = Body(...)):
 
 @app.delete("/api/id_tags/{id_tag}")
 async def delete_id_tag(id_tag: str = Path(...)):
-    with get_conn() as conn:
-        cur = conn.cursor()
-
-        cur.execute("SELECT 1 FROM id_tags WHERE id_tag = ?", (id_tag,))
-        if not cur.fetchone():
-            raise HTTPException(status_code=404, detail="id_tag not found")
-
-        cur.execute("DELETE FROM card_whitelist WHERE card_id = ?", (id_tag,))
-        cur.execute("DELETE FROM card_owners WHERE card_id = ?", (id_tag,))
-        cur.execute("DELETE FROM cards WHERE card_id = ?", (id_tag,))
-        cur.execute("DELETE FROM id_tags WHERE id_tag = ?", (id_tag,))
-        conn.commit()
-
-    return {"message": "Deleted successfully"}
+    try:
+        return _disable_or_hard_delete_card(id_tag)
+    except HTTPException:
+        raise
+    except HouseholdAccountError as exc:
+        raise _household_http_error(exc) from exc
 
 
 @app.get("/api/summary")
@@ -13610,13 +13643,19 @@ async def update_card(card_id: str, payload: dict):
 @app.post("/api/cards/{card_id}/topup")
 async def topup_card(card_id: str = Path(...), data: dict = Body(...)):
     amount = data.get("amount")
-    if amount is None or not isinstance(amount, (int, float)) or amount <= 0:
-        raise HTTPException(status_code=400, detail="amount must be greater than zero")
     with household_connect(DB_FILE) as account_conn:
         account = resolve_account_by_card(account_conn, card_id)
         if not account:
             raise HTTPException(status_code=404, detail="household account not found for card")
-        updated = topup_household_account(account_conn, account["account_id"], amount)
+        try:
+            updated = topup_household_account(
+                account_conn,
+                account["account_id"],
+                amount,
+                card_id=card_id,
+            )
+        except HouseholdAccountError as exc:
+            raise _household_http_error(exc) from exc
     return {
         "status": "success",
         "card_id": card_id,

@@ -80,7 +80,8 @@ def run() -> dict[str, object]:
             "[STARTUP][HOUSEHOLD_MIGRATION] "
             f"database={report['database']} backup={report['backup']} "
             f"accounts_created={report['accounts_created']} "
-            f"cards_linked={report['cards_linked']}"
+            f"cards_linked={report['cards_linked']} "
+            f"ledger_charges_backfilled={report['ledger_charges_backfilled']}"
         )
         return report
 
