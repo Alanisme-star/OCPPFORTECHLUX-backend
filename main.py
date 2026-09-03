@@ -5104,22 +5104,6 @@ class ChargePoint(OcppChargePoint):
                     )
 
                 # ==================================================
-                # LINE：交易完成通知與低餘額提醒共用同一 task，
-                # 依序完成第一則後才開始第二則。
-                # ==================================================
-                try:
-                    schedule_post_transaction_line_notifications(
-                        transaction_id,
-                        send_low_balance=should_send_low_balance,
-                    )
-                except Exception as e:
-                    logger.exception(
-                        f"[LINE][POST_TX][SCHEDULE_CALL_ERR] "
-                        f"tx_id={transaction_id} | "
-                        f"send_low_balance={should_send_low_balance} | err={e}"
-                    )
-
-                # ==================================================
                 # LINE 第三階段：餘額不足自動停充後推播
                 # 規則：
                 # - 第二階段已在 auto_stop_reason 標記 balance_insufficient
@@ -5144,8 +5128,12 @@ class ChargePoint(OcppChargePoint):
                     if _line_row:
                         auto_stop_reason_for_line = _line_row[0]
 
-                    if auto_stop_reason_for_line == AUTO_STOP_REASON_BALANCE_INSUFFICIENT:
-                        schedule_auto_stop_balance_insufficient_line_notification(transaction_id)
+                    should_send_auto_stop_balance_insufficient = (
+                        auto_stop_reason_for_line
+                        == AUTO_STOP_REASON_BALANCE_INSUFFICIENT
+                    )
+
+                    if should_send_auto_stop_balance_insufficient:
                         logger.warning(
                             f"[LINE][AUTO_STOP_BALANCE][TRIGGERED] "
                             f"tx_id={transaction_id} | "
@@ -5159,9 +5147,35 @@ class ChargePoint(OcppChargePoint):
                         )
 
                 except Exception as e:
+                    should_send_auto_stop_balance_insufficient = False
                     logger.exception(
                         f"[LINE][AUTO_STOP_BALANCE][SCHEDULE_CALL_ERR] "
                         f"tx_id={transaction_id} | err={e}"
+                    )
+
+                # ==================================================
+                # LINE：交易完成後通知共用同一 task，依序發送：
+                # 完成通知 -> 自動停充通知，否則才發低餘額提醒。
+                # ==================================================
+                try:
+                    should_send_low_balance = (
+                        should_send_low_balance
+                        and not should_send_auto_stop_balance_insufficient
+                    )
+                    schedule_post_transaction_line_notifications(
+                        transaction_id,
+                        send_low_balance=should_send_low_balance,
+                        send_auto_stop_balance_insufficient=(
+                            should_send_auto_stop_balance_insufficient
+                        ),
+                    )
+                except Exception as e:
+                    logger.exception(
+                        f"[LINE][POST_TX][SCHEDULE_CALL_ERR] "
+                        f"tx_id={transaction_id} | "
+                        f"send_low_balance={should_send_low_balance} | "
+                        f"send_auto_stop_balance_insufficient="
+                        f"{should_send_auto_stop_balance_insufficient} | err={e}"
                     )
         except Exception as e:
             logger.exception(f"🔴 StopTransaction DB/計算發生錯誤：{e}")
@@ -10427,11 +10441,13 @@ def send_low_balance_line_notification(transaction_id: int) -> dict:
 def schedule_post_transaction_line_notifications(
     transaction_id: int,
     send_low_balance: bool = False,
+    send_auto_stop_balance_insufficient: bool = False,
 ) -> None:
     """
     以單一 asyncio task 依序發送交易完成後的 LINE 通知。
 
-    第一則完成通知失敗時只記錄錯誤；低餘額提醒仍會在第一則結束後嘗試。
+    第一則完成通知失敗時只記錄錯誤；後續符合條件的提醒仍會依序嘗試。
+    自動停充通知優先於一般低餘額提醒，兩者不會同時發送。
     """
 
     try:
@@ -10439,16 +10455,20 @@ def schedule_post_transaction_line_notifications(
     except Exception:
         logging.warning(
             f"[LINE][POST_TX][SCHEDULE_SKIP] "
-            f"tx_id={transaction_id} | send_low_balance={bool(send_low_balance)}"
+            f"tx_id={transaction_id} | send_low_balance={bool(send_low_balance)} | "
+            f"send_auto_stop_balance_insufficient="
+            f"{bool(send_auto_stop_balance_insufficient)}"
         )
         return
 
-    should_send_low_balance = bool(send_low_balance)
+    should_send_auto_stop = bool(send_auto_stop_balance_insufficient)
+    should_send_low_balance = bool(send_low_balance) and not should_send_auto_stop
 
     async def _runner():
         logging.warning(
             f"[LINE][POST_TX][CHARGE_COMPLETED_START] "
-            f"tx_id={tx_id} | send_low_balance={should_send_low_balance}"
+            f"tx_id={tx_id} | send_low_balance={should_send_low_balance} | "
+            f"send_auto_stop_balance_insufficient={should_send_auto_stop}"
         )
         try:
             charge_completed_result = await asyncio.to_thread(
@@ -10477,7 +10497,36 @@ def schedule_post_transaction_line_notifications(
                 f"tx_id={tx_id} | send_low_balance={should_send_low_balance} | err={e}"
             )
 
-        if should_send_low_balance:
+        if should_send_auto_stop:
+            logging.warning(
+                f"[LINE][POST_TX][AUTO_STOP_BALANCE_START] tx_id={tx_id}"
+            )
+            try:
+                auto_stop_result = await asyncio.to_thread(
+                    send_auto_stop_balance_insufficient_line_notification,
+                    tx_id,
+                )
+                if (
+                    isinstance(auto_stop_result, dict)
+                    and auto_stop_result.get("ok") is False
+                ):
+                    logging.error(
+                        f"[LINE][POST_TX][AUTO_STOP_BALANCE_ERR] "
+                        f"tx_id={tx_id} | status={auto_stop_result.get('status')} | "
+                        f"reason={auto_stop_result.get('reason')}"
+                    )
+                else:
+                    logging.warning(
+                        f"[LINE][POST_TX][AUTO_STOP_BALANCE_DONE] "
+                        f"tx_id={tx_id} | "
+                        f"status={auto_stop_result.get('status') if isinstance(auto_stop_result, dict) else None}"
+                    )
+            except Exception as e:
+                logging.exception(
+                    f"[LINE][POST_TX][AUTO_STOP_BALANCE_ERR] "
+                    f"tx_id={tx_id} | err={e}"
+                )
+        elif should_send_low_balance:
             logging.warning(
                 f"[LINE][POST_TX][LOW_BALANCE_START] "
                 f"tx_id={tx_id} | send_low_balance={should_send_low_balance}"
@@ -10511,7 +10560,8 @@ def schedule_post_transaction_line_notifications(
 
         logging.warning(
             f"[LINE][POST_TX][DONE] "
-            f"tx_id={tx_id} | send_low_balance={should_send_low_balance}"
+            f"tx_id={tx_id} | send_low_balance={should_send_low_balance} | "
+            f"send_auto_stop_balance_insufficient={should_send_auto_stop}"
         )
 
     try:
@@ -10519,12 +10569,14 @@ def schedule_post_transaction_line_notifications(
         loop.create_task(_runner())
         logging.warning(
             f"[LINE][POST_TX][SCHEDULED] "
-            f"tx_id={tx_id} | send_low_balance={should_send_low_balance}"
+            f"tx_id={tx_id} | send_low_balance={should_send_low_balance} | "
+            f"send_auto_stop_balance_insufficient={should_send_auto_stop}"
         )
     except RuntimeError as e:
         logging.exception(
             f"[LINE][POST_TX][SCHEDULE_ERR] "
-            f"tx_id={tx_id} | send_low_balance={should_send_low_balance} | err={e}"
+            f"tx_id={tx_id} | send_low_balance={should_send_low_balance} | "
+            f"send_auto_stop_balance_insufficient={should_send_auto_stop} | err={e}"
         )
 
 
@@ -10664,7 +10716,6 @@ def build_auto_stop_balance_insufficient_line_message(transaction_id: int) -> di
             },
         }
 
-    household_display = _floor_parking_display(floor_no, parking_space_no)
     display_card = id_tag or card_number or "--"
 
     final_balance_value = balance_after
@@ -10673,17 +10724,12 @@ def build_auto_stop_balance_insufficient_line_message(transaction_id: int) -> di
 
     message_lines = [
         "餘額不足自動停充通知",
-        f"樓號／車位：{household_display}",
-        f"卡號：{display_card}",
-        f"充電樁：{charge_point_id or '--'}",
-        f"交易編號：{tx_id}",
-        f"系統判斷時間：{_format_line_taipei_time(auto_stop_triggered_at)}",
-        f"交易結束時間：{_format_line_taipei_time(stop_timestamp)}",
+        "",
+        "系統偵測到帳戶餘額不足，已自動停止充電。",
         f"自動停充時餘額：{_format_line_amount(auto_stop_balance)}",
-        f"當時預估費用：{_format_line_amount(auto_stop_estimated_amount)}",
         f"扣款後餘額：{_format_line_amount(final_balance_value)}",
         "",
-        "餘額已經歸零／餘額不足，因此系統已自動停止充電，請儘速儲值。",
+        "請儘速儲值，以便下次使用充電服務。",
     ]
 
     message = "\n".join(message_lines)
